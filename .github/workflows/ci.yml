@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  NVIM_VERSION: v0.12.5
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: nbv-core dependency rule (R5)
+        run: ./scripts/check-core-deps.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            nvim: nvim-linux-x86_64
+          - os: macos-latest
+            nvim: nvim-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - name: Neovim ${{ env.NVIM_VERSION }}
+        run: |
+          mkdir -p .tools
+          curl -sSLf "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/${{ matrix.nvim }}.tar.gz" | tar xz -C .tools
+          echo "NBV_NVIM=$PWD/.tools/${{ matrix.nvim }}/bin/nvim" >> "$GITHUB_ENV"
+      - name: tmux
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y tmux; else brew install tmux; fi
+      - name: Python kernel and ruff
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python ipykernel ruff
+      - run: cargo test --workspace
+      - name: Property tests, extended
+        run: PROPTEST_CASES=20000 cargo test --release -p nbv-core --test properties
