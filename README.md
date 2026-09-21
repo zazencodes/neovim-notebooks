@@ -23,11 +23,12 @@ as amended by [`docs/specs/2026-09-21-nbv-cell-editors.md`](docs/specs/2026-09-2
   2. the notebook's kernelspec (`metadata.kernelspec.name`) in the Jupyter data directories;
   3. `python3 -m ipykernel_launcher` on `PATH`.
 
-  The header shows which kernel is in use. `:NbvKernel` picks another from the active
-  virtualenv, every installed kernelspec and `python3` on `PATH`; choosing a kernelspec saves it
-  in the notebook. Code cells are edited in the kernel's language. Non-Python kernels are
+  The header shows which kernel is in use. Selecting it there (see below) picks another from
+  the active virtualenv, every installed kernelspec and `python3` on `PATH`; choosing a
+  kernelspec saves it in the notebook. nbv remembers your pick for each notebook
+  (`~/.local/state/nbv/kernels.json`) and starts with it next time, ahead of the order above. Code cells are edited in the kernel's language. Non-Python kernels are
   experimental (spec §4.3).
-- **tmux 3.3 or newer**, if you run nbv inside tmux.
+- **tmux 3.3 or newer**, if you run nbv inside tmux (3.5 for `Shift+Enter` / `Ctrl+Enter`, see [tmux](#tmux)).
 
 ## Install
 
@@ -54,21 +55,30 @@ left and its outputs underneath. nbv has two modes, shown in the header.
 | `J` | Join the next cell onto this one |
 | `]e` `[e` | Move the cell down / up |
 | `tc` `tm` `tr` | Make it code / markdown / raw |
-| `x` | Run and select the next cell (past the end, add one and edit it) |
-| `r` | Run and stay on the cell |
+| `x` `Shift+Enter` | Run and select the next cell (past the end, add one and edit it) |
+| `r` `Ctrl+Enter` | Run and stay on the cell |
 | `ii` `00` | Interrupt / restart the kernel |
 | `:` | Neovim's command line: `:w`, `:wq`, `:q!`, `:Telescope`, anything |
+| `?` | List every key (`q` closes it) |
+
+**The header** sits above the first cell: press `k` on the first cell to reach it, `h` `l` to
+select the file name or the kernel, and `Enter` to rename the file or pick the kernel. `j`
+goes back to the cells. `gg` and `G` always stay on cells.
 
 **Edit mode** (`EDIT`) is Neovim, in a window that holds only that cell. Motions, search,
 undo and text objects stop at the cell's edges. Your config applies as in any buffer: code
 cells are buffers of the notebook's language, markdown cells are `markdown` buffers.
 
 `<Esc>` in Normal mode leaves the cell (from Insert mode, `<Esc><Esc>`), and clears search
-highlighting. To run a cell, leave it and press `x`. Every key nbv defines works in any
-terminal, with no modifier keys.
+highlighting. `Shift+Enter` runs the cell and moves to the next one; `Ctrl+Enter` runs it and
+keeps you editing. Both work from Normal and Insert mode.
+
+`Shift+Enter` and `Ctrl+Enter` need a terminal that reports modifier keys: Kitty, Ghostty,
+WezTerm and iTerm2 do; macOS Terminal does not, and there they act as plain `Enter`. `x` and
+`r` work in every terminal.
 
 Actions without a key are Ex commands: `:NbvRunAll`, `:NbvRunAbove`, `:NbvSplit` (split the
-edited cell at the cursor), `:NbvClearOutput[!]` and `:NbvKernel` (pick the kernel). They act on the cell being edited, or the
+edited cell at the cursor), and `:NbvClearOutput[!]`. They act on the cell being edited, or the
 selected one.
 
 **Saving.** `:w` from anywhere writes the `.ipynb` (and so do `:wq` and `:x`, as in any
@@ -110,7 +120,20 @@ called first-class so far.
 
 ### tmux
 
-nbv needs no tmux configuration: images are drawn as coloured text (halfblocks) inside tmux
+For `Shift+Enter` and `Ctrl+Enter`, tmux (3.5 or newer) must pass modified keys on in the
+form nbv reads. Without these lines the header shows `⚠ tmux: Shift/Ctrl+Enter off`, `?`
+lists what to add, and everything else works:
+
+```tmux
+set -s extended-keys on
+set -s extended-keys-format csi-u
+set -as terminal-features 'xterm*:extkeys'
+```
+
+`extended-keys on` (not `always`) changes nothing for programs that don't ask for modified
+keys, such as your shell. The third line makes tmux ask your terminal for them.
+
+Images need no tmux configuration: they are drawn as coloured text (halfblocks) inside tmux
 by default. For sharp images in Kitty or Ghostty, enable passthrough:
 
 ```tmux

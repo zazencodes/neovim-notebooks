@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use nbv_core::{Change, CommitError, CommitOptions, Notebook, OpenError};
+use nbv_core::{Change, CommitError, CommitOptions, Notebook, OpenError, RenameError};
 use serde_json::Value;
 
 #[test]
@@ -172,4 +172,26 @@ fn reload_discards_tombstones_and_rebuilds() {
     assert!(nb.is_live(&key));
     assert!(!nb.is_mutated());
     assert_eq!(nb.undo(), None, "history is discarded");
+}
+
+#[test]
+fn rename_moves_the_file_and_later_writes_follow_it() {
+    let (dir, copy) = scratch_copy("v4.5-outputs.ipynb");
+    let before = std::fs::read(&copy).unwrap();
+    let mut nb = Notebook::open(&copy).unwrap();
+    for bad in ["", ".", "..", "sub/x.ipynb", "/tmp/x.ipynb"] {
+        assert!(matches!(nb.rename(bad), Err(RenameError::NotAFileName(_))), "{bad:?}");
+    }
+    std::fs::write(dir.path().join("taken.ipynb"), "{}").unwrap();
+    assert!(matches!(nb.rename("taken.ipynb"), Err(RenameError::Exists(_))));
+    assert_eq!(nb.path(), copy);
+
+    nb.rename("renamed.ipynb").unwrap();
+    let to = dir.path().join("renamed.ipynb");
+    assert_eq!(nb.path(), to);
+    assert!(!copy.exists());
+    assert_eq!(std::fs::read(&to).unwrap(), before);
+    // The file on disk is the one loaded, so writing needs no force.
+    nb.commit(CommitOptions::default()).unwrap();
+    assert!(!copy.exists());
 }

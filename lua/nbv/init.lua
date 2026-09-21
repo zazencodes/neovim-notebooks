@@ -243,6 +243,13 @@ local function create_buffer(key, spec)
     vim.cmd.nohlsearch()
     M.leave()
   end, { buffer = buf, silent = true, desc = 'nbv: leave the cell' })
+  -- Running from inside the cell. As mappings, they apply after every edit typed before them.
+  vim.keymap.set({ 'n', 'i' }, '<S-CR>', function()
+    M.act('run_advance')
+  end, { buffer = buf, silent = true, desc = 'nbv: run the cell and go to the next' })
+  vim.keymap.set({ 'n', 'i' }, '<C-CR>', function()
+    M.act('run')
+  end, { buffer = buf, silent = true, desc = 'nbv: run the cell' })
   return buf
 end
 
@@ -375,15 +382,115 @@ function M.set_modified()
   end
 end
 
---- Offers kernels in the user's picker (`vim.ui.select`), without blocking RPC.
+--- Opens `lines` in a centred float with focus, read-only, moved through with the usual
+--- motions. Returns the buffer and a function that closes the float and returns home.
+local function open_list(lines, title)
+  local buf = api.nvim_create_buf(false, true)
+  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = 'wipe'
+  local w = vim.fn.strdisplaywidth(title) + 4
+  for _, l in ipairs(lines) do
+    w = math.max(w, vim.fn.strdisplaywidth(l) + 1)
+  end
+  w = math.min(w, vim.o.columns - 4)
+  local h = math.min(#lines, vim.o.lines - 4)
+  local win = api.nvim_open_win(buf, true, {
+    relative = 'editor',
+    row = math.floor((vim.o.lines - h) / 2) - 1,
+    col = math.floor((vim.o.columns - w) / 2),
+    width = w,
+    height = h,
+    border = 'rounded',
+    title = title,
+    title_pos = 'center',
+    style = 'minimal',
+  })
+  -- Not the home window's transparency, which a new window copies.
+  set_local(win, 'winhighlight', '')
+  return buf, win, function()
+    api.nvim_win_close(win, true)
+    M.leave()
+  end
+end
+
+--- Offers kernels in a list: the usual motions move, `<CR>` picks, `q` cancels.
 function M.pick_kernel(items)
+  local lines = {}
+  for i, item in ipairs(items) do
+    lines[i] = ' ' .. item
+  end
+  local buf, win, close = open_list(lines, ' Kernel · <CR> picks · q cancels ')
+  set_local(win, 'cursorline', true)
+  local opts = { buffer = buf, nowait = true, silent = true }
+  vim.keymap.set('n', '<CR>', function()
+    local index = api.nvim_win_get_cursor(win)[1]
+    close()
+    notify('kernel_chosen', { index = index })
+  end, vim.tbl_extend('force', opts, { desc = 'nbv: pick this kernel' }))
+  vim.keymap.set('n', 'q', close, vim.tbl_extend('force', opts, { desc = 'nbv: cancel' }))
+end
+
+--- Asks for the notebook's new file name, starting from the current one.
+function M.rename(name)
   vim.schedule(function()
-    vim.ui.select(items, { prompt = 'Kernel' }, function(_, index)
-      if index then
-        notify('kernel_chosen', { index = index })
+    vim.ui.input({ prompt = 'Rename: ', default = name }, function(value)
+      if value and value ~= '' and value ~= name then
+        notify('rename', { name = value })
       end
     end)
   end)
+end
+
+--- Gives the home buffer the renamed notebook's name, and drops the alternate buffer
+--- renaming leaves under the old one.
+function M.rename_home(name)
+  local old = api.nvim_buf_get_name(M.home_buf)
+  api.nvim_buf_set_name(M.home_buf, name)
+  M.home_name = name
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if b ~= M.home_buf and api.nvim_buf_get_name(b) == old then
+      api.nvim_buf_delete(b, { force = true })
+    end
+  end
+end
+
+--- Shows the key list in a float: `sections` is `{ { title, { { keys, description }, … } }, … }`.
+--- `q`, `<Esc>` or `?` closes it.
+function M.help(sections)
+  local lines, marks = {}, {}
+  local width = 0
+  for _, s in ipairs(sections) do
+    for _, k in ipairs(s[2]) do
+      width = math.max(width, vim.fn.strdisplaywidth(k[1]))
+    end
+  end
+  for i, s in ipairs(sections) do
+    if i > 1 then
+      lines[#lines + 1] = ''
+    end
+    lines[#lines + 1] = ' ' .. s[1]
+    marks[#marks + 1] = { #lines - 1, 0, -1, 'Title' }
+    for _, k in ipairs(s[2]) do
+      if k[1] == '' then
+        -- A row without a key is prose, not a key column.
+        lines[#lines + 1] = '   ' .. k[2]
+      else
+        local pad = string.rep(' ', width - vim.fn.strdisplaywidth(k[1]))
+        lines[#lines + 1] = '   ' .. k[1] .. pad .. '  ' .. k[2]
+        marks[#marks + 1] = { #lines - 1, 3, 3 + #k[1], 'Special' }
+      end
+    end
+  end
+  local buf, _, close = open_list(lines, ' nbv keys · q closes ')
+  local ns = api.nvim_create_namespace('nbv_help')
+  for _, m in ipairs(marks) do
+    local stop = m[3] == -1 and #lines[m[1] + 1] or m[3]
+    api.nvim_buf_set_extmark(buf, ns, m[1], m[2], { end_col = stop, hl_group = m[4] })
+  end
+  for _, key in ipairs({ 'q', '<Esc>', '?' }) do
+    vim.keymap.set('n', key, close, { buffer = buf, nowait = true, silent = true, desc = 'nbv: close the key list' })
+  end
 end
 
 --- Asks the user for a line on behalf of the kernel (`input()`), without blocking RPC.
@@ -399,7 +506,6 @@ local commands = {
   { 'NbvRunAll', 'run_all' },
   { 'NbvRunAbove', 'run_above' },
   { 'NbvSplit', 'split' },
-  { 'NbvKernel', 'kernel' },
 }
 
 --- The first read of the home buffer, at startup. Later reads are reloads (intercept_io).

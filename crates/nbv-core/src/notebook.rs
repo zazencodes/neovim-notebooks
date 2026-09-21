@@ -60,6 +60,16 @@ pub enum CommitError {
     Io(PathBuf, std::io::Error),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RenameError {
+    #[error("{0:?} is not a file name: the notebook stays in its directory")]
+    NotAFileName(String),
+    #[error("{0} already exists")]
+    Exists(PathBuf),
+    #[error("cannot rename {0}: {1}")]
+    Io(PathBuf, std::io::Error),
+}
+
 pub struct Notebook {
     path: PathBuf,
     /// The top-level object. Its `cells` entry is rebuilt from `order` on serialisation.
@@ -422,6 +432,23 @@ impl Notebook {
             let _ = d.sync_all();
         }
         self.disk_hash = Some(Sha256::digest(&bytes).into());
+        Ok(())
+    }
+
+    /// Renames the `.ipynb` on disk to `name`, in the same directory. The document, its unsaved
+    /// changes and its history carry over; the next write goes to the new name.
+    pub fn rename(&mut self, name: &str) -> Result<(), RenameError> {
+        let mut parts = Path::new(name).components();
+        let single = matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(n)), None) if n == name);
+        if !single {
+            return Err(RenameError::NotAFileName(name.into()));
+        }
+        let to = self.path.with_file_name(name);
+        if fs::symlink_metadata(&to).is_ok() {
+            return Err(RenameError::Exists(to));
+        }
+        fs::rename(&self.path, &to).map_err(|e| RenameError::Io(self.path.clone(), e))?;
+        self.path = to;
         Ok(())
     }
 

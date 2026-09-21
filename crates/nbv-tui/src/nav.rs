@@ -38,7 +38,71 @@ pub enum Action {
     Restart,
     /// Neovim's command line.
     Cmdline,
+    /// The previous / next item in the header.
+    Left,
+    Right,
+    /// The key list.
+    Help,
 }
+
+/// Heads the key list when tmux passes on no modified keys.
+pub const TMUX_SETUP: (&str, &[(&str, &str)]) = (
+    "tmux: Shift+Enter and Ctrl+Enter are off",
+    &[
+        ("", "Add to tmux.conf, then restart tmux:"),
+        ("", "set -s extended-keys on"),
+        ("", "set -s extended-keys-format csi-u"),
+        ("", "set -as terminal-features 'xterm*:extkeys'"),
+    ],
+);
+
+/// The key list `?` shows, in sections.
+pub const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Cells (NAV)",
+        &[
+            ("j k", "next / previous cell; counts work (3j)"),
+            ("gg G {n}G", "first / last / nth cell"),
+            ("<C-d> <C-u>", "scroll half a page"),
+            ("<CR>", "edit the cell"),
+            ("o O", "new code cell below / above"),
+            ("dd yy", "delete / yank the cell"),
+            ("p P", "paste below / above"),
+            ("u <C-r>", "undo / redo a cell change"),
+            ("J", "join the next cell onto this one"),
+            ("]e [e", "move the cell down / up"),
+            ("tc tm tr", "make it code / markdown / raw"),
+            ("x <S-CR>", "run and select the next cell"),
+            ("r <C-CR>", "run and stay on the cell"),
+            ("ii 00", "interrupt / restart the kernel"),
+            (":", "Neovim's command line"),
+            ("?", "this list"),
+        ],
+    ),
+    (
+        "Header (k on the first cell)",
+        &[("h l", "file name / kernel"), ("<CR>", "rename the file / pick the kernel"), ("j", "back to the cells")],
+    ),
+    (
+        "Editing a cell (EDIT)",
+        &[
+            ("<Esc>", "leave the cell, from Normal mode (from Insert, <Esc><Esc>)"),
+            ("<S-CR>", "run the cell and go to the next"),
+            ("<C-CR>", "run the cell and keep editing"),
+            ("", "everything else is your own Neovim"),
+        ],
+    ),
+    (
+        "Commands",
+        &[
+            (":w :wq :q!", "save / save and quit / quit without saving"),
+            (":NbvRunAll", "run every code cell"),
+            (":NbvRunAbove", "run the code cells above this one"),
+            (":NbvSplit", "split the edited cell at the cursor"),
+            (":NbvClearOutput[!]", "clear this cell's outputs (! for every cell)"),
+        ],
+    ),
+];
 
 /// Keys that start a two-key chord.
 const PREFIXES: [&str; 8] = ["g", "d", "y", "t", "i", "0", "]", "["];
@@ -92,11 +156,14 @@ impl Nav {
             (Some("t"), "c") => Kind(CellKind::Code),
             (Some("t"), "m") => Kind(CellKind::Markdown),
             (Some("t"), "r") => Kind(CellKind::Raw),
-            (None, "x") => RunAdvance,
-            (None, "r") => Run,
+            (None, "x" | "<S-CR>") => RunAdvance,
+            (None, "r" | "<C-CR>") => Run,
             (Some("i"), "i") => Interrupt,
             (Some("0"), "0") => Restart,
             (None, ":") => Cmdline,
+            (None, "h") => Left,
+            (None, "l") => Right,
+            (None, "?") => Help,
             (None, first) if let Some(p) = PREFIXES.iter().find(|p| **p == first) => {
                 self.pending = Some(p);
                 self.count = count;
@@ -121,6 +188,8 @@ mod tests {
     fn motions_take_counts() {
         assert_eq!(feed(&["j", "3", "k", "1", "0", "j"]), [Action::Down(1), Action::Up(3), Action::Down(10)]);
         assert_eq!(feed(&["g", "g", "G", "2", "G"]), [Action::First, Action::Last(None), Action::Last(Some(2))]);
+        assert_eq!(feed(&["h", "l", "?"]), [Action::Left, Action::Right, Action::Help]);
+        assert_eq!(feed(&["<S-CR>", "<C-CR>"]), [Action::RunAdvance, Action::Run]);
     }
 
     #[test]

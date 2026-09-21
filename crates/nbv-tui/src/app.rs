@@ -16,6 +16,7 @@ use futures::StreamExt;
 use jupyter_protocol::JupyterMessage;
 use nbv_core::exec::{ExecEvent, Executor, KernelStatus};
 use nbv_core::kernel::{self, Kernel, KernelCommand, KernelError, KernelMessage};
+use nbv_core::memory::KernelMemory;
 use nbv_core::{CellKey, CellKind, Change, ExecState, Notebook};
 use nbv_nvim::editor::{self, Editor, EditorEvent, EditorRect, Focus, Theme, field};
 use nbv_nvim::redraw::CursorShape;
@@ -34,7 +35,7 @@ use tokio::sync::mpsc;
 
 use crate::compose::{self, Region};
 use crate::layout::{Block, Geometry, Layout};
-use crate::nav::{Action, Nav};
+use crate::nav::{self, Action, Nav};
 use crate::outputs::{self, Images, OutputView};
 use crate::terminal::{self as term, Tmux};
 
@@ -43,6 +44,9 @@ pub struct Options {
     pub clean: bool,
     pub nvim: PathBuf,
 }
+
+/// Where a failed or missing kernel's message points.
+const PICK_KERNEL: &str = "pick one in the header: gg k l <CR>";
 
 enum KernelStart {
     Ready(u64, Result<Kernel, KernelError>),
@@ -59,17 +63,26 @@ enum Mode {
     Other,
 }
 
+/// What can be selected in the header, above the first cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderItem {
+    /// The notebook's file name: `<CR>` renames the file.
+    Name,
+    /// The kernel: `<CR>` picks another.
+    Kernel,
+}
+
 struct App {
     nb: Notebook,
     editor: Editor,
     client: EmbeddedNvim,
     exec: Executor,
     kernel: Option<Kernel>,
-    /// The kernel chosen for this session: resolved at startup, or picked with `:NbvKernel`.
+    /// The kernel chosen for this session: resolved at startup, or picked in the header.
     kernel_cmd: Option<KernelCommand>,
     /// Why there is no working kernel. Runs fail with it, shown under the cell.
     kernel_error: Option<String>,
-    /// What `:NbvKernel` last offered, in the order shown.
+    /// What the kernel picker last offered, in the order shown.
     kernel_choices: Vec<KernelCommand>,
     generation: u64,
     kernel_tx: mpsc::UnboundedSender<KernelMessage>,
@@ -78,6 +91,10 @@ struct App {
     pending: Vec<JupyterMessage>,
     input_request: Option<JupyterMessage>,
     message: Option<String>,
+    /// tmux passes on no modified keys, so `<S-CR>` and `<C-CR>` arrive as `<CR>`.
+    tmux_keys_missing: bool,
+    /// The kernel picked for each notebook, across sessions.
+    memory: KernelMemory,
     views: HashMap<CellKey, OutputView>,
     images: Images,
     protocols: HashMap<(u64, u16, u16), SlicedProtocol>,
@@ -91,6 +108,8 @@ struct App {
     /// Sequence number of the latest focus change nbv asked for (§10.2).
     focus_seq: u64,
     selected: usize,
+    /// The header item selected in navigation mode, instead of a cell.
+    header: Option<HeaderItem>,
     scroll: usize,
     geometry: Option<Geometry>,
     theme: Theme,
@@ -115,10 +134,13 @@ struct App {
 }
 
 /// Restores the terminal on drop, including on panic.
-struct TerminalGuard;
+struct TerminalGuard {
+    tmux: bool,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        term::stop_reporting_modified_keys(self.tmux);
         let mut out = std::io::stdout();
         let _ = execute!(
             out,
@@ -147,17 +169,24 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         event::EnableBracketedPaste,
         event::EnableFocusChange
     )?;
-    let _guard = TerminalGuard;
+    let _guard = TerminalGuard { tmux: tmux.is_some() };
     // The capability query reads stdin, so it must run before the event stream starts.
     let picker = term::picker(tmux.as_ref());
+    term::report_modified_keys(tmux.is_some())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     terminal.clear()?;
     let size = terminal.size()?;
 
     // Before Neovim starts: code cells are edited in the kernel's language.
-    let (kernel_cmd, kernel_error) = match kernel::resolve(nb.kernel_name()).await {
+    // The kernel picked last time comes first; without one, nbv picks as Jupyter does.
+    let memory = KernelMemory::open()?;
+    let resolved = match memory.get(nb.path()) {
+        Some(cmd) => Ok(cmd.clone()),
+        None => kernel::resolve(nb.kernel_name()).await,
+    };
+    let (kernel_cmd, kernel_error) = match resolved {
         Ok(cmd) => (Some(cmd), None),
-        Err(e) => (None, Some(format!("{e} (:NbvKernel picks one)"))),
+        Err(e) => (None, Some(format!("{e} ({PICK_KERNEL})"))),
     };
     let (client, mut nvim_rx) = editor::spawn(opts.nvim.clone(), opts.clean, &[], &notebook).await?;
     let (err_tx, mut err_rx) = mpsc::unbounded_channel::<NvimError>();
@@ -190,6 +219,9 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         pending: vec![],
         input_request: None,
         message: None,
+        // Short enough not to wrap into a hit-enter prompt; the README has the lines to add.
+        tmux_keys_missing: tmux.as_ref().is_some_and(|t| !t.extended_keys),
+        memory,
         views: HashMap::new(),
         images: Images::default(),
         protocols: HashMap::new(),
@@ -201,6 +233,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         mode: Mode::Nav,
         focus_seq: 0,
         selected: 0,
+        header: None,
         scroll: 0,
         geometry: None,
         theme: Theme::new(),
@@ -313,7 +346,7 @@ impl App {
             }
             Err(e) => {
                 let name = self.kernel_cmd.as_ref().map_or("kernel", |c| c.display_name.as_str());
-                self.kernel_failed(format!("{name} could not start (00 retries, :NbvKernel picks another):\n{e}"));
+                self.kernel_failed(format!("{name} could not start (00 retries; {PICK_KERNEL}):\n{e}"));
             }
         }
         self.draw = true;
@@ -633,6 +666,7 @@ impl App {
     }
 
     fn select(&mut self, i: usize) {
+        self.header = None;
         self.selected = i.min(self.nb.order().len().saturating_sub(1));
         self.reveal = true;
         self.relayout = true;
@@ -659,6 +693,7 @@ impl App {
     /// focus when the request arrives.
     fn enter(&mut self, key: CellKey, insert: bool) {
         self.focus_seq += 1;
+        self.header = None;
         self.selected = self.nb.index_of(&key).unwrap_or(self.selected);
         self.mode = Mode::Edit(key.clone());
         self.relayout();
@@ -673,11 +708,42 @@ impl App {
     }
 
     async fn on_action(&mut self, action: Action) {
+        if let Some(item) = self.header {
+            match action {
+                Action::Left | Action::Right => {
+                    self.header = Some(if action == Action::Left { HeaderItem::Name } else { HeaderItem::Kernel });
+                    self.draw = true;
+                }
+                Action::Edit => match item {
+                    HeaderItem::Name => {
+                        self.editor.calls.lua("require('nbv').rename(...)", vec![self.file_name().into()])
+                    }
+                    HeaderItem::Kernel => self.pick_kernel().await,
+                },
+                // The header sits above the first cell.
+                Action::Down(n) => self.select(n - 1),
+                // Selecting a cell leaves the header; the rest need no cell.
+                Action::First | Action::Last(_) | Action::Help | Action::Cmdline => {
+                    return self.on_cell_action(action).await;
+                }
+                _ => {}
+            }
+            return;
+        }
+        self.on_cell_action(action).await
+    }
+
+    async fn on_cell_action(&mut self, action: Action) {
         let len = self.nb.order().len();
         let area = self.geometry.map_or(20, |g| g.area_height()) as isize;
         let key = self.selected_key();
         match action {
             Action::Down(n) => self.select(self.selected.saturating_add(n)),
+            // Past the first cell, the header.
+            Action::Up(_) if self.selected == 0 => {
+                self.header = Some(HeaderItem::Name);
+                self.draw = true;
+            }
             Action::Up(n) => self.select(self.selected.saturating_sub(n)),
             Action::First => self.select(0),
             Action::Last(None) => self.select(len.saturating_sub(1)),
@@ -757,12 +823,61 @@ impl App {
                 self.forward_since = Some(self.editor.grid.mode_changes);
                 self.editor.calls.input(":");
             }
+            Action::Help => {
+                let setup: &[(&str, &[(&str, &str)])] = if self.tmux_keys_missing { &[nav::TMUX_SETUP] } else { &[] };
+                let sections = setup
+                    .iter()
+                    .chain(nav::HELP)
+                    .map(|(title, keys)| {
+                        let keys = keys.iter().map(|(k, d)| Value::Array(vec![(*k).into(), (*d).into()])).collect();
+                        Value::Array(vec![(*title).into(), Value::Array(keys)])
+                    })
+                    .collect();
+                self.editor.calls.lua("require('nbv').help(...)", vec![Value::Array(sections)]);
+            }
+            // Only the header has items side by side.
+            Action::Left | Action::Right => {}
         }
+    }
+
+    fn file_name(&self) -> String {
+        self.nb.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// Offers the kernels found in Neovim's picker; `kernel_chosen` brings the answer.
+    async fn pick_kernel(&mut self) {
+        self.kernel_choices = kernel::choices().await;
+        if self.kernel_choices.is_empty() {
+            self.message =
+                Some("no kernels found: activate a virtualenv with ipykernel, or install a kernelspec".into());
+            self.draw = true;
+            return;
+        }
+        let items = self
+            .kernel_choices
+            .iter()
+            .map(|c| {
+                let spec = c.spec.as_ref().map(|s| format!(" [{s}]")).unwrap_or_default();
+                Value::from(format!("{}{spec}", c.display_name))
+            })
+            .collect();
+        self.editor.calls.lua("require('nbv').pick_kernel(...)", vec![Value::Array(items)]);
     }
 
     async fn on_command(&mut self, action: &str, args: &Value) {
         let key = self.command_key(args);
         match action {
+            // <S-CR> and <C-CR> in the cell being edited.
+            "run" => self.run_cells(key.into_iter().collect()).await,
+            "run_advance" => {
+                if let Some(k) = key {
+                    self.run_cells(vec![k.clone()]).await;
+                    if matches!(self.mode, Mode::Edit(_)) {
+                        self.leave();
+                    }
+                    self.advance(&k);
+                }
+            }
             "run_all" => {
                 let keys = self.code_cells();
                 self.run_cells(keys).await;
@@ -796,23 +911,22 @@ impl App {
                 self.mark_dirty();
                 self.relayout = true;
             }
-            "kernel" => {
-                self.kernel_choices = kernel::choices().await;
-                if self.kernel_choices.is_empty() {
-                    self.message =
-                        Some("no kernels found: activate a virtualenv with ipykernel, or install a kernelspec".into());
-                    self.draw = true;
-                    return;
+            "rename" => {
+                let name = field(args, "name").and_then(Value::as_str).expect("the prompt sends a name");
+                let from = self.nb.path().to_path_buf();
+                match self.nb.rename(name) {
+                    Ok(()) => {
+                        self.message = Some(match self.memory.renamed(&from, self.nb.path()) {
+                            Ok(()) => format!("renamed to {name}"),
+                            Err(e) => e.to_string(),
+                        });
+                        self.editor.renamed(&self.nb);
+                        self.last_sent = None;
+                        self.relayout = true;
+                    }
+                    Err(e) => self.message = Some(e.to_string()),
                 }
-                let items = self
-                    .kernel_choices
-                    .iter()
-                    .map(|c| {
-                        let spec = c.spec.as_ref().map(|s| format!(" [{s}]")).unwrap_or_default();
-                        Value::from(format!("{}{spec}", c.display_name))
-                    })
-                    .collect();
-                self.editor.calls.lua("require('nbv').pick_kernel(...)", vec![Value::Array(items)]);
+                self.draw = true;
             }
             "kernel_chosen" => {
                 let index = field(args, "index").and_then(Value::as_u64).expect("the picker sends an index") as usize;
@@ -821,6 +935,9 @@ impl App {
                     // Saved with the notebook, as Jupyter does.
                     self.nb.set_kernelspec(spec, &cmd.display_name, &cmd.language);
                     self.mark_dirty();
+                }
+                if let Err(e) = self.memory.remember(self.nb.path(), &cmd) {
+                    self.message = Some(e.to_string());
                 }
                 self.editor.set_language(Some(cmd.language.clone()));
                 self.kernel_cmd = Some(cmd);
@@ -939,7 +1056,7 @@ impl App {
     }
 
     fn header(&self) -> Line<'static> {
-        let name = self.nb.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = self.file_name();
         let (state, icon) = match self.exec.status() {
             KernelStatus::Starting => ("starting", "◌"),
             KernelStatus::Idle => ("idle", "○"),
@@ -954,19 +1071,46 @@ impl App {
         };
         let title = Style::default().fg(self.color("header").unwrap_or(Color::Reset)).add_modifier(Modifier::BOLD);
         let dim = Style::default().fg(self.color("dim").unwrap_or(Color::Reset));
+        let kernel = match (&self.kernel_cmd, &self.kernel_error) {
+            (None, _) => Span::styled(" no kernel ", self.error_style()),
+            (Some(c), Some(_)) => Span::styled(format!(" {} ✗ failed ", c.display_name), self.error_style()),
+            (Some(c), None) => Span::styled(format!(" {} {icon} {state} ", c.display_name), dim),
+        };
+        let mark = |span: Span<'static>, item: HeaderItem| {
+            if self.header != Some(item) {
+                return span;
+            }
+            let fg = self.color("nav").unwrap_or(Color::Reset);
+            span.style(Style::default().fg(fg).add_modifier(Modifier::BOLD | Modifier::REVERSED))
+        };
         let mut spans = vec![
-            Span::styled(format!(" {name} "), title),
-            match (&self.kernel_cmd, &self.kernel_error) {
-                (None, _) => Span::styled(" no kernel ", self.error_style()),
-                (Some(c), Some(_)) => Span::styled(format!(" {} ✗ failed ", c.display_name), self.error_style()),
-                (Some(c), None) => Span::styled(format!(" {} {icon} {state} ", c.display_name), dim),
-            },
+            mark(Span::styled(format!(" {name} "), title), HeaderItem::Name),
             Span::styled(format!(" {mode} {} ", self.nav.partial()), title),
+            mark(kernel, HeaderItem::Kernel),
         ];
         if let Some(m) = &self.message {
             spans.push(Span::styled(format!(" {m}"), dim));
         }
         Line::from(spans)
+    }
+
+    /// How to go on from here, at the header's right end: the way to the key list, after a
+    /// warning when tmux keeps `<S-CR>` and `<C-CR>` from nbv (the key list says what to add).
+    fn hint(&self) -> Option<Line<'static>> {
+        let text = match (&self.mode, self.header) {
+            (Mode::Nav, None) => " ? help ",
+            (Mode::Nav, Some(_)) => " h l select · <CR> open · ? help ",
+            (Mode::Edit(_), _) => " <Esc><Esc> to cells ",
+            (Mode::Other, _) => return None,
+        };
+        let dim = Style::default().fg(self.color("dim").unwrap_or(Color::Reset));
+        let mut spans = vec![];
+        if self.tmux_keys_missing {
+            let warn = Style::default().fg(self.color("running").unwrap_or(Color::Reset)).add_modifier(Modifier::BOLD);
+            spans.push(Span::styled(" ⚠ tmux: Shift/Ctrl+Enter off", warn));
+        }
+        spans.push(Span::styled(text, dim));
+        Some(Line::from(spans))
     }
 
     fn draw(&mut self) -> anyhow::Result<()> {
@@ -1003,6 +1147,7 @@ impl App {
         let grid = &self.editor.grid;
         let base = compose::style_of(None, grid.default_fg, grid.default_bg);
         let header = self.header();
+        let hint = self.hint();
         let decorations: Vec<Decoration> = match &self.shown {
             Some((layout, _)) => layout.blocks.iter().map(|b| self.decoration(b)).collect(),
             None => vec![],
@@ -1023,7 +1168,14 @@ impl App {
             if let Some(g) = geometry {
                 let v = g.viewport;
                 if v.row < area.height {
-                    buf.set_line(v.col, v.row, &header, v.width.min(area.width.saturating_sub(v.col)));
+                    let width = v.width.min(area.width.saturating_sub(v.col));
+                    // The hint keeps its place at the right end; the header's text gives way.
+                    let hint = hint.filter(|h| h.width() < width as usize);
+                    let hint_width = hint.as_ref().map_or(0, |h| h.width() as u16);
+                    buf.set_line(v.col, v.row, &header, width - hint_width);
+                    if let Some(hint) = &hint {
+                        buf.set_line(v.col + width - hint_width, v.row, hint, hint_width);
+                    }
                 }
                 if let Some(hint) = &empty_hint {
                     buf.set_line(g.inner_x().0, g.area_top(), hint, g.inner_x().1);
@@ -1056,7 +1208,7 @@ impl App {
 
     fn decoration(&self, b: &Block) -> Decoration {
         let active = self.mode == Mode::Edit(b.key.clone());
-        let selected = self.mode == Mode::Nav && self.selected_key().as_ref() == Some(&b.key);
+        let selected = self.mode == Mode::Nav && self.header.is_none() && self.selected_key().as_ref() == Some(&b.key);
         let border = if active {
             self.color("edit")
         } else if selected {

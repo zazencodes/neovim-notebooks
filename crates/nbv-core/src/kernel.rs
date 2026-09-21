@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 /// How to start a kernel.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct KernelCommand {
     /// `{connection_file}` is replaced with the connection file path.
     pub argv: Vec<String>,

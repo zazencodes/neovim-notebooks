@@ -334,6 +334,13 @@ impl Editor {
         self.calls.input(&format!("<C-\\><C-n><Cmd>lua require('nbv').leave({seq})<CR>"));
     }
 
+    /// Follows the notebook to its new path after a rename: the home buffer takes the new
+    /// name, and every cell buffer is wiped, so the next layout recreates it under the new name.
+    pub fn renamed(&mut self, nb: &Notebook) {
+        self.calls.lua("require('nbv').rename_home(...)", vec![home_name(nb.path()).into()]);
+        self.wipe_all();
+    }
+
     /// Marks the home buffer modified, so quitting with unsaved changes is refused as usual.
     pub fn set_modified(&self) {
         self.calls.lua("require('nbv').set_modified()", vec![]);

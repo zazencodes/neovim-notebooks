@@ -1,6 +1,9 @@
 //! Terminal identification, image protocol selection (§12) and tmux policy (§12.2).
 
+use std::io::Write;
 use std::process::Command;
+
+use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 
 use ratatui_image::picker::{Picker, ProtocolType};
 
@@ -19,6 +22,9 @@ pub struct Tmux {
     /// tmux itself parses and redraws Sixel (3.4+ built with Sixel support).
     pub sixel: bool,
     pub outer: Option<Term>,
+    /// tmux gets modified keys (`<S-CR>`) from the outer terminal and passes them on in the
+    /// CSI u form nbv reads (§10.2).
+    pub extended_keys: bool,
 }
 
 fn classify(name: &str) -> Term {
@@ -62,6 +68,7 @@ fn tmux(args: &[&str]) -> Option<String> {
 /// outer terminal is identified through tmux: capability replies inside tmux describe tmux.
 pub fn probe_tmux() -> Tmux {
     let opt = |name: &str| tmux(&["show-options", "-gv", name]).unwrap_or_default();
+    let server = |name: &str| tmux(&["show-options", "-sv", name]).unwrap_or_default();
     let client = tmux(&["display-message", "-p", "#{client_termname}\t#{client_termtype}\t#{client_termfeatures}"])
         .unwrap_or_default();
     let mut fields = client.split('\t');
@@ -76,7 +83,32 @@ pub fn probe_tmux() -> Tmux {
         passthrough: matches!(opt("allow-passthrough").as_str(), "on" | "all"),
         sixel: features.split(',').any(|f| f == "sixel"),
         outer: Some(outer),
+        extended_keys: matches!(server("extended-keys").as_str(), "on" | "always")
+            && server("extended-keys-format") == "csi-u"
+            // Without it, tmux never asks the outer terminal to report modifiers.
+            && features.split(',').any(|f| f == "extkeys"),
     }
+}
+
+/// Asks the terminal to report modified keys (`<S-CR>`, `<C-CR>`) distinctly from plain ones
+/// (§10.2). Directly, through the Kitty keyboard protocol; inside tmux, which ignores that
+/// protocol, through modifyOtherKeys, which tmux answers in CSI u form when configured to.
+/// Terminals with neither send the plain key.
+pub fn report_modified_keys(tmux: bool) -> std::io::Result<()> {
+    let mut out = std::io::stdout();
+    if tmux {
+        out.write_all(b"\x1b[>4;1m")?;
+    } else {
+        crossterm::queue!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+    }
+    out.flush()
+}
+
+/// Undoes `report_modified_keys`.
+pub fn stop_reporting_modified_keys(tmux: bool) {
+    let mut out = std::io::stdout();
+    let _ = if tmux { out.write_all(b"\x1b[>4m") } else { crossterm::queue!(out, PopKeyboardEnhancementFlags) };
+    let _ = out.flush();
 }
 
 /// The per-terminal override table (§12), applied over capability detection.
@@ -143,7 +175,7 @@ mod tests {
         assert_eq!(choose_protocol(d, &Term::Other("tmux".into()), Some(&t)), ProtocolType::Kitty);
         t.passthrough = false;
         assert_eq!(choose_protocol(d, &Term::Other("tmux".into()), Some(&t)), ProtocolType::Halfblocks);
-        let w = Tmux { outer: Some(Term::WezTerm), passthrough: true, sixel: true };
+        let w = Tmux { outer: Some(Term::WezTerm), passthrough: true, sixel: true, ..Default::default() };
         assert_eq!(choose_protocol(d, &Term::WezTerm, Some(&w)), ProtocolType::Sixel);
         let w = Tmux { outer: Some(Term::WezTerm), passthrough: true, ..Default::default() };
         assert_eq!(choose_protocol(d, &Term::WezTerm, Some(&w)), ProtocolType::Halfblocks);

@@ -32,6 +32,11 @@ impl Session {
     /// Starts nbv on a notebook written from `cells` (source strings), under a tmux with no
     /// configuration.
     fn start(cells: &[&str]) -> Option<Session> {
+        Session::start_with(cells, "")
+    }
+
+    /// As `start`, under a tmux configured with `conf`.
+    fn start_with(cells: &[&str], conf: &str) -> Option<Session> {
         let nvim = nvim()?;
         let venv = root().join(".venv");
         if !venv.join("bin/python").exists() || Command::new("tmux").arg("-V").output().is_err() {
@@ -52,14 +57,16 @@ impl Session {
         // The temporary directory's name is unique, so parallel tests get their own servers.
         let socket = format!("nbv-test-{}", dir.path().file_name().unwrap().to_string_lossy());
         let cmd = format!(
-            "cd {} && VIRTUAL_ENV={} NBV_NVIM={} {} --clean t.ipynb; echo NBV-EXITED-$?; sleep 30",
+            "cd {0} && XDG_STATE_HOME={0}/state VIRTUAL_ENV={1} NBV_NVIM={2} {3} --clean t.ipynb; echo NBV-EXITED-$?; sleep 30",
             dir.path().display(),
             venv.display(),
             nvim.display(),
             env!("CARGO_BIN_EXE_nbv"),
         );
         let s = Session { socket, dir };
-        s.tmux(&["-f", "/dev/null", "new-session", "-d", "-s", "t", "-x", "90", "-y", "30", &cmd]);
+        let conf_path = s.dir.path().join("tmux.conf");
+        std::fs::write(&conf_path, conf).unwrap();
+        s.tmux(&["-f", &conf_path.to_string_lossy(), "new-session", "-d", "-s", "t", "-x", "90", "-y", "30", &cmd]);
         s.wait_for(" NAV");
         Some(s)
     }
@@ -227,4 +234,90 @@ fn clean_exit_leaves_no_processes() {
     let ps = String::from_utf8_lossy(&ps.stdout);
     let dir = s.dir.path().to_string_lossy().into_owned();
     assert!(!ps.lines().any(|l| l.contains(&dir) && !l.contains("tmux")), "processes left behind:\n{ps}");
+}
+
+#[test]
+fn help_and_the_header() {
+    let Some(s) = Session::start(&["x = 1", "x + 1"]) else { return };
+    // This tmux reports no modified keys, and nbv says so.
+    s.wait_for("⚠ tmux: Shift/Ctrl+Enter off");
+    // The way to the key list is always on screen, and ? opens it.
+    s.wait_for("? help");
+    s.keys(&["?"]);
+    let screen = s.wait_for("nbv keys");
+    assert!(screen.contains("set -s extended-keys-format csi-u"), "the fix heads the list\n{screen}");
+    assert!(screen.contains("Cells (NAV)"), "{screen}");
+    s.keys(&["q"]);
+    s.wait_for(" NAV");
+    assert!(!s.screen().contains("nbv keys"));
+
+    // gg and G stay on cells; k past the first cell reaches the header, j comes back.
+    s.keys(&["G", "g", "g"]);
+    assert!(!s.screen().contains("h l select"));
+    s.keys(&["k"]);
+    s.wait_for("h l select");
+    s.keys(&["j"]);
+    s.wait_for("? help");
+    assert!(!s.screen().contains("h l select"));
+
+    // The kernel item opens a list moved through with motions; q cancels it.
+    s.keys(&["k", "l", "Enter"]);
+    let screen = s.wait_for("<CR> picks · q cancels");
+    assert!(screen.contains("neovim-notebooks/.venv"), "the active virtualenv is offered\n{screen}");
+    s.keys(&["j", "k", "q"]);
+    s.wait_for(" NAV");
+    assert!(!s.screen().contains("<CR> picks"));
+    // <CR> picks the kernel under the cursor, and nbv restarts onto it.
+    s.keys(&["Enter"]);
+    s.wait_for("<CR> picks");
+    s.keys(&["Enter"]);
+    s.wait_for(" NAV");
+    assert!(!s.screen().contains("<CR> picks"));
+
+    // The file name item renames the notebook; later writes follow it.
+    s.keys(&["h", "Enter"]);
+    s.wait_for("Rename: t.ipynb");
+    s.keys(&["C-u", "u.ipynb", "Enter"]);
+    s.wait_for(" u.ipynb ");
+    s.keys(&["j", "Enter"]);
+    s.wait_for(" EDIT");
+    s.keys(&["A", "  # edited", "Escape"]);
+    s.keys(&["Escape"]);
+    s.wait_for(" NAV");
+    s.keys(&[":wq", "Enter"]);
+    s.wait_for("NBV-EXITED-0");
+    assert!(!s.dir.path().join("t.ipynb").exists());
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.dir.path().join("u.ipynb")).unwrap()).unwrap();
+    assert_eq!(saved["cells"][0]["source"], serde_json::json!("x = 1  # edited"));
+    // The kernel picked is remembered for the notebook, under its new name.
+    let memory: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.dir.path().join("state/nbv/kernels.json")).unwrap()).unwrap();
+    let key = s.dir.path().canonicalize().unwrap().join("u.ipynb").to_string_lossy().into_owned();
+    assert!(memory[&key]["display_name"].is_string(), "{memory}");
+}
+
+#[test]
+fn shift_and_ctrl_enter_run_cells() {
+    let conf = "set -s extended-keys on\nset -s extended-keys-format csi-u\n";
+    let Some(s) = Session::start_with(&["x = 1", "x + 1"], conf) else { return };
+    // From navigation: <S-CR> runs and selects the next cell, <C-CR> runs and stays.
+    s.keys(&["S-Enter"]);
+    s.wait_for("[1]");
+    s.keys(&["C-Enter"]);
+    s.wait_for("[2]");
+    s.keys(&["C-Enter"]);
+    let screen = s.wait_for("[3]");
+    assert!(screen.contains("[1]") && !screen.contains("[4]"), "<C-CR> stayed on the second cell\n{screen}");
+
+    // From inside a cell, in Insert mode: <C-CR> runs what was just typed and keeps editing.
+    s.keys(&["Enter", "A", " + 40"]);
+    s.keys(&["C-Enter"]);
+    let screen = s.wait_for("42");
+    assert!(screen.contains(" EDIT"), "{screen}");
+    // <S-CR> runs and moves on: past the last cell, into a new one.
+    s.keys(&["S-Enter"]);
+    s.wait_for("[5]");
+    let screen = s.wait_for(" EDIT");
+    assert_eq!(screen.matches('╭').count(), 3, "{screen}");
 }
