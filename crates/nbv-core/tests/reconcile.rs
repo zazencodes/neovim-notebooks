@@ -183,3 +183,22 @@ fn out_of_range_edit_is_rejected() {
     let len = nb.mirror().len();
     assert!(nb.apply_edit(LineEdit { first: len, last: len + 1, lines: vec![] }).is_err());
 }
+
+#[test]
+fn two_step_filter_insert_then_delete_keeps_every_key() {
+    // Neovim's `:%!cmd` inserts the filtered text, then deletes the original, and the
+    // normalisation computed in between is refused by the changedtick guard.
+    let mut nb = load("v4.5-outputs.ipynb");
+    let before = snapshot(&nb);
+    let text = nb.mirror().to_vec();
+    let n = text.len();
+    let filtered: Vec<String> = text.iter().map(|l| if l.starts_with("# %%") { l.clone() } else { format!("{l} ") }).collect();
+    let r = nb.apply_edit(LineEdit { first: n, last: n, lines: filtered }).unwrap();
+    assert!(!r.normalise.is_empty(), "copies are fresh cells until the originals go");
+    let r = nb.apply_edit(LineEdit { first: 0, last: n, lines: vec![] }).unwrap();
+    assert!(r.normalise.is_empty(), "{:?}", r.normalise);
+    let after = snapshot(&nb);
+    for (b, a) in before.0.iter().zip(&after.0) {
+        assert_eq!((&b.0, &b.1, &b.3), (&a.0, &a.1, &a.3));
+    }
+}

@@ -86,6 +86,9 @@ enum Op {
     Move { at: usize, len: usize, to: usize },
     /// Whole-buffer replacement that keeps marker lines and rewrites bodies.
     Rewrite { suffix: String },
+    /// `:%!cmd`: insert the filtered text after the old, then delete the old, with the
+    /// normalisation in between refused.
+    Filter { suffix: String },
     /// Return to an earlier normalised state as a single edit, as undo does.
     Undo { back: usize },
     /// Return to an earlier normalised state as a whole-buffer resync.
@@ -111,6 +114,7 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (any::<usize>(), 1..8usize, any::<usize>()).prop_map(|(at, len, to)| Op::Duplicate { at, len, to }),
         2 => (any::<usize>(), 1..8usize, any::<usize>()).prop_map(|(at, len, to)| Op::Move { at, len, to }),
         1 => "[ x#]{0,3}".prop_map(|suffix| Op::Rewrite { suffix }),
+        1 => "[ x]{0,2}".prop_map(|suffix| Op::Filter { suffix }),
         2 => (1..6usize).prop_map(|back| Op::Undo { back }),
         1 => (1..6usize).prop_map(|back| Op::Resync { back }),
     ]
@@ -124,6 +128,10 @@ struct Harness {
     outputs: HashMap<CellKey, Value>,
     /// Normalised states: text and the document it corresponds to.
     history: Vec<(Vec<String>, Snapshot)>,
+    /// Whether edits of the current op leave normalisation pending (insert mode, or a
+    /// normalisation refused by the changedtick guard).
+    defer: bool,
+    pending: bool,
 }
 
 impl Harness {
@@ -131,7 +139,7 @@ impl Harness {
         let seen = nb.order().to_vec();
         let outputs = seen.iter().map(|k| (k.clone(), outputs_anywhere(&nb, k))).collect();
         let history = vec![(nb.mirror().to_vec(), snapshot(&nb))];
-        Harness { nb, seen, outputs, history }
+        Harness { nb, seen, outputs, history, defer: false, pending: false }
     }
 
     fn render(&self, g: &LineGen) -> String {
@@ -155,14 +163,26 @@ impl Harness {
     fn edit(&mut self, e: LineEdit) {
         let mut expect = self.nb.mirror().to_vec();
         expect.splice(e.first..e.last, e.lines.clone());
-        let r = self.nb.apply_edit(e).unwrap();
+        self.nb.apply_edit(e).unwrap();
         assert_eq!(self.nb.mirror(), expect.as_slice());
-        normalise(&mut self.nb, r.normalise);
         for k in self.nb.order() {
             if !self.seen.contains(k) {
                 self.seen.push(k.clone());
             }
         }
+        if self.defer {
+            self.pending = true;
+            self.check_integrity();
+        } else {
+            self.settle();
+        }
+    }
+
+    /// Applies whatever normalisation is pending, as leaving insert mode does.
+    fn settle(&mut self) {
+        let edits = self.nb.pending_normalisation();
+        normalise(&mut self.nb, edits);
+        self.pending = false;
         self.check_integrity();
     }
 
@@ -172,10 +192,12 @@ impl Harness {
         let order: HashSet<&CellKey> = nb.order().iter().collect();
         assert_eq!(order.len(), nb.order().len(), "two live cells share a key");
         assert!(nb.order().iter().all(|k| nb.is_live(k) && !nb.is_tombstoned(k)));
-        // Normalised: every marker shows its key, in order, and there is no leading cell.
-        let shown: Vec<CellKey> =
-            nb.mirror().iter().filter_map(|l| p.parse_marker(l)).map(|m| m.key.expect("normalised")).collect();
-        assert_eq!(shown, nb.order());
+        if !self.pending {
+            // Normalised: every marker shows its key, in order, and there is no leading cell.
+            let shown: Vec<CellKey> =
+                nb.mirror().iter().filter_map(|l| p.parse_marker(l)).map(|m| m.key.expect("normalised")).collect();
+            assert_eq!(shown, nb.order());
+        }
         // No output belonging to a surviving cell is ever lost.
         for (k, v) in &self.outputs {
             if nb.cell(k).is_some() {
@@ -190,7 +212,12 @@ impl Harness {
         }
     }
 
-    fn run(&mut self, op: Op) {
+    fn run(&mut self, op: Op, defer: bool) {
+        // Whole-buffer operations happen in normal mode.
+        if matches!(op, Op::Rewrite { .. } | Op::Undo { .. } | Op::Resync { .. } | Op::Filter { .. }) && self.pending {
+            self.settle();
+        }
+        self.defer = defer;
         let len = self.nb.mirror().len();
         let pos = |x: usize| x % (len + 1);
         match op {
@@ -248,6 +275,27 @@ impl Harness {
                     self.check_integrity();
                 }
             }
+            Op::Filter { suffix } => {
+                let p = PythonProjection;
+                let before: Vec<CellKey> = self.nb.order().to_vec();
+                let old = self.nb.mirror().to_vec();
+                let first = old.iter().position(|l| p.parse_marker(l).is_some());
+                let filtered: Vec<String> = old
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        if first.is_none_or(|f| i <= f) || p.parse_marker(l).is_some() { l.clone() } else { format!("{l}{suffix}") }
+                    })
+                    .collect();
+                let markers = |t: &[String]| t.iter().filter(|l| p.parse_marker(l).is_some()).count();
+                if markers(&filtered) == markers(&old) {
+                    self.defer = true;
+                    self.edit(LineEdit { first: old.len(), last: old.len(), lines: filtered });
+                    self.defer = false;
+                    self.edit(LineEdit { first: 0, last: old.len(), lines: vec![] });
+                    assert_eq!(self.nb.order(), before.as_slice(), "filter lost identity");
+                }
+            }
             Op::Undo { back } | Op::Resync { back } => {
                 let idx = self.history.len().saturating_sub(back + 1);
                 let (text, snap) = self.history[idx].clone();
@@ -262,7 +310,9 @@ impl Harness {
                 assert_eq!(snapshot(&self.nb), snap, "returning the text did not return the document");
             }
         }
-        self.history.push((self.nb.mirror().to_vec(), snapshot(&self.nb)));
+        if !self.pending {
+            self.history.push((self.nb.mirror().to_vec(), snapshot(&self.nb)));
+        }
     }
 }
 
@@ -280,12 +330,13 @@ proptest! {
     #[test]
     fn random_edit_sequences_preserve_integrity_and_reversibility(
         name in prop::sample::select(corpus_names()),
-        ops in prop::collection::vec(op(), 1..30),
+        ops in prop::collection::vec((op(), prop::bool::weighted(0.3)), 1..30),
     ) {
         let mut h = Harness::new(load(&name));
         h.check_integrity();
-        for op in ops {
-            h.run(op);
+        for (op, defer) in ops {
+            h.run(op, defer);
         }
+        h.settle();
     }
 }

@@ -314,21 +314,38 @@ impl Notebook {
             .filter_map(|(i, l)| self.adapter.parse_marker(l).map(|m| (i, m)))
             .collect();
 
-        // Step 1: untouched marker lines keep the key they already had.
-        let mut assigned: Vec<Option<CellKey>> = markers.iter().map(|(i, _)| survivor(*i).cloned()).collect();
+        let claimable = |k: &CellKey| self.live.contains_key(k) || self.tombstones.contains_key(k) || self.pending.contains(k);
+        let survivors: Vec<Option<&CellKey>> = markers.iter().map(|(i, _)| survivor(*i)).collect();
+
+        // Step 1: an untouched marker showing the key it already had keeps it.
+        let mut assigned: Vec<Option<CellKey>> = markers
+            .iter()
+            .zip(&survivors)
+            .map(|((_, m), old)| old.filter(|k| m.key.as_ref() == Some(*k)).cloned())
+            .collect();
         let mut taken: HashSet<CellKey> = assigned.iter().flatten().cloned().collect();
 
-        // Step 2: markers inside the edit take the key they show, first occurrence first.
+        // Step 2: identity is in the text. Every other marker takes the key it shows, first
+        // occurrence first. This includes untouched markers still awaiting normalisation, so
+        // a copy whose original has since gone reclaims the key (`:%!cmd` inserts the new
+        // text before deleting the old).
         for (slot, (_, marker)) in assigned.iter_mut().zip(&markers) {
-            if slot.is_some() {
-                continue;
-            }
-            if let Some(k) = &marker.key
-                && (self.live.contains_key(k) || self.tombstones.contains_key(k) || self.pending.contains(k))
-                && !taken.contains(k)
+            if slot.is_none()
+                && let Some(k) = &marker.key
+                && claimable(k)
+                && taken.insert(k.clone())
             {
-                taken.insert(k.clone());
                 *slot = Some(k.clone());
+            }
+        }
+
+        // Step 3: an untouched marker whose text claims nothing keeps its pending key.
+        for (slot, old) in assigned.iter_mut().zip(&survivors) {
+            if slot.is_none()
+                && let Some(k) = old
+                && taken.insert((*k).clone())
+            {
+                *slot = Some((*k).clone());
             }
         }
 
