@@ -1,6 +1,7 @@
-//! The canonical notebook: load (§6), projection and reconciliation (§7), persistence (§9.4).
+//! The canonical notebook: load (§6), cell sources and structural changes with undo (§7),
+//! persistence (§9.4).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,39 +9,28 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::adapter::{CellKind, LanguageProjection, Marker, PythonProjection};
-use crate::document::Cell;
+use crate::document::{Cell, CellKind};
 use crate::key::{CellKey, KeyMinter};
 
-/// Replace lines `[first, last)` of the previous text with `lines`.
+/// One structural change to the document. Every change has an exact inverse, which is what
+/// undo applies (§7.3). Cells leaving the document are tombstoned, never destroyed, so an
+/// inverse can always bring a cell back with its outputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LineEdit {
-    pub first: usize,
-    pub last: usize,
-    pub lines: Vec<String>,
-}
-
-/// Outcome of reconciling one edit.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Reconciled {
-    /// Whether the document changed.
-    pub changed: bool,
-    /// Edits that make every marker show its assigned key (§7.3). Ordered bottom-up, so each
-    /// applies to the text as left by the ones before it without index adjustment.
-    pub normalise: Vec<LineEdit>,
-}
-
-/// Where a live cell sits in the projected text.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CellSpan {
-    pub key: CellKey,
-    pub kind: CellKind,
-    /// The marker line, or `None` for a leading region awaiting normalisation.
-    pub marker: Option<usize>,
-    /// First body line.
-    pub body: usize,
-    /// One past the last body line.
-    pub end: usize,
+pub enum Change {
+    /// Makes a tombstoned cell live at `index` (clamped to the end).
+    Show { key: CellKey, index: usize },
+    /// Tombstones a live cell.
+    Hide { key: CellKey },
+    /// Moves a live cell to `index` (clamped to the end).
+    Move { key: CellKey, index: usize },
+    /// Changes a live cell's type.
+    Kind { key: CellKey, kind: CellKind },
+    /// Splits a live cell before source line `line`, which must leave a line on each side: the
+    /// lines from there on move into the tombstoned cell `new`, which keeps its own type and
+    /// becomes live directly below.
+    Split { key: CellKey, line: usize, new: CellKey },
+    /// Appends live cell `next`'s source to `key`'s, on a new line, and tombstones `next`.
+    Merge { key: CellKey, next: CellKey },
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -58,6 +48,8 @@ pub enum OpenError {
     NotANotebook(PathBuf, &'static str),
     #[error("{0} is nbformat {1}; nbv supports nbformat 4 only")]
     UnsupportedNbformat(PathBuf, String),
+    #[error("{0}: cell {1} has cell_type {2}; nbformat 4 allows code, markdown and raw")]
+    UnknownCellType(PathBuf, usize, String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,14 +60,6 @@ pub enum CommitError {
     Io(PathBuf, std::io::Error),
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("edit [{first}, {last}) is outside a {len}-line buffer")]
-pub struct EditError {
-    pub first: usize,
-    pub last: usize,
-    pub len: usize,
-}
-
 pub struct Notebook {
     path: PathBuf,
     /// The top-level object. Its `cells` entry is rebuilt from `order` on serialisation.
@@ -83,13 +67,12 @@ pub struct Notebook {
     trailing_newline: bool,
     order: Vec<CellKey>,
     live: HashMap<CellKey, Cell>,
+    /// Deleted cells, and cells created but not yet shown (§7.4).
     tombstones: HashMap<CellKey, Cell>,
     minter: KeyMinter,
-    /// Keys minted for cells a structural command is inserting, adopted when they appear.
-    pending: HashSet<CellKey>,
-    adapter: PythonProjection,
-    mirror: Vec<String>,
-    layout: Vec<CellSpan>,
+    /// Inverse change groups, most recent last.
+    undo: Vec<Vec<Change>>,
+    redo: Vec<Vec<Change>>,
     /// Whether any source, structure, type, output or execution change has happened (§6.3).
     mutated: bool,
     disk_hash: Option<[u8; 32]>,
@@ -120,15 +103,23 @@ impl Notebook {
             Some(v) => return Err(OpenError::UnsupportedNbformat(path.into(), v.to_string())),
             None => return Err(OpenError::NotANotebook(path.into(), "missing nbformat")),
         }
+        if !top.get("metadata").is_some_and(Value::is_object) {
+            return Err(OpenError::NotANotebook(path.into(), "metadata is missing or not an object"));
+        }
         let raw_cells = match top.get_mut("cells") {
             Some(Value::Array(cells)) => std::mem::take(cells),
             _ => return Err(OpenError::NotANotebook(path.into(), "missing cells array")),
         };
         let mut cells = Vec::with_capacity(raw_cells.len());
-        for c in raw_cells {
+        for (i, c) in raw_cells.into_iter().enumerate() {
             let Value::Object(raw) = c else {
                 return Err(OpenError::NotANotebook(path.into(), "a cell is not an object"));
             };
+            let kind = raw.get("cell_type").and_then(Value::as_str);
+            if kind.and_then(CellKind::from_nbformat).is_none() {
+                let shown = raw.get("cell_type").map_or("missing".into(), Value::to_string);
+                return Err(OpenError::UnknownCellType(path.into(), i + 1, shown));
+            }
             cells.push(Cell::from_raw(raw));
         }
 
@@ -148,38 +139,40 @@ impl Notebook {
         }
         let keys: Vec<CellKey> = keys.into_iter().map(|k| k.unwrap_or_else(|| minter.mint())).collect();
 
-        let trailing_newline = bytes.last() == Some(&b'\n');
-        let mut nb = Notebook {
+        Ok(Notebook {
             path: path.into(),
             top,
-            trailing_newline,
+            trailing_newline: bytes.last() == Some(&b'\n'),
             order: keys.clone(),
             live: keys.into_iter().zip(cells).collect(),
             tombstones: HashMap::new(),
             minter,
-            pending: HashSet::new(),
-            adapter: PythonProjection,
-            mirror: vec![],
-            layout: vec![],
+            undo: vec![],
+            redo: vec![],
             mutated: false,
             disk_hash: None,
-        };
-        nb.mirror = nb.project();
-        nb.layout = nb.compute_layout();
-        Ok(nb)
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn adapter(&self) -> &PythonProjection {
-        &self.adapter
-    }
-
     /// The kernel name from `metadata.kernelspec.name`, if any.
     pub fn kernel_name(&self) -> Option<&str> {
         self.top.get("metadata")?.get("kernelspec")?.get("name")?.as_str()
+    }
+
+    /// Records the kernel the notebook runs on, as Jupyter does when a kernel is chosen.
+    pub fn set_kernelspec(&mut self, name: &str, display_name: &str, language: &str) {
+        let Some(Value::Object(meta)) = self.top.get_mut("metadata") else {
+            unreachable!("metadata is validated as an object at load");
+        };
+        let spec = serde_json::json!({ "display_name": display_name, "language": language, "name": name });
+        if meta.get("kernelspec") != Some(&spec) {
+            meta.insert("kernelspec".into(), spec);
+            self.mutated = true;
+        }
     }
 
     pub fn is_mutated(&self) -> bool {
@@ -188,6 +181,10 @@ impl Notebook {
 
     pub fn order(&self) -> &[CellKey] {
         &self.order
+    }
+
+    pub fn index_of(&self, key: &CellKey) -> Option<usize> {
+        self.order.iter().position(|k| k == key)
     }
 
     /// A live or tombstoned cell.
@@ -220,216 +217,147 @@ impl Notebook {
         self.tombstones.contains_key(key)
     }
 
-    /// Mints a key for a cell a structural command is about to insert (§7.5).
-    pub fn mint_key(&mut self) -> CellKey {
+    /// Replaces a live cell's source, as typed in its editor. Returns whether it changed.
+    /// Text edits are not structural changes: the editor has its own undo for them.
+    pub fn set_source(&mut self, key: &CellKey, source: &str) -> bool {
+        let Some(cell) = self.live.get_mut(key) else { return false };
+        let changed = cell.set_source(source);
+        self.mutated |= changed;
+        changed
+    }
+
+    /// Creates a tombstoned cell under a fresh key, ready for [`Change::Show`] or as the
+    /// `new` half of a [`Change::Split`].
+    pub fn new_cell(&mut self, kind: CellKind, source: &str) -> CellKey {
         let key = self.minter.mint();
-        self.pending.insert(key.clone());
+        self.tombstones.insert(key.clone(), Cell::new(kind, source));
         key
     }
 
-    /// The projected text of the whole document (§7.1).
-    pub fn project(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for key in &self.order {
-            let cell = &self.live[key];
-            let kind = cell.kind();
-            out.push(self.adapter.format_marker(kind, key));
-            out.extend(self.adapter.to_buffer(kind, &cell.source()));
+    /// Creates a tombstoned copy of a live or tombstoned cell under a fresh key, outputs
+    /// included, for pasting.
+    pub fn copy_cell(&mut self, raw: &Map<String, Value>) -> CellKey {
+        let mut raw = raw.clone();
+        raw.shift_remove("id");
+        let key = self.minter.mint();
+        let mut cell = Cell::from_raw(raw);
+        cell.runtime.baseline = cell.source();
+        self.tombstones.insert(key.clone(), cell);
+        key
+    }
+
+    /// Applies a group of changes as one undo step. Returns the index of the cell to focus.
+    pub fn edit(&mut self, changes: Vec<Change>) -> Option<usize> {
+        let (inverse, focus) = self.apply_group(changes);
+        if !inverse.is_empty() {
+            self.undo.push(inverse);
+            self.redo.clear();
         }
-        out
+        focus
     }
 
-    /// The text core believes the buffer holds.
-    pub fn mirror(&self) -> &[String] {
-        &self.mirror
+    /// Reverts the most recent change group. Returns the index of the cell to focus, or
+    /// `None` when there is nothing to undo.
+    pub fn undo(&mut self) -> Option<usize> {
+        let group = self.undo.pop()?;
+        let (inverse, focus) = self.apply_group(group);
+        self.redo.push(inverse);
+        focus.or(Some(0))
     }
 
-    pub fn layout(&self) -> &[CellSpan] {
-        &self.layout
+    pub fn redo(&mut self) -> Option<usize> {
+        let group = self.redo.pop()?;
+        let (inverse, focus) = self.apply_group(group);
+        self.undo.push(inverse);
+        focus.or(Some(0))
     }
 
-    /// The span containing `line`, if any.
-    pub fn span_at(&self, line: usize) -> Option<&CellSpan> {
-        self.layout.iter().rev().find(|s| s.marker.unwrap_or(0) <= line)
-    }
-
-    fn compute_layout(&self) -> Vec<CellSpan> {
-        let mut spans = Vec::new();
-        let mut line = 0;
-        for key in &self.order {
-            let cell = &self.live[key];
-            let n = self.adapter.to_buffer(cell.kind(), &cell.source()).len();
-            spans.push(CellSpan {
-                key: key.clone(),
-                kind: cell.kind(),
-                marker: Some(line),
-                body: line + 1,
-                end: line + 1 + n,
-            });
-            line += 1 + n;
-        }
-        spans
-    }
-
-    /// Whole-buffer replacement. Always safe: identity is in the text (§7.2).
-    pub fn resync(&mut self, lines: Vec<String>) -> Reconciled {
-        let len = self.mirror.len();
-        self.apply_edit(LineEdit { first: 0, last: len, lines }).expect("whole-buffer edit is in range")
-    }
-
-    /// Reconciles one line edit (§7.2).
-    pub fn apply_edit(&mut self, edit: LineEdit) -> Result<Reconciled, EditError> {
-        let LineEdit { first, last, lines } = edit;
-        if first > last || last > self.mirror.len() {
-            return Err(EditError { first, last, len: self.mirror.len() });
-        }
-        let inserted = lines.len();
-        self.mirror.splice(first..last, lines);
-
-        // Old marker positions mapped into new coordinates, for markers outside the edit.
-        let old_by_line: HashMap<usize, CellKey> =
-            self.layout.iter().filter_map(|s| s.marker.map(|m| (m, s.key.clone()))).collect();
-        let old_leading = self.layout.first().filter(|s| s.marker.is_none()).map(|s| s.key.clone());
-        let survivor = |line: usize| -> Option<&CellKey> {
-            let old = if line < first {
-                line
-            } else if line >= first + inserted {
-                line - inserted + (last - first)
-            } else {
-                return None;
-            };
-            old_by_line.get(&old)
-        };
-
-        let markers: Vec<(usize, Marker)> =
-            self.mirror.iter().enumerate().filter_map(|(i, l)| self.adapter.parse_marker(l).map(|m| (i, m))).collect();
-
-        let claimable =
-            |k: &CellKey| self.live.contains_key(k) || self.tombstones.contains_key(k) || self.pending.contains(k);
-        let survivors: Vec<Option<&CellKey>> = markers.iter().map(|(i, _)| survivor(*i)).collect();
-
-        // Step 1: an untouched marker showing the key it already had keeps it.
-        let mut assigned: Vec<Option<CellKey>> = markers
-            .iter()
-            .zip(&survivors)
-            .map(|((_, m), old)| old.filter(|k| m.key.as_ref() == Some(*k)).cloned())
-            .collect();
-        let mut taken: HashSet<CellKey> = assigned.iter().flatten().cloned().collect();
-
-        // Step 2: identity is in the text. Every other marker takes the key it shows, first
-        // occurrence first. This includes untouched markers still awaiting normalisation, so
-        // a copy whose original has since gone reclaims the key (`:%!cmd` inserts the new
-        // text before deleting the old).
-        for (slot, (_, marker)) in assigned.iter_mut().zip(&markers) {
-            if slot.is_none()
-                && let Some(k) = &marker.key
-                && claimable(k)
-                && taken.insert(k.clone())
-            {
-                *slot = Some(k.clone());
+    /// Applies changes in order; returns their inverses in reverse order, and the focus of the
+    /// first change that applied. Changes that do not apply (a stale key) are skipped.
+    fn apply_group(&mut self, changes: Vec<Change>) -> (Vec<Change>, Option<usize>) {
+        let mut inverse = vec![];
+        let mut focus = None;
+        for c in changes {
+            if let Some((inv, at)) = self.apply(c) {
+                inverse.push(inv);
+                focus.get_or_insert(at);
             }
         }
-
-        // Step 3: an untouched marker whose text claims nothing keeps its pending key.
-        for (slot, old) in assigned.iter_mut().zip(&survivors) {
-            if slot.is_none()
-                && let Some(k) = old
-                && taken.insert((*k).clone())
-            {
-                *slot = Some((*k).clone());
-            }
+        if !inverse.is_empty() {
+            self.mutated = true;
         }
-
-        // The leading region keeps its pending key while it stays non-empty.
-        let lead_end = markers.first().map_or(self.mirror.len(), |(i, _)| *i);
-        let has_leading = self.mirror[..lead_end].iter().any(|l| !l.trim().is_empty());
-        let leading_key = has_leading.then(|| match old_leading {
-            Some(k) if self.live.contains_key(&k) && !taken.contains(&k) => k,
-            _ => self.minter.mint(),
-        });
-        if let Some(k) = &leading_key {
-            taken.insert(k.clone());
-        }
-
-        // Everything else is a new cell.
-        let assigned: Vec<CellKey> = assigned.into_iter().map(|k| k.unwrap_or_else(|| self.minter.mint())).collect();
-
-        let mut spans = Vec::with_capacity(markers.len() + 1);
-        if let Some(k) = leading_key {
-            spans.push(CellSpan { key: k, kind: CellKind::Code, marker: None, body: 0, end: lead_end });
-        }
-        for (idx, ((line, marker), key)) in markers.iter().zip(assigned).enumerate() {
-            let end = markers.get(idx + 1).map_or(self.mirror.len(), |(i, _)| *i);
-            spans.push(CellSpan { key, kind: marker.kind, marker: Some(*line), body: line + 1, end });
-        }
-
-        for s in &spans {
-            self.pending.remove(&s.key);
-        }
-        let changed = self.adopt(&spans);
-        self.mutated |= changed;
-
-        self.layout = spans;
-        Ok(Reconciled { changed, normalise: self.pending_normalisation() })
+        inverse.reverse();
+        (inverse, focus)
     }
 
-    /// Edits that make every marker show its assigned key and give a leading region its
-    /// marker (§7.3), computed against the current text. Ordered bottom-up.
-    pub fn pending_normalisation(&self) -> Vec<LineEdit> {
-        let mut edits = Vec::new();
-        for span in self.layout.iter().rev() {
-            let Some(line) = span.marker else { continue };
-            let shown = self.adapter.parse_marker(&self.mirror[line]).and_then(|m| m.key);
-            if shown.as_ref() != Some(&span.key) {
-                edits.push(LineEdit {
-                    first: line,
-                    last: line + 1,
-                    lines: vec![self.adapter.format_marker(span.kind, &span.key)],
-                });
+    fn apply(&mut self, change: Change) -> Option<(Change, usize)> {
+        match change {
+            Change::Show { key, index } => {
+                let cell = self.tombstones.remove(&key)?;
+                let at = index.min(self.order.len());
+                self.order.insert(at, key.clone());
+                self.live.insert(key.clone(), cell);
+                Some((Change::Hide { key }, at))
             }
-        }
-        if let Some(lead) = self.layout.first().filter(|s| s.marker.is_none()) {
-            edits.push(LineEdit {
-                first: 0,
-                last: 0,
-                lines: vec![self.adapter.format_marker(CellKind::Code, &lead.key)],
-            });
-        }
-        edits
-    }
-
-    /// Makes the document match `spans` over the current mirror. Returns whether it changed.
-    fn adopt(&mut self, spans: &[CellSpan]) -> bool {
-        let new_order: Vec<CellKey> = spans.iter().map(|s| s.key.clone()).collect();
-        let keep: HashSet<&CellKey> = new_order.iter().collect();
-        let mut changed = new_order != self.order;
-
-        let gone: Vec<CellKey> = self.order.iter().filter(|k| !keep.contains(k)).cloned().collect();
-        for k in gone {
-            let cell = self.live.remove(&k).expect("order and live agree");
-            self.tombstones.insert(k, cell);
-        }
-        for span in spans {
-            let source = self.adapter.from_buffer(span.kind, &self.mirror[span.body..span.end]);
-            let cell = match self.live.get_mut(&span.key) {
-                Some(c) => c,
-                None => {
-                    let cell = match self.tombstones.remove(&span.key) {
-                        Some(c) => c,
-                        None => Cell::new(span.kind, &source),
-                    };
-                    changed = true;
-                    self.live.entry(span.key.clone()).or_insert(cell)
+            Change::Hide { key } => {
+                let at = self.index_of(&key)?;
+                self.order.remove(at);
+                let cell = self.live.remove(&key).expect("order and live agree");
+                self.tombstones.insert(key.clone(), cell);
+                Some((Change::Show { key, index: at }, at.min(self.order.len().saturating_sub(1))))
+            }
+            Change::Move { key, index } => {
+                let from = self.index_of(&key)?;
+                self.order.remove(from);
+                let at = index.min(self.order.len());
+                self.order.insert(at, key.clone());
+                Some((Change::Move { key, index: from }, at))
+            }
+            Change::Kind { key, kind } => {
+                let at = self.index_of(&key)?;
+                let cell = self.live.get_mut(&key)?;
+                let old = cell.kind();
+                if old == kind {
+                    return None;
                 }
-            };
-            if cell.kind() != span.kind {
-                cell.set_kind(span.kind);
-                changed = true;
+                cell.set_kind(kind);
+                Some((Change::Kind { key, kind: old }, at))
             }
-            changed |= cell.set_source(&source);
+            Change::Split { key, line, new } => {
+                let at = self.index_of(&key)?;
+                if !self.tombstones.contains_key(&new) {
+                    return None;
+                }
+                let source = self.live[&key].source();
+                let lines: Vec<&str> = source.split('\n').collect();
+                // Both halves keep at least one line, so merging them back restores the source.
+                if line == 0 || line >= lines.len() {
+                    return None;
+                }
+                let (head, tail) = (lines[..line].join("\n"), lines[line..].join("\n"));
+                self.live.get_mut(&key).expect("checked").set_source(&head);
+                let mut second = self.tombstones.remove(&new).expect("checked");
+                second.set_source(&tail);
+                self.order.insert(at + 1, new.clone());
+                self.live.insert(new.clone(), second);
+                Some((Change::Merge { key, next: new }, at))
+            }
+            Change::Merge { key, next } => {
+                let at = self.index_of(&key)?;
+                if key == next || !self.live.contains_key(&next) {
+                    return None;
+                }
+                let head = self.live[&key].source();
+                let tail = self.live[&next].source();
+                let line = head.split('\n').count();
+                self.live.get_mut(&key).expect("checked").set_source(&format!("{head}\n{tail}"));
+                let pos = self.index_of(&next).expect("live");
+                self.order.remove(pos);
+                let cell = self.live.remove(&next).expect("checked");
+                self.tombstones.insert(next.clone(), cell);
+                Some((Change::Split { key, line, new: next }, at))
+            }
         }
-        self.order = new_order;
-        changed
     }
 
     /// The document as nbformat JSON, as it would be committed.
@@ -497,15 +425,14 @@ impl Notebook {
         Ok(())
     }
 
-    /// Reloads from disk (§9.5): rebuilds the document and discards tombstones. Returns the new
-    /// projection, which the frontend writes over the whole buffer.
-    pub fn reload(&mut self) -> Result<Vec<String>, OpenError> {
+    /// Reloads from disk (§9.5): rebuilds the document, discarding tombstones and history.
+    pub fn reload(&mut self) -> Result<(), OpenError> {
         let bytes = fs::read(&self.path).map_err(|e| OpenError::Io(self.path.clone(), e))?;
         let minter = std::mem::take(&mut self.minter);
         let mut nb = Notebook::from_bytes(&self.path, &bytes, minter)?;
         nb.disk_hash = Some(Sha256::digest(&bytes).into());
         *self = nb;
-        Ok(self.mirror.clone())
+        Ok(())
     }
 }
 

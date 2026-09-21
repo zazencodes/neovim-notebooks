@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use nbv_core::{CommitError, CommitOptions, LineEdit, Notebook, OpenError};
+use nbv_core::{Change, CommitError, CommitOptions, Notebook, OpenError};
 use serde_json::Value;
 
 #[test]
@@ -30,13 +30,14 @@ fn jupyter_formatted_notebooks_save_byte_identical() {
 }
 
 #[test]
-fn projection_reconciles_to_itself_across_corpus() {
+fn rewriting_every_source_unchanged_is_not_a_mutation() {
     for path in corpus() {
         let mut nb = Notebook::open(&path).unwrap();
         let before = snapshot(&nb);
-        let text = nb.project();
-        let r = nb.resync(text);
-        assert!(!r.changed && r.normalise.is_empty(), "{path:?}: {r:?}");
+        for k in nb.order().to_vec() {
+            let src = nb.cell(&k).unwrap().source();
+            assert!(!nb.set_source(&k, &src), "{path:?} {k}");
+        }
         assert_eq!(snapshot(&nb), before, "{path:?}");
         assert!(!nb.is_mutated());
     }
@@ -56,9 +57,10 @@ fn legacy_upgrades_on_first_mutation() {
     let (_dir, copy) = scratch_copy("legacy-4.4-outputs.ipynb");
     let before: Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
     let mut nb = Notebook::open(&copy).unwrap();
-    // Append a line to the second cell's body.
-    let span = nb.layout()[1].clone();
-    edit_normalised(&mut nb, LineEdit { first: span.end, last: span.end, lines: lines(&["x = 1"]) });
+    // Append a line to the second cell.
+    let k = nb.order()[1].clone();
+    let src = nb.cell(&k).unwrap().source();
+    assert!(nb.set_source(&k, &format!("{src}\nx = 1")));
     let keys: Vec<String> = nb.order().iter().map(|k| k.to_string()).collect();
     nb.commit(CommitOptions::default()).unwrap();
 
@@ -90,12 +92,35 @@ fn bad_ids_get_synthesized_keys_and_are_rewritten_on_mutation() {
         }
     }
     assert!(nb.to_json()["cells"][0]["id"] == "dup", "unmutated document is untouched");
-    let t = nb.project();
-    edit_normalised(&mut nb, LineEdit { first: t.len(), last: t.len(), lines: lines(&["# more"]) });
+    let last = nb.order().last().unwrap().clone();
+    nb.set_source(&last, "# more");
     let json = nb.to_json();
     for (c, k) in json["cells"].as_array().unwrap().iter().zip(&keys) {
         assert_eq!(c["id"], k.as_str());
     }
+}
+
+#[test]
+fn refuses_unknown_cell_types_and_missing_metadata() {
+    let err = Notebook::open(&corpus_dir().join("refused/unknown-cell-type.ipynb")).unwrap_err();
+    assert!(matches!(err, OpenError::UnknownCellType(_, 1, _)), "{err}");
+    assert!(err.to_string().contains("\"heading\""), "{err}");
+    let json = br#"{"cells": [], "nbformat": 4, "nbformat_minor": 5}"#;
+    let err = Notebook::from_bytes(std::path::Path::new("t.ipynb"), json, Default::default()).unwrap_err();
+    assert!(matches!(err, OpenError::NotANotebook(..)), "{err}");
+}
+
+#[test]
+fn choosing_a_kernel_records_its_kernelspec() {
+    let (_dir, copy) = scratch_copy("v4.5-outputs.ipynb");
+    let mut nb = Notebook::open(&copy).unwrap();
+    nb.set_kernelspec("python3", "Python 3", "python");
+    assert!(!nb.is_mutated(), "the same kernelspec is no change");
+    nb.set_kernelspec("ir", "R", "r");
+    assert!(nb.is_mutated());
+    nb.commit(CommitOptions::default()).unwrap();
+    let v: Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+    assert_eq!(v["metadata"]["kernelspec"], serde_json::json!({"display_name": "R", "language": "r", "name": "ir"}));
 }
 
 #[test]
@@ -125,25 +150,26 @@ fn writes_through_symlinks_and_preserves_permissions() {
     let link = dir.path().join("link.ipynb");
     std::os::unix::fs::symlink(&copy, &link).unwrap();
     let mut nb = Notebook::open(&link).unwrap();
-    let t = nb.project();
-    edit_normalised(&mut nb, LineEdit { first: t.len(), last: t.len(), lines: lines(&["#"]) });
+    let first = nb.order()[0].clone();
+    nb.set_source(&first, "#");
     nb.commit(CommitOptions::default()).unwrap();
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
     assert_eq!(std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o640);
     let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert_eq!(names.len(), 2, "no stray temporary or projected files: {names:?}");
+    assert_eq!(names.len(), 2, "no stray temporary files: {names:?}");
 }
 
 #[test]
 fn reload_discards_tombstones_and_rebuilds() {
     let (_dir, copy) = scratch_copy("v4.5-outputs.ipynb");
     let mut nb = Notebook::open(&copy).unwrap();
-    let original = nb.project();
-    let span = nb.layout()[1].clone();
-    edit_normalised(&mut nb, LineEdit { first: span.marker.unwrap(), last: span.end, lines: vec![] });
-    assert!(nb.is_tombstoned(&span.key));
-    let reprojected = nb.reload().unwrap();
-    assert_eq!(reprojected, original);
-    assert!(nb.is_live(&span.key));
+    let original = snapshot(&nb);
+    let key = nb.order()[1].clone();
+    nb.edit(vec![Change::Hide { key: key.clone() }]);
+    assert!(nb.is_tombstoned(&key));
+    nb.reload().unwrap();
+    assert_eq!(snapshot(&nb), original);
+    assert!(nb.is_live(&key));
     assert!(!nb.is_mutated());
+    assert_eq!(nb.undo(), None, "history is discarded");
 }

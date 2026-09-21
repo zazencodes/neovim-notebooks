@@ -1,6 +1,6 @@
 [package]
 name = "nbv-nvim"
-description = "Neovim Notebooks: NvimClient boundary, grid model and notebook buffer adapter"
+description = "Neovim Notebooks: NvimClient boundary, grid model and cell buffer adapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

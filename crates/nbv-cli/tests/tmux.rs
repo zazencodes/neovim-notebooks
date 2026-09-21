@@ -29,7 +29,8 @@ impl Session {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    /// Starts nbv on a notebook written from `cells` (source strings).
+    /// Starts nbv on a notebook written from `cells` (source strings), under a tmux with no
+    /// configuration.
     fn start(cells: &[&str]) -> Option<Session> {
         let nvim = nvim()?;
         let venv = root().join(".venv");
@@ -59,7 +60,7 @@ impl Session {
         );
         let s = Session { socket, dir };
         s.tmux(&["-f", "/dev/null", "new-session", "-d", "-s", "t", "-x", "90", "-y", "30", &cmd]);
-        s.wait_for("# %% id=\"c0\"");
+        s.wait_for(" NAV");
         Some(s)
     }
 
@@ -122,34 +123,37 @@ def png(w, h):
 display(Image(png(80, 60)))"#;
 
 #[test]
-fn edit_run_image_and_save_inside_tmux() {
+fn run_image_input_edit_and_save_inside_tmux() {
     let Some(s) = Session::start(&["print(6 * 7)", IMAGE, "input('name? ')"]) else {
         eprintln!("skipped: needs tmux, Neovim 0.12 and .venv");
         return;
     };
-    // tmux here has no allow-passthrough: nbv says so, and falls back to halfblocks.
-    s.wait_for("allow-passthrough");
+    // tmux here has no allow-passthrough, so images fall back to halfblocks.
+    let screen = s.wait_for("print(6 * 7)");
+    assert!(screen.contains("╭") && screen.contains("│print(6 * 7)"), "each cell is a box\n{screen}");
 
     s.keys(&[":NbvRunAll", "Enter"]);
     let screen = s.wait_for("42");
-    assert!(screen.contains("[1] ✓"), "{screen}");
-    // The image is halfblock text, placed between its cell and the next marker.
+    assert!(screen.contains("[1]"), "{screen}");
+    // The output sits below its cell's box, outside it.
+    let lines: Vec<&str> = screen.lines().collect();
+    let out = lines.iter().position(|l| l.trim() == "42").unwrap();
+    assert!(lines[out - 1].contains("╰"), "{screen}");
+    // The image is halfblock text, between its cell's box and the next cell's box.
     let screen = s.wait_for_any(&['▀', '▄']);
     let lines: Vec<&str> = screen.lines().collect();
-    let first_block = lines.iter().position(|l| l.contains('▀') || l.contains('▄')).unwrap();
-    assert!(lines[first_block - 1].starts_with("display(Image"), "{screen}");
-    let after = lines[first_block..].iter().position(|l| !(l.contains('▀') || l.contains('▄'))).unwrap();
-    assert!(lines[first_block + after].starts_with("# %% id=\"c2\""), "{screen}");
+    let first_block = lines.iter().position(|l| l.contains(['▀', '▄'])).unwrap();
+    assert!(lines[first_block - 1].contains("╰"), "{screen}");
 
-    // input() is answered through Neovim's prompt.
+    // input() is answered through Neovim's prompt, from navigation mode.
     s.wait_for("name? ");
     s.keys(&["nbv", "Enter"]);
-    s.wait_for("[3] ✓");
+    s.wait_for("[3]");
 
     // Scroll through the notebook: at every step the image rows are one contiguous block,
-    // and while the image's bottom is on screen the next marker follows it directly.
+    // never drawn over a box.
     let full = count_blocks(&s.screen());
-    s.keys(&["gg"]);
+    s.keys(&["g", "g"]);
     for _ in 0..14 {
         let screen = s.screen();
         let lines: Vec<&str> = screen.lines().collect();
@@ -157,27 +161,67 @@ fn edit_run_image_and_save_inside_tmux() {
         if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
             assert_eq!(last - first + 1, rows.len(), "image rows not contiguous\n{screen}");
             assert!(rows.len() <= full, "{screen}");
-            if last + 1 < lines.len() && !lines[last + 1].contains("t.ipynb.py") {
-                assert!(lines[last + 1].starts_with("# %% id=\"c2\""), "{screen}");
-            }
+            assert!(rows.iter().all(|r| !lines[*r].contains('│')), "image inside a box\n{screen}");
         }
         s.keys(&["C-e"]);
     }
 
+    // Enter edits the selected cell in its own Neovim window; :q returns to navigation.
+    s.keys(&["g", "g", "Enter"]);
+    s.wait_for(" EDIT");
+    s.keys(&["A", "  # edited", "Escape"]);
+    s.wait_for("print(6 * 7)  # edited");
+    s.keys(&[":q", "Enter"]);
+    s.wait_for(" NAV");
+
     s.keys(&[":wq", "Enter"]);
     s.wait_for("NBV-EXITED-0");
     let saved = s.saved();
+    // The cell keeps the string form it was loaded with.
+    assert_eq!(saved["cells"][0]["source"], serde_json::json!("print(6 * 7)  # edited"));
     assert_eq!(saved["cells"][0]["outputs"][0]["text"], serde_json::json!(["42\n"]));
     assert!(saved["cells"][1]["outputs"][0]["data"]["image/png"].is_string());
     assert_eq!(saved["cells"][2]["execution_count"], 3);
 }
 
 #[test]
+fn run_advance_and_leave_cells() {
+    let Some(s) = Session::start(&["x = 1", "x + 1"]) else { return };
+    // x runs the selected cell and selects the next.
+    s.keys(&["x"]);
+    s.wait_for("[1]");
+    s.keys(&["x"]);
+    s.wait_for("[2]");
+    // Past the last cell, a new one opens in insert mode.
+    let screen = s.wait_for(" EDIT");
+    assert_eq!(screen.matches('╭').count(), 3, "{screen}");
+    s.keys(&["y = 3"]);
+    // Esc leaves insert mode, then Esc in Normal mode leaves the cell.
+    s.keys(&["Escape"]);
+    s.keys(&["Escape"]);
+    s.wait_for(" NAV");
+    s.keys(&["k", "d", "d"]);
+    let screen = s.wait_for("y = 3");
+    assert!(!screen.contains("x + 1"), "dd deleted the selected cell\n{screen}");
+    s.keys(&["u"]);
+    s.wait_for("x + 1");
+    s.keys(&[":wq", "Enter"]);
+    s.wait_for("NBV-EXITED-0");
+    let sources: Vec<serde_json::Value> =
+        s.saved()["cells"].as_array().unwrap().iter().map(|c| c["source"].clone()).collect();
+    assert_eq!(sources, [serde_json::json!("x = 1"), serde_json::json!("x + 1"), serde_json::json!(["y = 3"])]);
+}
+
+#[test]
 fn clean_exit_leaves_no_processes() {
     let Some(s) = Session::start(&["x = 1"]) else { return };
-    s.keys(&[":NbvRun", "Enter"]);
-    s.wait_for("[1] ✓");
+    // r runs the cell and stays on it.
+    s.keys(&["r"]);
+    s.wait_for("[1]");
+    // Outputs are unsaved changes: :q refuses, :q! quits.
     s.keys(&[":q", "Enter"]);
+    s.wait_for("E37");
+    s.keys(&[":q!", "Enter"]);
     s.wait_for("NBV-EXITED-0");
     let ps = Command::new("ps").args(["-eo", "command"]).output().unwrap();
     let ps = String::from_utf8_lossy(&ps.stdout);

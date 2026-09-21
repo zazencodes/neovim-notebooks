@@ -15,11 +15,7 @@ pub enum Term {
 /// What nbv knows about the tmux server it runs under.
 #[derive(Clone, Debug, Default)]
 pub struct Tmux {
-    pub version: Option<(u32, u32)>,
     pub passthrough: bool,
-    pub extended_keys: bool,
-    pub focus_events: bool,
-    pub rgb: bool,
     /// tmux itself parses and redraws Sixel (3.4+ built with Sixel support).
     pub sixel: bool,
     pub outer: Option<Term>,
@@ -62,16 +58,10 @@ fn tmux(args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Queries the tmux server for the options nbv relies on and the outer terminal. The outer
-/// terminal is identified through tmux: capability replies inside tmux describe tmux.
+/// Queries the tmux server for what image support depends on, and the outer terminal. The
+/// outer terminal is identified through tmux: capability replies inside tmux describe tmux.
 pub fn probe_tmux() -> Tmux {
-    let version = tmux(&["-V"]).and_then(|v| {
-        let num: String = v.chars().skip_while(|c| !c.is_ascii_digit()).collect();
-        let mut parts = num.split(|c: char| !c.is_ascii_digit());
-        Some((parts.next()?.parse().ok()?, parts.next().and_then(|m| m.parse().ok()).unwrap_or(0)))
-    });
     let opt = |name: &str| tmux(&["show-options", "-gv", name]).unwrap_or_default();
-    let server_opt = |name: &str| tmux(&["show-options", "-sv", name]).unwrap_or_default();
     let client = tmux(&["display-message", "-p", "#{client_termname}\t#{client_termtype}\t#{client_termfeatures}"])
         .unwrap_or_default();
     let mut fields = client.split('\t');
@@ -83,37 +73,9 @@ pub fn probe_tmux() -> Tmux {
         t => t,
     };
     Tmux {
-        version,
         passthrough: matches!(opt("allow-passthrough").as_str(), "on" | "all"),
-        extended_keys: matches!(server_opt("extended-keys").as_str(), "on" | "always"),
-        focus_events: server_opt("focus-events") == "on",
-        rgb: features.split(',').any(|f| f == "RGB"),
         sixel: features.split(',').any(|f| f == "sixel"),
         outer: Some(outer),
-    }
-}
-
-impl Tmux {
-    /// The `tmux.conf` lines for options nbv relies on that are not set.
-    pub fn missing(&self) -> Vec<&'static str> {
-        let mut m = vec![];
-        if !self.passthrough {
-            m.push("set -g allow-passthrough on");
-        }
-        if !self.extended_keys {
-            m.push("set -s extended-keys on");
-        }
-        if !self.focus_events {
-            m.push("set -s focus-events on");
-        }
-        if !self.rgb {
-            m.push("set -as terminal-features ',*:RGB'");
-        }
-        m
-    }
-
-    pub fn too_old(&self) -> bool {
-        self.version.is_some_and(|v| v < (3, 3))
     }
 }
 
@@ -181,15 +143,9 @@ mod tests {
         assert_eq!(choose_protocol(d, &Term::Other("tmux".into()), Some(&t)), ProtocolType::Kitty);
         t.passthrough = false;
         assert_eq!(choose_protocol(d, &Term::Other("tmux".into()), Some(&t)), ProtocolType::Halfblocks);
-        let w = Tmux { outer: Some(Term::WezTerm), passthrough: true, sixel: true, ..Default::default() };
+        let w = Tmux { outer: Some(Term::WezTerm), passthrough: true, sixel: true };
         assert_eq!(choose_protocol(d, &Term::WezTerm, Some(&w)), ProtocolType::Sixel);
         let w = Tmux { outer: Some(Term::WezTerm), passthrough: true, ..Default::default() };
         assert_eq!(choose_protocol(d, &Term::WezTerm, Some(&w)), ProtocolType::Halfblocks);
-    }
-
-    #[test]
-    fn missing_options_are_named() {
-        let t = Tmux { passthrough: true, focus_events: true, ..Default::default() };
-        assert_eq!(t.missing(), ["set -s extended-keys on", "set -as terminal-features ',*:RGB'"]);
     }
 }

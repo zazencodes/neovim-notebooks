@@ -1,44 +1,87 @@
-//! Spike 2: the buffer contract (§6, §7, §9) through a real Neovim.
+//! The cell buffer contract (§7, §9) through a real Neovim: every cell edits in its own
+//! buffer and window, writes commit the notebook, and the home window is transparent.
 
-use nbv_nvim::NvimClient;
+use nbv_core::{CellKey, Change};
+use nbv_nvim::editor::Focus;
 use nbv_nvim::harness::{Harness, Options, repo_root};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn ids(saved: &Value) -> Vec<Option<String>> {
     saved["cells"].as_array().unwrap().iter().map(|c| c["id"].as_str().map(str::to_string)).collect()
 }
 
-#[tokio::test]
-async fn opens_as_an_ordinary_python_buffer() {
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    assert_eq!(h.buffer_lines().await, h.mirror());
-    let info = h
-        .lua("return { vim.bo.filetype, vim.bo.buftype, vim.bo.swapfile, vim.bo.modified, vim.api.nvim_buf_get_name(0) }")
+/// Buffer options of the current window's buffer.
+async fn current(h: &Harness) -> Value {
+    let v = h
+        .lua(
+            "return { vim.bo.filetype, vim.bo.buftype, vim.bo.swapfile, vim.bo.modified, \
+             vim.api.nvim_buf_get_name(0), vim.b.nbv_key or '', vim.api.nvim_win_get_config(0).relative }",
+        )
         .await;
-    let a = info.as_array().unwrap();
-    assert_eq!(a[0].as_str(), Some("python"));
-    assert_eq!(a[1].as_str(), Some(""));
-    assert_eq!(a[2].as_bool(), Some(false));
-    assert_eq!(a[3].as_bool(), Some(false));
-    assert!(a[4].as_str().unwrap().ends_with("v4.5-outputs.ipynb.py"));
-    // The first load is not an undoable change.
-    h.keys("u").await;
-    assert_eq!(h.buffer_lines().await, h.mirror());
-    assert!(h.screen().contains("# %% [markdown] id=\"e5f6a7b8\""), "{}", h.screen());
+    serde_json::to_value(
+        v.as_array().unwrap().iter().map(|x| x.to_string().trim_matches('"').to_string()).collect::<Vec<_>>(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
-async fn write_commits_to_the_notebook_and_never_the_projection() {
+async fn each_cell_is_its_own_ordinary_buffer() {
     let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    h.keys("gg]cAX<Esc>").await; // append to the first body line of the second cell
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    let info = current(&h).await;
+    assert_eq!(info[0], "python");
+    assert_eq!(info[1], "", "buftype is empty, so LSP attaches");
+    assert_eq!(info[2], "false");
+    assert_eq!(info[3], "false");
+    assert!(info[4].as_str().unwrap().ends_with("v4.5-outputs.ipynb.a1b2c3d4.py"), "{info}");
+    assert_eq!(info[5], "a1b2c3d4");
+    assert_eq!(info[6], "editor", "a floating window");
+    assert_eq!(h.lua("return vim.api.nvim_buf_line_count(0)").await.as_u64(), Some(2));
+
+    let md = h.key(0);
+    h.enter(&md, false).await;
+    let info = current(&h).await;
+    assert_eq!(info[0], "markdown");
+    assert!(info[4].as_str().unwrap().ends_with(".e5f6a7b8.md"));
+    // The initial text is not an undoable change.
+    h.keys("u").await;
+    assert_eq!(h.lua("return vim.api.nvim_get_current_line()").await.as_str(), Some("## Results"));
+}
+
+#[tokio::test]
+async fn motions_and_edits_stay_inside_the_cell() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    // G, dG, and gg=G reach only this cell's two lines.
+    h.keys("GoX = 1<Esc>").await;
+    assert_eq!(h.source(1), "import numpy as np\nnp.arange(3)\nX = 1");
+    h.keys("ggdG").await;
+    assert_eq!(h.source(1), "");
+    assert_eq!(h.source(0), "## Results", "other cells are untouched");
+    assert_eq!(h.source(2), "plot()");
+    h.keys("u").await;
+    assert_eq!(h.source(1), "import numpy as np\nnp.arange(3)\nX = 1");
+    let outputs = h.state.lock().unwrap().nb.cell(&code).unwrap().outputs().len();
+    assert_eq!(outputs, 1, "editing keeps outputs");
+}
+
+#[tokio::test]
+async fn write_from_a_cell_commits_the_notebook_and_nothing_else() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    h.keys("AX<Esc>").await;
     assert!(h.lua("return vim.bo.modified").await.as_bool().unwrap());
     h.cmd("w").await;
     assert!(!h.lua("return vim.bo.modified").await.as_bool().unwrap());
     let saved = h.saved();
-    assert_eq!(saved["cells"][1]["source"], serde_json::json!(["import numpy as npX\n", "np.arange(3)"]));
-    assert_eq!(saved["cells"][1]["outputs"][0]["data"]["text/plain"], serde_json::json!(["42"]));
+    assert_eq!(saved["cells"][1]["source"], json!(["import numpy as npX\n", "np.arange(3)"]));
+    assert_eq!(saved["cells"][1]["outputs"][0]["data"]["text/plain"], json!(["42"]));
     let names: Vec<_> = std::fs::read_dir(h.dir()).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(names.len(), 1, "only the notebook exists: {names:?}");
+    assert!(h.try_cmd("w other.py").await.is_err(), "writing a cell elsewhere is refused");
 }
 
 #[tokio::test]
@@ -49,7 +92,9 @@ async fn legacy_notebook_saves_without_ids_until_edited() {
     assert_eq!(saved["nbformat_minor"], 4);
     assert!(ids(&saved).iter().all(Option::is_none));
 
-    h.keys("Go# more<Esc>").await;
+    let first = h.key(0);
+    h.enter(&first, false).await;
+    h.keys("o# more<Esc>").await;
     h.cmd("w").await;
     let saved = h.saved();
     assert_eq!(saved["nbformat_minor"], 5);
@@ -58,191 +103,189 @@ async fn legacy_notebook_saves_without_ids_until_edited() {
 }
 
 #[tokio::test]
-async fn yank_paste_makes_a_fresh_key_and_delete_undo_restores_outputs() {
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    // Cell 2 (`a1b2c3d4`) is lines 3-5. Yank it and paste at the end.
-    h.cmd("3,5yank").await;
-    h.cmd("$put").await;
-    h.assert_in_sync().await;
-    let (order, lines) = {
-        let st = h.state.lock().unwrap();
-        (st.nb.order().to_vec(), st.nb.mirror().to_vec())
-    };
-    assert_eq!(order.len(), 5);
-    assert_eq!(order[1].as_str(), "a1b2c3d4");
-    assert_ne!(order[4].as_str(), "a1b2c3d4");
-    assert!(lines.iter().any(|l| l == &format!("# %% id=\"{}\"", order[4])), "copy normalised");
-
-    // `u` reverts the paste and its normalisation together (undojoin).
-    h.keys("u").await;
-    h.assert_in_sync().await;
-    assert_eq!(h.state.lock().unwrap().nb.order().len(), 4);
-
-    // Delete the cell with outputs, then undo.
-    h.keys("3GVjjd").await;
-    assert!(h.state.lock().unwrap().nb.is_tombstoned(&nbv_core::CellKey::new("a1b2c3d4")));
-    h.keys("u").await;
-    h.cmd("w").await;
-    let saved = h.saved();
-    assert_eq!(saved["cells"][1]["id"], "a1b2c3d4");
-    assert_eq!(saved["cells"][1]["outputs"][0]["data"]["text/plain"], serde_json::json!(["42"]));
-}
-
-#[tokio::test]
-async fn whole_buffer_filter_undo_and_redo_keep_identity() {
+async fn format_on_save_formats_the_cell_before_commit() {
     let ruff = repo_root().join(".venv/bin/ruff");
     if !ruff.exists() {
         eprintln!("skipped: no ruff");
         return;
     }
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    let before: Vec<String> = h.state.lock().unwrap().nb.order().iter().map(|k| k.to_string()).collect();
-    h.keys("4GA;  x=[1,2]<Esc>").await;
-    h.cmd(&format!("%!{} format -", ruff.display())).await;
-    h.assert_in_sync().await;
-    let lines = h.buffer_lines().await;
-    assert!(lines.iter().any(|l| l.contains("x = [1, 2]")), "ruff formatted: {lines:?}");
-    let after: Vec<String> = h.state.lock().unwrap().nb.order().iter().map(|k| k.to_string()).collect();
-    assert_eq!(before, after);
-    h.keys("u").await;
-    h.assert_in_sync().await;
-    h.keys("<C-r>").await;
-    h.assert_in_sync().await;
-    h.cmd("w").await;
-    assert_eq!(h.saved()["cells"][2]["outputs"].as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn format_on_save_edits_are_reconciled_before_commit() {
-    let init = r#"
-        vim.api.nvim_create_autocmd('BufWritePre', {
-          pattern = '*.py',
-          callback = function(a)
-            local lines = vim.api.nvim_buf_get_lines(a.buf, 0, -1, false)
-            for i, l in ipairs(lines) do
-              lines[i] = l:gsub('np%.arange', 'np.linspace')
-            end
-            vim.api.nvim_buf_set_lines(a.buf, 0, -1, false, lines)
-          end,
-        })
-    "#;
-    let h = Harness::open("v4.5-outputs.ipynb", Options { init: Some(init.into()), ..Default::default() }).await;
-    h.cmd("w").await;
-    let saved = h.saved();
-    assert_eq!(saved["cells"][1]["source"][1], "np.linspace(3)");
-    assert_eq!(saved["cells"][1]["id"], "a1b2c3d4", "identity survives the whole-buffer rewrite");
-    assert!(!h.lua("return vim.bo.modified").await.as_bool().unwrap());
-}
-
-#[tokio::test]
-async fn reload_reads_the_notebook_from_disk() {
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    let original = h.buffer_lines().await;
-    h.keys("ggdG").await;
-    assert!(h.state.lock().unwrap().nb.order().is_empty());
-    h.cmd("e!").await;
-    h.wait("reattach", |s| s.nb.order().len() == 4).await;
-    assert_eq!(h.buffer_lines().await, original);
-    h.assert_in_sync().await;
-    assert!(!h.lua("return vim.bo.modified").await.as_bool().unwrap());
-    // The buffer is still a notebook buffer: writes still commit.
-    h.keys("GoZ = 1<Esc>").await;
-    h.cmd("w").await;
-    assert_eq!(h.saved()["cells"][3]["source"], serde_json::json!(["\n", "Z = 1"]));
-}
-
-#[tokio::test]
-async fn writes_elsewhere_and_partial_writes_are_refused() {
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    let other = h.dir().join("other.py");
-    let err = h.try_cmd(&format!("w {}", other.display())).await.unwrap_err();
-    assert!(err.contains("only be written to its notebook"), "{err}");
-    let err = h.try_cmd(&format!("1,2w {}", other.display())).await.unwrap_err();
-    assert!(err.contains("partial writes"), "{err}");
-    assert!(!other.exists());
-}
-
-#[tokio::test]
-async fn changed_on_disk_requires_bang() {
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    let mut v = h.saved();
-    v["metadata"]["touched"] = true.into();
-    std::fs::write(&h.notebook, serde_json::to_vec(&v).unwrap()).unwrap();
-    h.keys("GoZ = 1<Esc>").await;
-    let err = h.try_cmd("w").await.unwrap_err();
-    assert!(err.contains("changed on disk"), "{err}");
-    assert!(h.lua("return vim.bo.modified").await.as_bool().unwrap());
-    h.cmd("w!").await;
-    assert_eq!(h.saved()["cells"][3]["source"], serde_json::json!(["\n", "Z = 1"]));
-}
-
-#[tokio::test]
-async fn wq_saves_and_exits() {
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    h.keys("GoZ = 1<Esc>").await;
-    let _ = h.client.input(":wq<CR>").await;
-    h.wait("exit", |s| s.exited).await;
-    assert_eq!(h.saved()["cells"][3]["source"], serde_json::json!(["\n", "Z = 1"]));
-}
-
-#[tokio::test]
-async fn typing_a_marker_in_insert_mode_normalises_on_leave() {
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    h.keys("Go# %%<CR>y = 2").await;
-    // Still in insert mode: the marker is untouched, but the cell already exists.
-    let lines = h.buffer_lines().await;
-    assert!(lines.contains(&"# %%".to_string()));
-    let pending = h.state.lock().unwrap().nb.order().to_vec();
-    assert_eq!(pending.len(), 5);
-    h.keys("<Esc>").await;
-    let key = pending[4].to_string();
-    let lines = h.buffer_lines().await;
-    assert!(lines.contains(&format!("# %% id=\"{key}\"")), "{lines:?}");
-    assert_eq!(h.state.lock().unwrap().nb.order()[4].as_str(), key, "key stable across normalisation");
-    // One `u` removes the typing and the normalisation together.
-    h.keys("u").await;
-    h.assert_in_sync().await;
-    assert_eq!(h.state.lock().unwrap().nb.order().len(), 4);
-}
-
-#[tokio::test]
-async fn commands_motions_and_text_objects() {
-    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
-    h.keys("gg]c]c").await;
-    let row = h.lua("return vim.api.nvim_win_get_cursor(0)[1]").await;
-    assert_eq!(row.as_u64(), Some(7), "first body line of the third cell");
-    h.keys("[c").await;
-    assert_eq!(h.lua("return vim.api.nvim_win_get_cursor(0)[1]").await.as_u64(), Some(4));
-    h.keys("dic").await;
-    h.assert_in_sync().await;
-    assert_eq!(h.state.lock().unwrap().nb.cell(&nbv_core::CellKey::new("a1b2c3d4")).unwrap().source(), "");
-    h.cmd("NbvRun").await;
-    h.cmd("NbvCellMove down").await;
-    let commands: Vec<String> = h.state.lock().unwrap().commands.iter().map(|(a, _)| a.clone()).collect();
-    assert_eq!(commands, ["run", "cell_move"]);
-}
-
-#[tokio::test]
-async fn user_lsp_attaches_through_normal_config() {
-    let ruff = repo_root().join(".venv/bin/ruff");
-    if !ruff.exists() {
-        return;
-    }
     let init = format!(
         r#"
-        vim.lsp.config('ruff', {{ cmd = {{ '{}', 'server' }}, filetypes = {{ 'python' }}, root_markers = {{ '.git' }} }})
-        vim.lsp.enable('ruff')
+        vim.api.nvim_create_autocmd('BufWritePre', {{
+          pattern = '*.py',
+          callback = function(a)
+            local view = vim.fn.winsaveview()
+            vim.cmd('silent %!{} format -')
+            vim.fn.winrestview(view)
+          end,
+        }})
         "#,
         ruff.display()
     );
     let h = Harness::open("v4.5-outputs.ipynb", Options { init: Some(init), ..Default::default() }).await;
-    let mut name = rmpv::Value::Nil;
-    for _ in 0..100 {
-        name = h.lua("local c = vim.lsp.get_clients({ bufnr = 0 })[1]; return c and c.name").await;
-        if name.as_str().is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let code = h.key(2);
+    h.enter(&code, false).await;
+    h.keys("A;  x=[1,2]<Esc>").await;
+    h.cmd("w").await;
+    let src = h.saved()["cells"][2]["source"].clone();
+    // Buffer lines map 1:1 to source lines, so the buffer's final newline is not in the source.
+    assert_eq!(src, json!(["plot()\n", "x = [1, 2]"]), "formatted before the commit");
+    assert_eq!(h.saved()["cells"][2]["outputs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn quitting_a_cell_window_returns_home() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    h.keys("Goy = 2<Esc>").await;
+    h.cmd("q").await;
+    h.wait("home after :q", |s| matches!(s.focus, Some((_, Focus::Home)))).await;
+    assert!(!h.state.lock().unwrap().exited, ":q in a cell leaves the cell, not Neovim");
+    assert_eq!(h.source(1), "import numpy as np\nnp.arange(3)\ny = 2");
+
+    // Re-entered, the cell's new window has the cursor where it was left.
+    h.enter(&code, true).await;
+    h.keys("z").await;
+    // Leaving works from insert mode, behind keys already typed.
+    h.leave().await;
+    assert_eq!(h.lua("return vim.api.nvim_get_mode().mode").await.as_str(), Some("n"));
+    assert_eq!(h.source(1), "import numpy as np\nnp.arange(3)\ny = z2");
+}
+
+#[tokio::test]
+async fn esc_in_normal_mode_leaves_the_cell() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, true).await;
+    h.keys("x = 1").await;
+    // From insert mode, the first Esc only returns to Normal mode.
+    h.keys("<Esc>").await;
+    assert!(matches!(h.state.lock().unwrap().focus, Some((_, Focus::Cell(_)))));
+    h.cmd("let @/ = 'np' | set hlsearch").await;
+    h.keys("<Esc>").await;
+    h.wait("home after Esc", |s| matches!(s.focus, Some((_, Focus::Home)))).await;
+    assert_eq!(h.lua("return vim.v.hlsearch").await.as_u64(), Some(0), "search highlighting cleared");
+    assert_eq!(h.source(1), "x = 1import numpy as np\nnp.arange(3)");
+}
+
+#[tokio::test]
+async fn unsaved_changes_refuse_quit() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    h.layout_all(None).await;
+    // A structural change or output marks the home buffer.
+    h.state.lock().unwrap().editor.set_modified();
+    h.settle().await;
+    let err = h.try_cmd("q").await.unwrap_err();
+    assert!(err.contains("E37") || err.contains("E162"), "{err}");
+    h.cmd("w").await;
+    assert_eq!(h.state.lock().unwrap().written, 1);
+    assert!(h.try_cmd("q").await.is_ok() || h.state.lock().unwrap().exited);
+}
+
+#[tokio::test]
+async fn edits_in_a_hidden_cell_buffer_refuse_quit() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    h.keys("ox<Esc>").await;
+    h.leave().await;
+    let err = h.try_cmd("q").await.unwrap_err();
+    assert!(err.contains("E162") || err.contains("E37"), "{err}");
+}
+
+#[tokio::test]
+async fn structural_changes_rewrite_or_wipe_buffers() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    h.layout_all(None).await;
+    let code = h.key(1);
+    let buf = h.state.lock().unwrap().editor.buffer(&code).unwrap();
+    {
+        let mut st = h.state.lock().unwrap();
+        let new = st.nb.new_cell(nbv_core::CellKind::Code, "");
+        st.nb.edit(vec![Change::Split { key: code.clone(), line: 1, new }]);
+        let nbv_nvim::harness::State { nb, editor, .. } = &mut *st;
+        editor.sync(nb);
     }
-    assert_eq!(name.as_str(), Some("ruff"));
+    h.settle().await;
+    let lines = h.lua(&format!("return vim.api.nvim_buf_get_lines({buf}, 0, -1, false)")).await;
+    assert_eq!(lines.as_array().unwrap().len(), 1, "the first half's buffer was rewritten");
+    assert_eq!(h.source(1), "import numpy as np");
+
+    {
+        let mut st = h.state.lock().unwrap();
+        st.nb.edit(vec![Change::Hide { key: code.clone() }]);
+        let nbv_nvim::harness::State { nb, editor, .. } = &mut *st;
+        editor.sync(nb);
+    }
+    h.settle().await;
+    assert_eq!(h.lua(&format!("return vim.api.nvim_buf_is_valid({buf})")).await.as_bool(), Some(false));
+    assert!(h.state.lock().unwrap().editor.buffer(&code).is_none());
+    // Laid out again after undo, the cell gets a fresh buffer with its text.
+    h.state.lock().unwrap().nb.undo();
+    h.layout_all(None).await;
+    assert!(h.state.lock().unwrap().editor.buffer(&code).is_some());
+}
+
+#[tokio::test]
+async fn reload_rebuilds_from_disk() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    h.keys("ddu").await;
+    h.keys("dd").await;
+    assert_eq!(h.source(1), "np.arange(3)");
+    h.cmd("e!").await;
+    h.wait("reloaded", |s| s.nb.cell(&CellKey::new("a1b2c3d4")).unwrap().source().starts_with("import")).await;
+    h.wait("cell buffers wiped", |s| s.editor.buffer(&CellKey::new("a1b2c3d4")).is_none()).await;
+}
+
+#[tokio::test]
+async fn the_home_window_is_transparent_and_cells_are_not() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let rects = h.layout_all(None).await;
+    let screen = h.opaque_screen();
+    let rows: Vec<&str> = screen.lines().collect();
+    for r in &rects {
+        let row = rows[r.row as usize];
+        let cells: String = row.chars().skip(r.col as usize).take(r.width as usize).collect();
+        assert!(!cells.contains('·'), "cell window row {} is opaque\n{screen}", r.row);
+    }
+    // Row 0 and the column left of the windows belong to the home window.
+    assert!(rows[0].chars().all(|c| c == '·'), "{screen}");
+    assert!(rows[1].starts_with("····"), "{screen}");
+    assert!(rows[1].contains("## Results"), "{screen}");
+    assert!(rows[3].contains("import numpy as np"), "{screen}");
+}
+
+#[tokio::test]
+async fn home_stays_transparent_under_user_decorations() {
+    let init = r#"
+        vim.o.number = true
+        vim.o.cursorline = true
+        vim.o.signcolumn = 'yes'
+        vim.o.list = true
+    "#;
+    let h = Harness::open("v4.5-outputs.ipynb", Options { init: Some(init.into()), ..Default::default() }).await;
+    let rects = h.layout_all(None).await;
+    let screen = h.opaque_screen();
+    let rows: Vec<&str> = screen.lines().collect();
+    assert!(rows[0].chars().all(|c| c == '·'), "{screen}");
+    // Cell windows take the user's options: line numbers show inside them.
+    let first = &rows[rects[1].row as usize];
+    assert!(first.contains("1 import numpy"), "{screen}");
+}
+
+#[tokio::test]
+async fn windows_are_clipped_with_topline() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    // Only the second line of `import numpy as np / np.arange(3)` is visible.
+    let rect = nbv_nvim::EditorRect { key: code, row: 2, col: 4, width: 30, height: 1, topline: 2 };
+    h.layout(None, &[rect]).await;
+    let screen = h.screen();
+    let row: String = screen.lines().nth(2).unwrap().to_string();
+    assert!(row.contains("np.arange(3)"), "{screen}");
+    assert!(!screen.contains("import numpy"), "{screen}");
+    assert!(!screen.contains("## Results"), "windows of unlisted cells are closed\n{screen}");
 }

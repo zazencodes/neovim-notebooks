@@ -30,8 +30,11 @@ fn nvim_version(program: &PathBuf) -> Result<(u32, u32), String> {
     let text = String::from_utf8_lossy(&out.stdout);
     let first = text.lines().next().unwrap_or("");
     let v = first.strip_prefix("NVIM v").ok_or_else(|| format!("{} is not Neovim: {first}", program.display()))?;
-    let mut parts = v.split(|c: char| !c.is_ascii_digit()).filter_map(|p| p.parse::<u32>().ok());
-    Ok((parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
+    let mut parts = v.split('.').map(|p| p.parse::<u32>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => Ok((major, minor)),
+        _ => Err(format!("cannot read the version of {}: {first}", program.display())),
+    }
 }
 
 fn main() -> ExitCode {

@@ -48,11 +48,11 @@ pub struct OutputView {
 /// Decoded images by content hash, so re-rendering does not re-decode.
 #[derive(Default)]
 pub struct Images {
-    decoded: HashMap<u64, Option<Arc<DynamicImage>>>,
+    decoded: HashMap<u64, Result<Arc<DynamicImage>, String>>,
 }
 
 impl Images {
-    fn get(&mut self, b64: &str) -> Option<(u64, Arc<DynamicImage>)> {
+    fn get(&mut self, b64: &str) -> Result<(u64, Arc<DynamicImage>), String> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         b64.hash(&mut h);
         let hash = h.finish();
@@ -61,11 +61,11 @@ impl Images {
             .entry(hash)
             .or_insert_with(|| {
                 let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
-                let bytes = base64::engine::general_purpose::STANDARD.decode(clean).ok()?;
-                image::load_from_memory(&bytes).ok().map(Arc::new)
+                let bytes = base64::engine::general_purpose::STANDARD.decode(clean).map_err(|e| e.to_string())?;
+                image::load_from_memory(&bytes).map(Arc::new).map_err(|e| e.to_string())
             })
             .clone()?;
-        Some((hash, img))
+        Ok((hash, img))
     }
 }
 
@@ -122,11 +122,18 @@ pub fn build(cell: &Cell, width: u16, font: FontSize, images: &mut Images) -> Ou
                 let data = out.get("data").cloned().unwrap_or(Value::Null);
                 let image = ["image/png", "image/jpeg", "image/gif"]
                     .iter()
-                    .find_map(|m| data.get(*m).map(|v| multiline(Some(v))))
-                    .and_then(|b64| images.get(&b64));
-                if let Some((hash, image)) = image {
-                    let (cols, rows) = image_cells(&image, font, width.saturating_sub(2).max(1));
-                    blocks.push(Block::Image { hash, image, cols, rows });
+                    .find_map(|m| data.get(*m).map(|v| (m, images.get(&multiline(Some(v))))));
+                if let Some((mime, image)) = image {
+                    match image {
+                        Ok((hash, image)) => {
+                            let (cols, rows) = image_cells(&image, font, width.saturating_sub(2).max(1));
+                            blocks.push(Block::Image { hash, image, cols, rows });
+                        }
+                        Err(e) => blocks.push(Block::Text(vec![Line::styled(
+                            format!("{mime} could not be decoded: {e}"),
+                            Style::default().fg(Color::LightRed),
+                        )])),
+                    }
                 } else if let Some(t) = data.get("text/plain") {
                     blocks.push(Block::Text(text_block(&multiline(Some(t)), Style::default())));
                 } else if let Some(mime) = data.as_object().and_then(|m| m.keys().next()) {
@@ -137,6 +144,10 @@ pub fn build(cell: &Cell, width: u16, font: FontSize, images: &mut Images) -> Ou
         }
     }
     cap_text(&mut blocks);
+    // Why the last run could not happen: after the outputs, never elided.
+    if let Some(e) = &cell.runtime.error {
+        blocks.push(Block::Text(text_block(e, Style::default().fg(Color::LightRed))));
+    }
     let height = blocks.iter().map(Block::height).sum();
     OutputView { blocks, height, width }
 }
@@ -198,6 +209,24 @@ mod tests {
         let Block::Text(lines) = &v.blocks[0] else { panic!() };
         assert!(lines[0].spans[0].content.contains("61 earlier lines"));
         assert_eq!(lines.last().unwrap().spans[0].content, "99");
+    }
+
+    #[test]
+    fn an_undecodable_image_says_so() {
+        let c = cell(json!([{"output_type": "display_data",
+            "data": {"image/png": "iVBORw0KGgo=", "text/plain": ["<Figure>"]}, "metadata": {}}]));
+        let v = build(&c, 80, FontSize::new(10, 20), &mut Images::default());
+        let Block::Text(lines) = &v.blocks[0] else { panic!("expected the error") };
+        assert!(lines[0].spans[0].content.starts_with("image/png could not be decoded"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_failed_run_shows_its_reason_under_the_outputs() {
+        let mut c = cell(json!([{"output_type": "stream", "name": "stdout", "text": ["old\n"]}]));
+        c.runtime.error = Some("no kernel".into());
+        let v = build(&c, 80, FontSize::new(10, 20), &mut Images::default());
+        let Block::Text(lines) = v.blocks.last().unwrap() else { panic!() };
+        assert_eq!(lines[0].spans[0].content, "no kernel");
     }
 
     #[test]

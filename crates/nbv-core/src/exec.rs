@@ -68,6 +68,7 @@ impl Executor {
         let code = cell.source();
         cell.runtime.baseline = code.clone();
         cell.runtime.exec = ExecState::Queued;
+        cell.runtime.error = None;
         let request = ExecuteRequest {
             code,
             silent: false,
@@ -100,6 +101,28 @@ impl Executor {
             cell.runtime.duration = None;
         }
         self.forget_displays(key);
+    }
+
+    /// Marks a cell as unable to run, with the reason shown under it.
+    pub fn fail(&mut self, nb: &mut Notebook, key: &CellKey, reason: &str) -> ExecEvent {
+        self.requests.retain(|_, k| k != key);
+        if let Some(rt) = nb.runtime_mut(key) {
+            rt.exec = ExecState::Error;
+            rt.error = Some(reason.to_string());
+        }
+        ExecEvent::Cell(key.clone())
+    }
+
+    /// The kernel failed (it could not start, or it died): every cell queued or running fails
+    /// with `reason`.
+    pub fn fail_all(&mut self, nb: &mut Notebook, reason: &str) -> Vec<ExecEvent> {
+        let keys: Vec<CellKey> = self.requests.values().cloned().collect();
+        let mut events: Vec<ExecEvent> = keys.iter().map(|k| self.fail(nb, k, reason)).collect();
+        self.started.clear();
+        self.clear_pending.clear();
+        self.status = KernelStatus::Dead;
+        events.push(ExecEvent::Status(KernelStatus::Dead));
+        events
     }
 
     /// The kernel went away (restart or death): nothing in flight will complete.
@@ -449,7 +472,7 @@ mod tests {
     fn output_for_a_tombstoned_cell_lands_on_the_tombstone() {
         let (mut nb, mut ex, req, key) = setup();
         ex.handle(&mut nb, &JupyterMessage::new(Status::busy(), Some(&req)));
-        nb.resync(vec![]);
+        nb.edit(vec![crate::Change::Hide { key: key.clone() }]);
         assert!(nb.is_tombstoned(&key));
         ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout("late\n"), Some(&req)));
         ex.handle(&mut nb, &reply(&req, ReplyStatus::Ok, 1));
@@ -467,6 +490,19 @@ mod tests {
         ex.reset(&mut nb, KernelStatus::Restarting);
         assert_eq!(nb.cell(&key).unwrap().runtime.exec, ExecState::Idle);
         assert_eq!(ex.in_flight().count(), 0);
+    }
+
+    #[test]
+    fn a_failed_kernel_fails_every_cell_in_flight_with_the_reason() {
+        let (mut nb, mut ex, _req, key) = setup();
+        ex.fail_all(&mut nb, "the kernel died");
+        let rt = &nb.cell(&key).unwrap().runtime;
+        assert_eq!((rt.exec, rt.error.as_deref()), (ExecState::Error, Some("the kernel died")));
+        assert_eq!(ex.status(), KernelStatus::Dead);
+        assert_eq!(ex.in_flight().count(), 0);
+        // The next run clears it.
+        ex.request(&mut nb, &key).unwrap();
+        assert_eq!(nb.cell(&key).unwrap().runtime.error, None);
     }
 
     #[test]

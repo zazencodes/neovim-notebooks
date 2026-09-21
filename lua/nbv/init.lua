@@ -1,8 +1,11 @@
 -- nbv: the Lua companion loaded into the embedded Neovim (R6).
 --
--- It provides commands, keymaps, cell motions, extmark placement, write/read interception
--- and RPC notifications. It holds no notebook state: cell identity, the document, and the
--- kernel all live in Rust. Rust loads this file before the user's config (pre-config) and
+-- The notebook is drawn by Rust. Neovim contributes one transparent "home" window, through
+-- which the notebook shows, and one floating window per visible cell, each editing that
+-- cell's own buffer. This file creates and places those windows and buffers on Rust's
+-- instruction, intercepts writes and reloads, and reports focus changes. It holds no notebook
+-- state: windows and buffers carry their cell's key (`w:nbv_key`, `b:nbv_key`), and
+-- everything else lives in Rust. Rust loads this file before the user's config (pre-config);
 -- it finishes its setup on VimEnter (post-config).
 
 local M = {}
@@ -10,314 +13,377 @@ local api = vim.api
 
 --- Channel of the nbv process, set at load.
 M.chan = nil
---- Path of the projected notebook buffer (the argument file), set at load.
-M.path = nil
-M.ns = api.nvim_create_namespace('nbv')
-M.slots = 64
+--- Name of the home buffer (`nbv://<notebook path>`), set at load.
+M.home_name = nil
+M.home_buf = nil
+M.home_win = nil
+--- The latest focus request from Rust, echoed in focus notifications so Rust can discard
+--- ones that predate its own requests.
+M.focus_seq = 0
 
-local function notify(action, extra)
-  local args = extra or {}
-  args.line = api.nvim_win_get_cursor(0)[1] - 1
-  args.tick = api.nvim_buf_get_changedtick(0)
-  vim.rpcnotify(M.chan, 'nbv', action, args)
+local function notify(action, args)
+  vim.rpcnotify(M.chan, 'nbv', action, args or vim.empty_dict())
 end
-
---- The marker grammar (§7.1), for motions. Rust's parser is authoritative.
-function M.is_marker(line)
-  if line:sub(1, 4) ~= '# %%' then
-    return false
-  end
-  local rest = line:sub(5)
-  for _, kind in ipairs({ ' [markdown]', ' [raw]' }) do
-    if rest:sub(1, #kind) == kind then
-      rest = rest:sub(#kind + 1)
-      break
-    end
-  end
-  if rest == '' then
-    return true
-  end
-  if rest:sub(1, 4) ~= ' id=' then
-    return false
-  end
-  local lit = rest:sub(5)
-  if #lit < 2 or lit:sub(1, 1) ~= '"' or lit:sub(-1) ~= '"' then
-    return false
-  end
-  local ok, v = pcall(vim.json.decode, lit)
-  return ok and type(v) == 'string'
-end
-
---- Marker line numbers (1-based) of the current buffer.
-local function markers(buf)
-  local out = {}
-  for i, l in ipairs(api.nvim_buf_get_lines(buf, 0, -1, false)) do
-    if M.is_marker(l) then
-      out[#out + 1] = i
-    end
-  end
-  return out
-end
-
---- Moves to the first body line of the `count`th next (dir=1) or previous (dir=-1) cell.
-function M.jump(dir)
-  local row = api.nvim_win_get_cursor(0)[1]
-  local ms = markers(0)
-  -- The marker of the cell containing the cursor.
-  local cur = 0
-  for i, m in ipairs(ms) do
-    if m <= row then
-      cur = i
-    end
-  end
-  local target = cur + dir * vim.v.count1
-  if dir < 0 and ms[cur] and row > ms[cur] + 1 then
-    target = target + 1 -- first go to the top of the current cell
-  end
-  target = math.max(1, math.min(#ms, target))
-  if ms[target] then
-    local last = api.nvim_buf_line_count(0)
-    vim.cmd("normal! m'")
-    api.nvim_win_set_cursor(0, { math.min(ms[target] + 1, last), 0 })
-  end
-end
-
---- Selects the current cell linewise: body only (`ic`) or marker and body (`ac`).
-function M.select(around)
-  local row = api.nvim_win_get_cursor(0)[1]
-  local ms = markers(0)
-  local start, stop = nil, api.nvim_buf_line_count(0)
-  for i, m in ipairs(ms) do
-    if m <= row then
-      start = m
-      stop = (ms[i + 1] or stop + 1) - 1
-    end
-  end
-  if not start then
-    return
-  end
-  local first = around and start or start + 1
-  if first > stop then
-    return
-  end
-  vim.cmd('normal! \27') -- leave any pending visual mode
-  api.nvim_win_set_cursor(0, { first, 0 })
-  vim.cmd('normal! V')
-  api.nvim_win_set_cursor(0, { stop, 0 })
-end
-
-local commands = {
-  { 'NbvRun', 'run' },
-  { 'NbvRunAdvance', 'run_advance' },
-  { 'NbvRunAll', 'run_all' },
-  { 'NbvRunAbove', 'run_above' },
-  { 'NbvInterrupt', 'interrupt' },
-  { 'NbvRestart', 'restart' },
-  { 'NbvCellDelete', 'cell_delete' },
-  { 'NbvCellSplit', 'cell_split' },
-  { 'NbvCellMerge', 'cell_merge' },
-}
-
-local keymaps = {
-  { 'n', '<localleader>x', '<Cmd>NbvRun<CR>' },
-  { 'n', '<S-CR>', '<Cmd>NbvRunAdvance<CR>' },
-  { 'i', '<S-CR>', '<Esc><Cmd>NbvRunAdvance<CR>' },
-  { 'n', '<localleader><CR>', '<Cmd>NbvRunAdvance<CR>' },
-  { 'n', '<localleader>X', '<Cmd>NbvRunAll<CR>' },
-  { 'n', '<localleader>ba', '<Cmd>NbvRunAbove<CR>' },
-  { 'n', '<localleader>i', '<Cmd>NbvInterrupt<CR>' },
-  { 'n', '<localleader>R', '<Cmd>NbvRestart<CR>' },
-  { 'n', '<localleader>o', '<Cmd>NbvCellAdd<CR>' },
-  { 'n', '<localleader>O', '<Cmd>NbvCellAdd!<CR>' },
-  { 'n', '<localleader>dd', '<Cmd>NbvCellDelete<CR>' },
-  { 'n', '<localleader>s', '<Cmd>NbvCellSplit<CR>' },
-  { 'n', '<localleader>m', '<Cmd>NbvCellMerge<CR>' },
-  { 'n', '<localleader>k', '<Cmd>NbvCellMove up<CR>' },
-  { 'n', '<localleader>j', '<Cmd>NbvCellMove down<CR>' },
-  { 'n', '<localleader>tc', '<Cmd>NbvCellType code<CR>' },
-  { 'n', '<localleader>tm', '<Cmd>NbvCellType markdown<CR>' },
-  { 'n', '<localleader>tr', '<Cmd>NbvCellType raw<CR>' },
-  { 'n', '<localleader>c', '<Cmd>NbvClearOutput<CR>' },
-}
 
 local function fail(msg)
   error('nbv: ' .. msg, 0)
 end
 
---- BufWriteCmd (§9.2): commit projection → canonical document → .ipynb.
+--- The cell a window edits, if it is a cell window still showing its cell's buffer.
+local function window_key(win)
+  local key = vim.w[win].nbv_key
+  if key and vim.b[api.nvim_win_get_buf(win)].nbv_key == key then
+    return key
+  end
+end
+
+local function viewport()
+  local w = M.home_win
+  if not (w and api.nvim_win_is_valid(w)) then
+    return nil
+  end
+  local pos = api.nvim_win_get_position(w)
+  return { row = pos[1], col = pos[2], width = api.nvim_win_get_width(w), height = api.nvim_win_get_height(w) }
+end
+
+local function report_focus()
+  local win = api.nvim_get_current_win()
+  notify('focus', { seq = M.focus_seq, home = win == M.home_win, key = window_key(win) })
+end
+
+-- Highlight groups. Rust draws the notebook with the colours these resolve to.
+local THEME = {
+  border = 'NbvBorder',
+  nav = 'NbvBorderNav',
+  edit = 'NbvBorderEdit',
+  header = 'NbvHeader',
+  dim = 'NbvDim',
+  stderr = 'NbvStderr',
+  ok = 'NbvStatusOk',
+  error = 'NbvStatusError',
+  running = 'NbvStatusRunning',
+  queued = 'NbvStatusQueued',
+  stale = 'NbvStatusStale',
+}
+
+local function theme()
+  local t = {}
+  for name, group in pairs(THEME) do
+    local h = api.nvim_get_hl(0, { name = group, link = false })
+    t[name] = { fg = h.fg, bg = h.bg }
+  end
+  return t
+end
+
+local function define_highlights()
+  -- The special colour marks the home window's cells as transparent (§11.2); `nocombine`
+  -- keeps it from mixing into anything drawn over it.
+  api.nvim_set_hl(0, 'NbvTransparent', { sp = M.transparent_sp, nocombine = true })
+  local links = {
+    NbvBorder = 'LineNr',
+    NbvBorderNav = 'DiagnosticInfo',
+    NbvBorderEdit = 'DiagnosticOk',
+    NbvHeader = 'Title',
+    NbvDim = 'Comment',
+    NbvStderr = 'DiagnosticError',
+    NbvStatusOk = 'DiagnosticOk',
+    NbvStatusError = 'DiagnosticError',
+    NbvStatusRunning = 'DiagnosticWarn',
+    NbvStatusQueued = 'DiagnosticInfo',
+    NbvStatusStale = 'DiagnosticHint',
+  }
+  for group, link in pairs(links) do
+    api.nvim_set_hl(0, group, { default = true, link = link })
+  end
+end
+
+-- Every group the home window can draw with maps to NbvTransparent, so even decorations a
+-- plugin turns on there (line numbers, signs, a cursorline) stay invisible.
+local HOME_GROUPS = {
+  'Normal', 'NormalNC', 'EndOfBuffer', 'CursorLine', 'CursorColumn', 'ColorColumn', 'LineNr',
+  'LineNrAbove', 'LineNrBelow', 'CursorLineNr', 'SignColumn', 'FoldColumn', 'NonText',
+  'Whitespace', 'Folded', 'Visual', 'Conceal',
+}
+
+local function set_local(win, name, value)
+  api.nvim_set_option_value(name, value, { win = win, scope = 'local' })
+end
+
+local function setup_home_window(win)
+  if not (win and api.nvim_win_is_valid(win)) then
+    return
+  end
+  local hl = {}
+  for _, g in ipairs(HOME_GROUPS) do
+    hl[#hl + 1] = g .. ':NbvTransparent'
+  end
+  local opts = {
+    winhighlight = table.concat(hl, ','),
+    number = false,
+    relativenumber = false,
+    signcolumn = 'no',
+    foldcolumn = '0',
+    statuscolumn = '',
+    cursorline = false,
+    cursorcolumn = false,
+    colorcolumn = '',
+    list = false,
+    spell = false,
+    fillchars = 'eob: ',
+  }
+  for name, value in pairs(opts) do
+    set_local(win, name, value)
+  end
+end
+
+-- New windows copy the current window's options, which is the home window's transparency.
+-- Cell windows take the user's global values instead.
+local CELL_OPTIONS = {
+  'number', 'relativenumber', 'signcolumn', 'foldcolumn', 'statuscolumn', 'cursorcolumn',
+  'colorcolumn', 'list', 'spell', 'fillchars',
+}
+
+local function setup_cell_window(win, key)
+  for _, name in ipairs(CELL_OPTIONS) do
+    set_local(win, name, api.nvim_get_option_value(name, { scope = 'global' }))
+  end
+  local user = api.nvim_get_option_value('winhighlight', { scope = 'global' })
+  set_local(win, 'winhighlight', 'NormalFloat:Normal,FloatBorder:Normal' .. (user ~= '' and (',' .. user) or ''))
+  -- The window is exactly as tall as its cell has lines; wrapped lines would not fit.
+  set_local(win, 'wrap', false)
+  vim.w[win].nbv_key = key
+end
+
+--- The cursorline shows only in the cell being edited, if the user has it on.
+local function set_active(win, active)
+  set_local(win, 'cursorline', active and api.nvim_get_option_value('cursorline', { scope = 'global' }))
+end
+
+--- BufWriteCmd (§9.2): commit every cell buffer → canonical document → .ipynb.
 local function on_write(ev)
   local buf = ev.buf
-  if vim.fn.fnamemodify(ev.match, ':p') ~= api.nvim_buf_get_name(buf) then
-    fail('the notebook buffer can only be written to its notebook (use :w)')
+  local name = api.nvim_buf_get_name(buf)
+  if ev.match ~= name and vim.fn.fnamemodify(ev.match, ':p') ~= name then
+    fail('notebook buffers can only be written to their notebook (use :w)')
   end
   api.nvim_exec_autocmds('BufWritePre', { buffer = buf, modeline = false })
-  local lines = api.nvim_buf_get_lines(buf, 0, -1, false)
-  local res = vim.rpcrequest(M.chan, 'nbv_commit', api.nvim_buf_get_changedtick(buf), vim.v.cmdbang == 1, lines)
+  local buffers = {}
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if vim.b[b].nbv_key then
+      buffers[#buffers + 1] = { b, api.nvim_buf_get_lines(b, 0, -1, false) }
+    end
+  end
+  local res = vim.rpcrequest(M.chan, 'nbv_commit', vim.v.cmdbang == 1, buffers)
   if res.error then
     fail(res.error)
   end
-  vim.bo[buf].modified = false
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if b == M.home_buf or vim.b[b].nbv_key then
+      vim.bo[b].modified = false
+    end
+  end
   api.nvim_exec_autocmds('BufWritePost', { buffer = buf, modeline = false })
   api.nvim_echo({ { res.message } }, false, {})
 end
 
---- Replaces the buffer's text without an undo step, e.g. for the initial load.
-local function set_text(buf, lines, undoable)
-  local ul = vim.bo[buf].undolevels
-  if not undoable then
-    vim.bo[buf].undolevels = -1
+--- BufReadCmd (§9.5): `:e` / `:e!` on any notebook buffer reloads the .ipynb through Rust.
+local function on_reload()
+  local res = vim.rpcrequest(M.chan, 'nbv_reload')
+  if res.error then
+    fail(res.error)
   end
-  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  if not undoable then
-    vim.bo[buf].undolevels = ul
+  if M.home_buf and api.nvim_buf_is_valid(M.home_buf) then
+    vim.bo[M.home_buf].modified = false
   end
-  vim.bo[buf].modified = false
 end
 
-local function setup_buffer(buf, filetype)
-  vim.bo[buf].swapfile = false
-  vim.bo[buf].buftype = ''
-  local group = api.nvim_create_augroup('nbv_buffer', { clear = true })
+local function intercept_io(buf)
+  local group = api.nvim_create_augroup('nbv_buffer_' .. buf, { clear = true })
   api.nvim_create_autocmd('BufWriteCmd', { group = group, buffer = buf, callback = on_write })
   api.nvim_create_autocmd({ 'FileWriteCmd', 'FileAppendCmd' }, {
     group = group,
     buffer = buf,
     callback = function()
-      fail('partial writes of the notebook buffer are not supported')
+      fail('partial writes of notebook buffers are not supported')
     end,
   })
-  api.nvim_create_autocmd('InsertLeave', {
-    group = group,
-    buffer = buf,
-    callback = function()
-      notify('normalise')
-    end,
-  })
-
-  for _, c in ipairs(commands) do
-    api.nvim_buf_create_user_command(buf, c[1], function()
-      notify(c[2])
-    end, {})
-  end
-  api.nvim_buf_create_user_command(buf, 'NbvCellAdd', function(o)
-    notify('cell_add', { above = o.bang })
-  end, { bang = true })
-  api.nvim_buf_create_user_command(buf, 'NbvCellMove', function(o)
-    notify('cell_move', { dir = o.args })
-  end, { nargs = 1, complete = function() return { 'up', 'down' } end })
-  api.nvim_buf_create_user_command(buf, 'NbvCellType', function(o)
-    notify('cell_type', { kind = o.args })
-  end, { nargs = 1, complete = function() return { 'code', 'markdown', 'raw' } end })
-  api.nvim_buf_create_user_command(buf, 'NbvClearOutput', function(o)
-    notify('clear_output', { all = o.bang })
-  end, { bang = true })
-
-  local map = function(mode, lhs, rhs, desc)
-    vim.keymap.set(mode, lhs, rhs, { buffer = buf, silent = true, desc = desc })
-  end
-  map({ 'n', 'x', 'o' }, ']c', function() M.jump(1) end, 'Next cell')
-  map({ 'n', 'x', 'o' }, '[c', function() M.jump(-1) end, 'Previous cell')
-  map({ 'x', 'o' }, 'ic', function() M.select(false) end, 'Inside cell')
-  map({ 'x', 'o' }, 'ac', function() M.select(true) end, 'Around cell')
-  if not vim.g.nbv_no_default_keymaps then
-    for _, k in ipairs(keymaps) do
-      map(k[1], k[2], k[3])
-    end
-  end
-  vim.bo[buf].filetype = filetype
+  api.nvim_create_autocmd('BufReadCmd', { group = group, buffer = buf, callback = on_reload })
 end
 
---- BufReadCmd (§9.5): the first load and every :e / :e! read the .ipynb through Rust.
-local function on_read(ev)
-  local res = vim.rpcrequest(M.chan, 'nbv_load', ev.buf)
-  if res.error then
-    fail(res.error)
-  end
-  -- The first load is not undoable; a reload is, so undo can step back across it.
-  local first = vim.b[ev.buf].nbv_loaded == nil
-  set_text(ev.buf, res.lines, not first)
-  vim.b[ev.buf].nbv_loaded = true
-  setup_buffer(ev.buf, res.filetype)
-  -- Sent after the text is in place: Rust (re)attaches and resyncs from here.
-  vim.rpcnotify(M.chan, 'nbv', 'loaded', { buf = ev.buf })
+--- Sends an action to Rust on behalf of the current window's cell, if any.
+function M.act(action, extra)
+  local args = extra or {}
+  local win = api.nvim_get_current_win()
+  args.key = window_key(win)
+  args.line = api.nvim_win_get_cursor(win)[1] - 1
+  notify(action, args)
 end
 
---- Applies line edits if the buffer is still at `tick` and not in insert mode (§7.3).
---- Edits are ordered bottom-up. Returns whether they were applied.
-function M.apply(buf, tick, edits, join, cursor)
-  if api.nvim_buf_get_changedtick(buf) ~= tick then
-    return false
-  end
-  if join and api.nvim_get_mode().mode:match('^[iR]') then
-    return false
-  end
-  for i, e in ipairs(edits) do
-    if join and i == 1 then
-      pcall(vim.cmd, 'undojoin') -- refused right after an undo; then it is its own step
-    end
-    api.nvim_buf_set_lines(buf, e[1], e[2], false, e[3])
-  end
-  if cursor and api.nvim_get_current_buf() == buf then
-    local last = api.nvim_buf_line_count(buf)
-    api.nvim_win_set_cursor(0, { math.max(1, math.min(cursor + 1, last)), 0 })
-  end
-  return true
+--- Replaces a buffer's text without an undo step, e.g. for the initial load.
+local function set_initial_text(buf, lines)
+  local ul = vim.bo[buf].undolevels
+  vim.bo[buf].undolevels = -1
+  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].undolevels = ul
+  vim.bo[buf].modified = false
 end
 
---- Defines the placeholder highlight groups. `nocombine` gives each group an attribute,
---- so Neovim reports it as its own highlight (§11.2) while drawing nothing visible.
-local function define_highlights()
-  for i = 0, M.slots - 1 do
-    api.nvim_set_hl(0, 'NbvOutputSlot' .. i, { nocombine = true })
-  end
-  api.nvim_set_hl(0, 'NbvMarker', { default = true, link = 'Comment' })
-  api.nvim_set_hl(0, 'NbvMarkerMarkdown', { default = true, link = 'Title' })
-  api.nvim_set_hl(0, 'NbvStatusOk', { default = true, link = 'DiagnosticOk' })
-  api.nvim_set_hl(0, 'NbvStatusError', { default = true, link = 'DiagnosticError' })
-  api.nvim_set_hl(0, 'NbvStatusRunning', { default = true, link = 'DiagnosticWarn' })
-  api.nvim_set_hl(0, 'NbvStatusQueued', { default = true, link = 'DiagnosticInfo' })
-  api.nvim_set_hl(0, 'NbvStatusStale', { default = true, link = 'DiagnosticHint' })
+local function create_buffer(key, spec)
+  local buf = api.nvim_create_buf(false, false)
+  -- An ordinary buffer (buftype=""), so LSP attaches (§9.1). Nothing is ever written to its name.
+  api.nvim_buf_set_name(buf, spec.name)
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].bufhidden = 'hide'
+  set_initial_text(buf, spec.lines)
+  vim.b[buf].nbv_key = key
+  intercept_io(buf)
+  -- The one way out of a cell: <Esc> in Normal mode, which otherwise does nothing. It also
+  -- clears search highlighting, the usual job of a user's own <Esc> mapping.
+  vim.keymap.set('n', '<Esc>', function()
+    vim.cmd.nohlsearch()
+    M.leave()
+  end, { buffer = buf, silent = true, desc = 'nbv: leave the cell' })
+  return buf
 end
 
---- Redraws all nbv decorations: output placeholders (virt_lines of the right height) and
---- cell status (virt_text on marker lines). Each placeholder row is one chunk wider than
---- any window, so its highlight reaches the end of the row.
-function M.render(buf, tick, outputs, marks)
-  if not api.nvim_buf_is_valid(buf) then
-    return
-  end
-  if api.nvim_buf_get_changedtick(buf) ~= tick then
-    -- Rust has not seen the latest change yet; it re-renders once it has.
-    vim.rpcnotify(M.chan, 'nbv', 'rerender', {})
-    return
-  end
-  api.nvim_buf_clear_namespace(buf, M.ns, 0, -1)
-  local count = api.nvim_buf_line_count(buf)
-  local pad = string.rep(' ', math.max(vim.o.columns, 80) + 8)
-  for _, o in ipairs(outputs) do
-    -- Each row carries its index as `#n#`: placeholder cells are drawn transparent, so the
-    -- tag is never seen, but it tells Rust exactly which output row landed where.
-    local rows = {}
-    local group = 'NbvOutputSlot' .. o.slot
-    for r = 1, o.height do
-      rows[r] = { { ('#%d#'):format(r - 1) .. pad, group } }
+--- Places a window for every listed cell and closes the rest (§11.1). Each cell is
+--- `{ key, row, col, width, height, topline, create? }`; `create` makes the cell's buffer.
+--- Ends with a redraw, then tells Rust the layout is on screen, so Rust always draws the
+--- notebook around the windows as Neovim has them.
+function M.layout(seq, spec)
+  local ok, err = pcall(function()
+    setup_home_window(M.home_win)
+    local bufs = {}
+    for _, b in ipairs(api.nvim_list_bufs()) do
+      local k = vim.b[b].nbv_key
+      if k then
+        bufs[k] = b
+      end
     end
-    local line = math.min(o.line, count - 1)
-    pcall(api.nvim_buf_set_extmark, buf, M.ns, line, 0, {
-      virt_lines = rows,
-      virt_lines_above = o.above,
-    })
-  end
-  for _, m in ipairs(marks) do
-    if m.line < count then
-      pcall(api.nvim_buf_set_extmark, buf, M.ns, m.line, 0, {
-        virt_text = m.text,
-        virt_text_pos = 'eol',
-        line_hl_group = m.line_hl,
-        hl_mode = 'combine',
-      })
+    local want = {}
+    for _, c in ipairs(spec.cells) do
+      want[c.key] = true
+    end
+    local wins = {}
+    local current = api.nvim_get_current_win()
+    for _, w in ipairs(api.nvim_list_wins()) do
+      local k = vim.w[w].nbv_key
+      if k then
+        if want[k] and not wins[k] and api.nvim_win_get_buf(w) == bufs[k] then
+          wins[k] = w
+        elseif w ~= current then
+          api.nvim_win_close(w, true)
+        end
+      end
+    end
+    local created = {}
+    for _, c in ipairs(spec.cells) do
+      local buf = bufs[c.key]
+      if not buf and c.create then
+        buf = create_buffer(c.key, c.create)
+        created[#created + 1] = { key = c.key, buf = buf, filetype = c.create.filetype }
+      end
+      if buf then
+        local active = c.key == spec.active
+        local cfg = {
+          relative = 'editor',
+          row = c.row,
+          col = c.col,
+          width = c.width,
+          height = c.height,
+          focusable = active,
+          zindex = 1,
+          hide = false,
+        }
+        local w = wins[c.key]
+        if w then
+          api.nvim_win_set_config(w, cfg)
+        else
+          cfg.border = 'none'
+          w = api.nvim_open_win(buf, false, cfg)
+          setup_cell_window(w, c.key)
+          wins[c.key] = w
+        end
+        set_active(w, active)
+        if c.topline > 0 then
+          api.nvim_win_call(w, function()
+            vim.fn.winrestview({ topline = c.topline })
+          end)
+        end
+      end
+    end
+    -- Set in the cell's window, so ftplugins' window-local settings land there.
+    for _, n in ipairs(created) do
+      api.nvim_win_call(wins[n.key], function()
+        vim.bo[n.buf].filetype = n.filetype
+      end)
+      notify('buffer', { key = n.key, buf = n.buf })
+    end
+  end)
+  vim.cmd.redraw()
+  notify('layout_done', { seq = seq, error = (not ok) and tostring(err) or nil, viewport = viewport() })
+end
+
+--- Focuses a cell's window (made focusable by the layout that precedes this call).
+function M.enter(seq, key, insert)
+  M.focus_seq = seq
+  for _, w in ipairs(api.nvim_list_wins()) do
+    if window_key(w) == key then
+      api.nvim_win_set_config(w, { focusable = true })
+      set_active(w, true)
+      api.nvim_set_current_win(w)
+      if insert then
+        vim.cmd.startinsert()
+      end
+      return
     end
   end
+  report_focus()
+end
+
+--- Returns to the home window. Rust queues this as input, after `<C-\><C-n>`, with its
+--- latest focus request; `<Esc>` in a cell calls it without one.
+function M.leave(seq)
+  M.focus_seq = seq or M.focus_seq
+  if M.home_win and api.nvim_win_is_valid(M.home_win) and api.nvim_get_current_win() ~= M.home_win then
+    api.nvim_set_current_win(M.home_win)
+  else
+    report_focus()
+  end
+end
+
+--- Rewrites a cell buffer after a structural change (split, merge, undo). Undoable in that
+--- buffer, like any edit.
+function M.set_text(buf, lines)
+  if api.nvim_buf_is_valid(buf) then
+    api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  end
+end
+
+function M.wipe(bufs)
+  for _, b in ipairs(bufs) do
+    if api.nvim_buf_is_valid(b) then
+      api.nvim_buf_delete(b, { force = true })
+    end
+  end
+end
+
+--- Marks the notebook changed in ways no cell buffer shows: structure, outputs.
+function M.set_modified()
+  if M.home_buf and api.nvim_buf_is_valid(M.home_buf) then
+    vim.bo[M.home_buf].modified = true
+  end
+end
+
+--- Offers kernels in the user's picker (`vim.ui.select`), without blocking RPC.
+function M.pick_kernel(items)
+  vim.schedule(function()
+    vim.ui.select(items, { prompt = 'Kernel' }, function(_, index)
+      if index then
+        notify('kernel_chosen', { index = index })
+      end
+    end)
+  end)
 end
 
 --- Asks the user for a line on behalf of the kernel (`input()`), without blocking RPC.
@@ -328,28 +394,84 @@ function M.input(prompt, password)
   end)
 end
 
+-- Only actions without a navigation key have commands.
+local commands = {
+  { 'NbvRunAll', 'run_all' },
+  { 'NbvRunAbove', 'run_above' },
+  { 'NbvSplit', 'split' },
+  { 'NbvKernel', 'kernel' },
+}
+
+--- The first read of the home buffer, at startup. Later reads are reloads (intercept_io).
+local function on_read_home(ev)
+  local buf = ev.buf
+  vim.bo[buf].buftype = 'acwrite'
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].bufhidden = 'hide'
+  vim.bo[buf].buflisted = false
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].modified = false
+  intercept_io(buf)
+  vim.bo[buf].filetype = 'nbv'
+end
+
+--- Post-config: runs after the user's config, so these settings win.
+local function post()
+  define_highlights()
+  M.home_buf = vim.fn.bufnr(M.home_name)
+  M.home_win = vim.fn.bufwinid(M.home_buf)
+  if M.home_win == -1 then
+    M.home_win = api.nvim_get_current_win()
+  end
+  -- Floating cell windows have no statuslines of their own; a global one follows them.
+  if vim.o.laststatus ~= 0 then
+    vim.o.laststatus = 3
+  end
+  setup_home_window(M.home_win)
+
+  local group = api.nvim_create_augroup('nbv_post', { clear = true })
+  api.nvim_create_autocmd('WinEnter', { group = group, callback = report_focus })
+  api.nvim_create_autocmd({ 'WinResized', 'VimResized' }, {
+    group = group,
+    callback = function()
+      notify('viewport', viewport())
+    end,
+  })
+
+  for _, c in ipairs(commands) do
+    api.nvim_create_user_command(c[1], function()
+      M.act(c[2])
+    end, {})
+  end
+  api.nvim_create_user_command('NbvClearOutput', function(o)
+    M.act('clear_output', { all = o.bang })
+  end, { bang = true })
+
+  notify('ready', { home = M.home_buf, viewport = viewport(), theme = theme() })
+end
+
 --- Pre-config: runs before the user's init.lua.
-function M.pre(chan, path)
+function M.pre(chan, home_name, transparent_sp)
   M.chan = chan
-  M.path = path
+  M.home_name = home_name
+  M.transparent_sp = transparent_sp
   vim.g.nbv = true
   local group = api.nvim_create_augroup('nbv', { clear = true })
   api.nvim_create_autocmd('BufReadCmd', {
     group = group,
-    -- Autocmd patterns treat these as wildcards; the path must match literally.
-    pattern = (path:gsub('([*?%[%]{},\\])', '\\%1')),
-    callback = on_read,
-  })
-  api.nvim_create_autocmd('ColorScheme', { group = group, callback = define_highlights })
-  -- Post-config: after the user's config, so these win.
-  api.nvim_create_autocmd('VimEnter', {
-    group = group,
     once = true,
+    -- Autocmd patterns treat these as wildcards; the name must match literally.
+    pattern = (home_name:gsub('([*?%[%]{},\\])', '\\%1')),
+    callback = on_read_home,
+  })
+  api.nvim_create_autocmd('ColorScheme', {
+    group = group,
     callback = function()
       define_highlights()
-      vim.rpcnotify(M.chan, 'nbv', 'ready', { buf = vim.fn.bufnr(path) })
+      notify('theme', theme())
     end,
   })
+  api.nvim_create_autocmd('VimEnter', { group = group, once = true, callback = post })
 end
 
 package.loaded['nbv'] = M

@@ -1,34 +1,42 @@
 //! The event loop: terminal input, Neovim, and the kernel, around one notebook (R1).
+//!
+//! nbv draws the notebook: cell boxes, execution counts, outputs. Neovim draws each visible
+//! cell's editor in a floating window placed inside its box, and everything else Neovim shows
+//! (command line, pickers, completion) on top. Keys go to nbv's navigation mode while the
+//! home window has focus, and to Neovim while a cell (or anything else) does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyboardEnhancementFlags};
+use crossterm::event::{Event, EventStream, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::{cursor, event, execute, terminal};
 use futures::StreamExt;
 use jupyter_protocol::JupyterMessage;
 use nbv_core::exec::{ExecEvent, Executor, KernelStatus};
 use nbv_core::kernel::{self, Kernel, KernelCommand, KernelError, KernelMessage};
-use nbv_core::structure::{self, Direction, Plan};
-use nbv_core::{CellKey, CellKind, ExecState, Notebook};
-use nbv_nvim::editor::{self, Editor, EditorEvent, field};
+use nbv_core::{CellKey, CellKind, Change, ExecState, Notebook};
+use nbv_nvim::editor::{self, Editor, EditorEvent, EditorRect, Focus, Theme, field};
 use nbv_nvim::redraw::CursorShape;
 use nbv_nvim::{EmbeddedNvim, NvimClient, NvimError, NvimEvent};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Rect, Size};
-use ratatui::style::{Modifier, Style};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Size;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui_image::picker::Picker;
 use ratatui_image::sliced::SlicedProtocol;
 use rmpv::Value;
+use serde_json::Map;
 use tokio::sync::mpsc;
 
-use crate::outputs::{self, Block, Images, OutputView};
+use crate::compose::{self, Region};
+use crate::layout::{Block, Geometry, Layout};
+use crate::nav::{Action, Nav};
+use crate::outputs::{self, Images, OutputView};
 use crate::terminal::{self as term, Tmux};
-use crate::{compose, decor};
 
 pub struct Options {
     pub notebook: PathBuf,
@@ -37,7 +45,18 @@ pub struct Options {
 }
 
 enum KernelStart {
-    Ready(u64, Result<(Kernel, KernelCommand), KernelError>),
+    Ready(u64, Result<Kernel, KernelError>),
+}
+
+/// Where keys go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Mode {
+    /// nbv's navigation keys act on cells.
+    Nav,
+    /// A cell's Neovim window has focus; keys go to Neovim.
+    Edit(CellKey),
+    /// Some other Neovim window has focus; keys go to Neovim.
+    Other,
 }
 
 struct App {
@@ -46,7 +65,12 @@ struct App {
     client: EmbeddedNvim,
     exec: Executor,
     kernel: Option<Kernel>,
-    kernel_name: String,
+    /// The kernel chosen for this session: resolved at startup, or picked with `:NbvKernel`.
+    kernel_cmd: Option<KernelCommand>,
+    /// Why there is no working kernel. Runs fail with it, shown under the cell.
+    kernel_error: Option<String>,
+    /// What `:NbvKernel` last offered, in the order shown.
+    kernel_choices: Vec<KernelCommand>,
     generation: u64,
     kernel_tx: mpsc::UnboundedSender<KernelMessage>,
     start_tx: mpsc::UnboundedSender<KernelStart>,
@@ -59,25 +83,43 @@ struct App {
     protocols: HashMap<(u64, u16, u16), SlicedProtocol>,
     picker: Picker,
     tmux: Option<Tmux>,
-    slots: Vec<Option<CellKey>>,
     terminal: Terminal<CrosstermBackend<Stdout>>,
-    decorations: bool,
-    draw: bool,
     cursor_shape: Option<(CursorShape, u8)>,
     quit: bool,
+
+    mode: Mode,
+    /// Sequence number of the latest focus change nbv asked for (§10.2).
+    focus_seq: u64,
+    selected: usize,
+    scroll: usize,
+    geometry: Option<Geometry>,
+    theme: Theme,
+    nav: Nav,
+    /// The last deleted or yanked cell, for pasting.
+    register: Option<Map<String, serde_json::Value>>,
+    /// Keys go to Neovim until it returns to Normal mode after this mode-change count.
+    forward_since: Option<u64>,
+    /// Whether the next layout should scroll the selected cell into view.
+    reveal: bool,
+    layout_seq: u64,
+    /// The last editor placement sent, to skip identical ones.
+    last_sent: Option<(Option<CellKey>, Vec<EditorRect>)>,
+    /// Layouts sent and not yet on screen, with their scroll offsets.
+    sent: VecDeque<(u64, Layout, usize)>,
+    /// The layout Neovim has on screen: nbv draws around the windows where they are.
+    shown: Option<(Layout, usize)>,
+    relayout: bool,
+    draw: bool,
+    /// Whether the home buffer has been marked modified since the last write.
+    dirty: bool,
 }
 
 /// Restores the terminal on drop, including on panic.
-struct TerminalGuard {
-    enhanced: bool,
-}
+struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = std::io::stdout();
-        if self.enhanced {
-            let _ = execute!(out, event::PopKeyboardEnhancementFlags);
-        }
         let _ = execute!(
             out,
             event::DisableMouseCapture,
@@ -105,26 +147,25 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         event::EnableBracketedPaste,
         event::EnableFocusChange
     )?;
-    // Modified keys such as <S-CR> need the Kitty keyboard protocol; without it the
-    // <localleader> bindings still work (§10.2).
-    let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
-    if enhanced {
-        execute!(out, event::PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
-    }
-    let _guard = TerminalGuard { enhanced };
+    let _guard = TerminalGuard;
     // The capability query reads stdin, so it must run before the event stream starts.
     let picker = term::picker(tmux.as_ref());
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     terminal.clear()?;
     let size = terminal.size()?;
 
-    let buffer_path = editor::buffer_path(&notebook, &nb);
-    let (client, mut nvim_rx) = editor::spawn(opts.nvim.clone(), opts.clean, &[], &buffer_path).await?;
+    // Before Neovim starts: code cells are edited in the kernel's language.
+    let (kernel_cmd, kernel_error) = match kernel::resolve(nb.kernel_name()).await {
+        Ok(cmd) => (Some(cmd), None),
+        Err(e) => (None, Some(format!("{e} (:NbvKernel picks one)"))),
+    };
+    let (client, mut nvim_rx) = editor::spawn(opts.nvim.clone(), opts.clean, &[], &notebook).await?;
     let (err_tx, mut err_rx) = mpsc::unbounded_channel::<NvimError>();
-    let editor = Editor::new(client.clone(), err_tx.clone());
+    let mut editor = Editor::new(client.clone(), err_tx.clone());
+    editor.set_language(kernel_cmd.as_ref().map(|c| c.language.clone()));
     {
-        let (client, path) = (client.clone(), buffer_path.clone());
-        let (w, h) = (size.width as usize, size.height.saturating_sub(1) as usize);
+        let (client, path) = (client.clone(), notebook.clone());
+        let (w, h) = (size.width as usize, size.height as usize);
         tokio::spawn(async move {
             if let Err(e) = editor::handshake(&client, &path, w, h).await {
                 let _ = err_tx.send(e);
@@ -134,38 +175,46 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
     let (kernel_tx, mut kernel_rx) = mpsc::unbounded_channel();
     let (start_tx, mut start_rx) = mpsc::unbounded_channel();
-    let message = tmux.as_ref().and_then(|t| {
-        let missing = t.missing();
-        match (t.too_old(), missing.is_empty()) {
-            (true, _) => Some("tmux 3.3 or newer is required for images".to_string()),
-            (false, true) => None,
-            (false, false) => Some(format!("tmux.conf is missing: {}", missing.join("; "))),
-        }
-    });
     let mut app = App {
         nb,
         editor,
         client,
         exec: Executor::default(),
         kernel: None,
-        kernel_name: String::from("kernel"),
+        kernel_cmd,
+        kernel_error,
+        kernel_choices: vec![],
         generation: 0,
         kernel_tx,
         start_tx,
         pending: vec![],
         input_request: None,
-        message,
+        message: None,
         views: HashMap::new(),
         images: Images::default(),
         protocols: HashMap::new(),
         picker,
         tmux,
-        slots: vec![None; decor::SLOTS],
         terminal,
-        decorations: false,
-        draw: true,
         cursor_shape: None,
         quit: false,
+        mode: Mode::Nav,
+        focus_seq: 0,
+        selected: 0,
+        scroll: 0,
+        geometry: None,
+        theme: Theme::new(),
+        nav: Nav::default(),
+        register: None,
+        forward_since: None,
+        reveal: false,
+        layout_seq: 0,
+        last_sent: None,
+        sent: VecDeque::new(),
+        shown: None,
+        relayout: false,
+        draw: true,
+        dirty: false,
     };
     app.start_kernel();
 
@@ -194,8 +243,8 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         while let Ok(msg) = kernel_rx.try_recv() {
             app.on_kernel(msg).await;
         }
-        if app.decorations {
-            app.render_decorations();
+        if app.relayout {
+            app.relayout();
         }
         if app.draw {
             app.draw()?;
@@ -209,42 +258,51 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn arg_line(args: &Value) -> usize {
-    field(args, "line").and_then(Value::as_u64).unwrap_or(0) as usize
-}
-
-fn arg_tick(args: &Value) -> u64 {
-    field(args, "tick").and_then(Value::as_u64).unwrap_or(0)
+fn rgb(c: Option<u32>) -> Option<Color> {
+    c.map(|c| Color::Rgb((c >> 16) as u8, (c >> 8) as u8, c as u8))
 }
 
 impl App {
+    /// Starts the chosen kernel. Without one, `kernel_error` already says why.
     fn start_kernel(&mut self) {
         self.generation += 1;
+        let Some(cmd) = self.kernel_cmd.clone() else {
+            let reason = self.kernel_error.clone().expect("no kernel without a reason");
+            for ev in self.exec.fail_all(&mut self.nb, &reason) {
+                self.on_exec_event(ev);
+            }
+            return;
+        };
+        self.kernel_error = None;
         let generation = self.generation;
-        let name = self.nb.kernel_name().map(str::to_string);
-        let cwd = self.nb.path().parent().map(PathBuf::from).unwrap_or_else(|| ".".into());
+        let cwd = self.nb.path().parent().expect("the notebook path is absolute").to_path_buf();
         let (tx, start) = (self.kernel_tx.clone(), self.start_tx.clone());
         tokio::spawn(async move {
-            let result = async {
-                let cmd = kernel::resolve(name.as_deref()).await?;
-                let k = Kernel::start(&cmd, &cwd, generation, tx).await?;
-                Ok((k, cmd))
-            }
-            .await;
+            let result = Kernel::start(&cmd, &cwd, generation, tx).await;
             let _ = start.send(KernelStart::Ready(generation, result));
         });
     }
 
-    async fn on_kernel_ready(&mut self, generation: u64, result: Result<(Kernel, KernelCommand), KernelError>) {
+    /// The kernel cannot run anything: cells queued or running fail with `reason`, and so will
+    /// later runs until the kernel is restarted or another is picked.
+    fn kernel_failed(&mut self, reason: String) {
+        self.kernel = None;
+        self.pending.clear();
+        for ev in self.exec.fail_all(&mut self.nb, &reason) {
+            self.on_exec_event(ev);
+        }
+        self.kernel_error = Some(reason);
+    }
+
+    async fn on_kernel_ready(&mut self, generation: u64, result: Result<Kernel, KernelError>) {
         if generation != self.generation {
-            if let Ok((k, _)) = result {
+            if let Ok(k) = result {
                 tokio::spawn(k.shutdown());
             }
             return;
         }
         match result {
-            Ok((mut k, cmd)) => {
-                self.kernel_name = cmd.display_name;
+            Ok(mut k) => {
                 for msg in self.pending.drain(..) {
                     if let Err(e) = k.send_shell(msg).await {
                         self.message = Some(e.to_string());
@@ -254,14 +312,10 @@ impl App {
                 self.exec.connected();
             }
             Err(e) => {
-                self.message = Some(e.to_string());
-                for ev in self.exec.reset(&mut self.nb, KernelStatus::Dead) {
-                    self.on_exec_event(ev);
-                }
-                self.pending.clear();
+                let name = self.kernel_cmd.as_ref().map_or("kernel", |c| c.display_name.as_str());
+                self.kernel_failed(format!("{name} could not start (00 retries, :NbvKernel picks another):\n{e}"));
             }
         }
-        self.decorations = true;
         self.draw = true;
     }
 
@@ -269,10 +323,67 @@ impl App {
         for e in self.editor.handle(&mut self.nb, ev) {
             match e {
                 EditorEvent::Flush => self.draw = true,
-                EditorEvent::Ready | EditorEvent::DocumentChanged => self.decorations = true,
+                EditorEvent::Ready => self.relayout = true,
+                EditorEvent::SourceChanged(_) => {
+                    // So `:x` in the home window writes it, as for any changed buffer.
+                    self.mark_dirty();
+                    // A cell's line count may have changed, and its staleness.
+                    self.relayout = true;
+                    self.draw = true;
+                }
                 EditorEvent::Reloaded => {
                     self.views.clear();
-                    self.decorations = true;
+                    self.mode = Mode::Nav;
+                    self.dirty = false;
+                    self.last_sent = None;
+                    self.relayout = true;
+                }
+                EditorEvent::Written => {
+                    self.dirty = false;
+                    self.draw = true;
+                }
+                EditorEvent::Focus { seq, focus } => {
+                    // Focus changes that predate nbv's latest request are superseded by it.
+                    if seq >= self.focus_seq {
+                        let mode = match focus {
+                            Focus::Home => Mode::Nav,
+                            Focus::Cell(k) => {
+                                self.selected = self.nb.index_of(&k).unwrap_or(self.selected);
+                                Mode::Edit(k)
+                            }
+                            Focus::Other => Mode::Other,
+                        };
+                        if mode != self.mode {
+                            self.mode = mode;
+                            self.relayout = true;
+                        }
+                    }
+                }
+                EditorEvent::LayoutDone { seq, error } => {
+                    while let Some((s, ..)) = self.sent.front() {
+                        if *s > seq {
+                            break;
+                        }
+                        let (s, layout, scroll) = self.sent.pop_front().expect("front exists");
+                        if s == seq {
+                            self.shown = Some((layout, scroll));
+                        }
+                    }
+                    if let Some(e) = error {
+                        self.message = Some(format!("layout: {e}"));
+                    }
+                    self.draw = true;
+                }
+                EditorEvent::Viewport(v) => {
+                    let g = Geometry { viewport: v };
+                    if self.geometry != Some(g) {
+                        self.geometry = Some(g);
+                        self.relayout = true;
+                    }
+                }
+                EditorEvent::Theme(t) => {
+                    self.theme = t;
+                    self.draw = true;
                 }
                 EditorEvent::Command { action, args } => self.on_command(&action, &args).await,
                 EditorEvent::Exited => self.quit = true,
@@ -282,35 +393,18 @@ impl App {
 
     async fn on_terminal(&mut self, ev: Event) {
         match ev {
-            Event::Key(k) => {
-                if let Some(keys) = crate::keys::encode(k) {
-                    self.editor.calls.request("nvim_input", vec![keys.into()]);
-                }
-            }
-            Event::Mouse(m) => {
-                if let Some((button, action, modifier, row, col)) = crate::keys::mouse(m) {
-                    let args = vec![
-                        button.into(),
-                        action.into(),
-                        modifier.into(),
-                        0u64.into(),
-                        (row as u64).into(),
-                        (col as u64).into(),
-                    ];
-                    self.editor.calls.request("nvim_input_mouse", args);
-                }
-            }
+            Event::Key(k) => self.on_key(k).await,
+            Event::Mouse(m) => self.on_mouse(m),
             Event::Paste(text) => {
-                self.editor.calls.request("nvim_paste", vec![text.into(), true.into(), (-1).into()]);
+                if self.mode != Mode::Nav || self.forwarding() {
+                    self.editor.calls.request("nvim_paste", vec![text.into(), true.into(), (-1).into()]);
+                }
             }
             Event::Resize(w, h) => {
-                self.editor
-                    .calls
-                    .request("nvim_ui_try_resize", vec![(w as u64).into(), (h.saturating_sub(1) as u64).into()]);
+                self.editor.calls.request("nvim_ui_try_resize", vec![(w as u64).into(), (h as u64).into()]);
                 self.views.clear();
                 self.protocols.clear();
-                self.decorations = true;
-                self.draw = true;
+                self.relayout = true;
             }
             Event::FocusGained => {
                 self.editor.calls.request("nvim_ui_set_focus", vec![true.into()]);
@@ -325,6 +419,84 @@ impl App {
         }
     }
 
+    /// Whether keys typed in navigation mode belong to Neovim: its command line, a prompt,
+    /// or a `:` command nbv handed over and Neovim has not finished.
+    fn forwarding(&mut self) -> bool {
+        let grid = &self.editor.grid;
+        if let Some(since) = self.forward_since {
+            if grid.mode_name == "normal" && grid.mode_changes >= since + 2 {
+                self.forward_since = None;
+            } else {
+                return true;
+            }
+        }
+        grid.mode_name != "normal"
+    }
+
+    async fn on_key(&mut self, k: KeyEvent) {
+        let Some(keys) = crate::keys::encode(k) else { return };
+        let calls = self.editor.calls.clone();
+        match self.mode.clone() {
+            // A cell's own <Esc> mapping leaves it (§10.2); everything else is Neovim's.
+            Mode::Edit(_) | Mode::Other => calls.input(&keys),
+            Mode::Nav if self.forwarding() => calls.input(&keys),
+            Mode::Nav => match self.nav.feed(&keys) {
+                Some(action) => self.on_action(action).await,
+                None => self.draw = true,
+            },
+        }
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let forward = |app: &App| {
+            if let Some((button, action, modifier, row, col)) = crate::keys::mouse(m) {
+                let args = vec![
+                    button.into(),
+                    action.into(),
+                    modifier.into(),
+                    0u64.into(),
+                    (row as u64).into(),
+                    (col as u64).into(),
+                ];
+                app.editor.calls.request("nvim_input_mouse", args);
+            }
+        };
+        let (Some(g), Some((layout, scroll))) = (self.geometry, self.shown.as_ref()) else { return forward(self) };
+        let scroll = *scroll;
+        let hit = layout.at_row(&g, scroll, m.row).map(|i| layout.blocks[i].key.clone());
+        let in_editor = hit.as_ref().is_some_and(|key| {
+            layout.editors(&g, scroll, None).iter().any(|r| {
+                &r.key == key
+                    && (r.row..r.row + r.height).contains(&m.row)
+                    && (r.col..r.col + r.width).contains(&m.column)
+            })
+        });
+        match (m.kind, &self.mode) {
+            (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, Mode::Nav) => {
+                let rows = if m.kind == MouseEventKind::ScrollDown { 3 } else { -3 };
+                self.scroll_by(rows);
+            }
+            (MouseEventKind::Down(MouseButton::Left), mode) if hit.is_some() => {
+                let key = hit.expect("checked");
+                let editing = mode == &Mode::Edit(key.clone());
+                if in_editor {
+                    if !editing {
+                        self.enter(key, false);
+                    }
+                    // Positions the cursor, now that the window has focus.
+                    forward(self);
+                } else {
+                    if matches!(self.mode, Mode::Edit(_)) {
+                        self.leave();
+                    }
+                    self.select(self.nb.index_of(&key).unwrap_or(self.selected));
+                }
+            }
+            (_, Mode::Nav) if hit.is_some() => {}
+            _ => forward(self),
+        }
+    }
+
     async fn on_kernel(&mut self, msg: KernelMessage) {
         match msg {
             KernelMessage::Message(m) => {
@@ -336,12 +508,9 @@ impl App {
                 }
             }
             KernelMessage::Died { generation, stderr } if generation == self.generation => {
-                self.kernel = None;
-                let last = stderr.lines().last().unwrap_or("").to_string();
-                self.message = Some(format!("kernel died {last} (:NbvRestart to restart)"));
-                for ev in self.exec.reset(&mut self.nb, KernelStatus::Dead) {
-                    self.on_exec_event(ev);
-                }
+                let tail = stderr.trim_end();
+                let tail = if tail.is_empty() { String::new() } else { format!(":\n{tail}") };
+                self.kernel_failed(format!("the kernel died (00 restarts it){tail}"));
             }
             KernelMessage::Died { .. } => {}
         }
@@ -351,7 +520,8 @@ impl App {
         match ev {
             ExecEvent::Cell(k) => {
                 self.views.remove(&k);
-                self.decorations = true;
+                self.mark_dirty();
+                self.relayout = true;
                 self.draw = true;
             }
             ExecEvent::Status(_) => self.draw = true,
@@ -361,12 +531,37 @@ impl App {
         }
     }
 
-    fn key_at(&self, line: usize) -> Option<CellKey> {
-        self.nb.span_at(line).map(|s| s.key.clone())
+    /// The document changed: mark the home buffer modified, so quitting without saving is
+    /// refused, and `:x` writes, as for any buffer.
+    fn mark_dirty(&mut self) {
+        if !self.dirty {
+            self.dirty = true;
+            self.editor.set_modified();
+        }
+    }
+
+    fn selected_key(&self) -> Option<CellKey> {
+        self.nb.order().get(self.selected).cloned()
+    }
+
+    /// The cell a command names (the cell whose window ran it), or the selected cell.
+    fn command_key(&self, args: &Value) -> Option<CellKey> {
+        field(args, "key")
+            .and_then(Value::as_str)
+            .map(CellKey::new)
+            .filter(|k| self.nb.is_live(k))
+            .or_else(|| self.selected_key())
     }
 
     async fn run_cells(&mut self, keys: Vec<CellKey>) {
         for key in keys {
+            if let Some(reason) = self.kernel_error.clone() {
+                if self.nb.cell(&key).is_some_and(|c| c.kind() == CellKind::Code) {
+                    let ev = self.exec.fail(&mut self.nb, &key, &reason);
+                    self.on_exec_event(ev);
+                }
+                continue;
+            }
             let Some(msg) = self.exec.request(&mut self.nb, &key) else { continue };
             self.views.remove(&key);
             match self.kernel.as_mut() {
@@ -378,123 +573,260 @@ impl App {
                 None => self.pending.push(msg),
             }
         }
-        self.decorations = true;
+        self.relayout = true;
         self.draw = true;
     }
 
     fn code_cells(&self) -> Vec<CellKey> {
-        self.nb.layout().iter().filter(|s| s.kind == CellKind::Code).map(|s| s.key.clone()).collect()
+        let nb = &self.nb;
+        nb.order().iter().filter(|k| nb.cell(k).is_some_and(|c| c.kind() == CellKind::Code)).cloned().collect()
     }
 
-    fn apply_plan(&mut self, tick: u64, plan: Plan) {
-        self.editor.apply(tick, &plan.edits, false, plan.cursor);
+    async fn restart(&mut self) {
+        if let Some(k) = self.kernel.take() {
+            tokio::spawn(k.shutdown());
+        }
+        for ev in self.exec.reset(&mut self.nb, KernelStatus::Restarting) {
+            self.on_exec_event(ev);
+        }
+        self.pending.clear();
+        self.start_kernel();
     }
 
-    async fn on_command(&mut self, action: &str, args: &Value) {
-        let line = arg_line(args);
-        let tick = arg_tick(args);
-        match action {
-            "run" => {
-                let keys = self.key_at(line).into_iter().collect();
-                self.run_cells(keys).await;
+    async fn interrupt(&mut self) {
+        if let Some(k) = self.kernel.as_mut()
+            && let Err(e) = k.interrupt().await
+        {
+            self.message = Some(e.to_string());
+        }
+    }
+
+    /// After running `key` with run-and-advance: select the next cell, or add one at the end
+    /// and edit it, as Jupyter does.
+    fn advance(&mut self, key: &CellKey) {
+        let Some(i) = self.nb.index_of(key) else { return };
+        if i + 1 < self.nb.order().len() {
+            self.select(i + 1);
+        } else {
+            self.open(i + 1);
+        }
+    }
+
+    /// A new code cell at `index`, edited in insert mode.
+    fn open(&mut self, index: usize) {
+        let key = self.nb.new_cell(CellKind::Code, "");
+        let at = self.nb.edit(vec![Change::Show { key: key.clone(), index }]);
+        self.structure_changed(at);
+        self.enter(key, true);
+    }
+
+    /// Brings the buffers, the selection and the screen up to date after a structural change.
+    fn structure_changed(&mut self, focus: Option<usize>) {
+        self.editor.sync(&self.nb);
+        if let Some(i) = focus {
+            self.selected = i;
+        }
+        self.mark_dirty();
+        self.last_sent = None;
+        self.reveal = true;
+        self.relayout = true;
+    }
+
+    fn select(&mut self, i: usize) {
+        self.selected = i.min(self.nb.order().len().saturating_sub(1));
+        self.reveal = true;
+        self.relayout = true;
+    }
+
+    /// Scrolls the view by `rows`, keeping the selection on screen.
+    fn scroll_by(&mut self, rows: isize) {
+        let Some(g) = self.geometry else { return };
+        let layout = self.layout(&g);
+        let area = g.area_height();
+        self.scroll = self.scroll.saturating_add_signed(rows).min(layout.max_scroll(area));
+        let visible = |b: &Block| b.top + b.box_height() > self.scroll && b.top < self.scroll + area;
+        if !layout.blocks.get(self.selected).is_some_and(visible) {
+            let pick =
+                if rows > 0 { layout.blocks.iter().position(visible) } else { layout.blocks.iter().rposition(visible) };
+            if let Some(i) = pick {
+                self.selected = i;
             }
-            "run_advance" => {
-                let keys = self.key_at(line).into_iter().collect();
-                self.run_cells(keys).await;
-                // Like Jupyter: move to the next cell, adding one at the end.
-                match structure::next_cell_line(&self.nb, line) {
-                    Some(next) => self.editor.apply(tick, &[], false, Some(next)),
+        }
+        self.relayout = true;
+    }
+
+    /// Gives a cell's window focus. The layout goes first, so the window exists and accepts
+    /// focus when the request arrives.
+    fn enter(&mut self, key: CellKey, insert: bool) {
+        self.focus_seq += 1;
+        self.selected = self.nb.index_of(&key).unwrap_or(self.selected);
+        self.mode = Mode::Edit(key.clone());
+        self.relayout();
+        self.editor.enter(self.focus_seq, &key, insert);
+    }
+
+    fn leave(&mut self) {
+        self.focus_seq += 1;
+        self.mode = Mode::Nav;
+        self.editor.leave(self.focus_seq);
+        self.relayout = true;
+    }
+
+    async fn on_action(&mut self, action: Action) {
+        let len = self.nb.order().len();
+        let area = self.geometry.map_or(20, |g| g.area_height()) as isize;
+        let key = self.selected_key();
+        match action {
+            Action::Down(n) => self.select(self.selected.saturating_add(n)),
+            Action::Up(n) => self.select(self.selected.saturating_sub(n)),
+            Action::First => self.select(0),
+            Action::Last(None) => self.select(len.saturating_sub(1)),
+            Action::Last(Some(n)) => self.select(n.saturating_sub(1)),
+            Action::HalfPageDown => self.scroll_by(area / 2),
+            Action::HalfPageUp => self.scroll_by(-area / 2),
+            Action::Edit => match key {
+                Some(k) => self.enter(k, false),
+                None => self.open(0),
+            },
+            Action::Open { above } => {
+                let at = if len == 0 || above { self.selected.min(len) } else { self.selected + 1 };
+                self.open(at);
+            }
+            Action::Delete => {
+                if let Some(k) = key {
+                    self.register = self.nb.cell(&k).map(|c| c.raw.clone());
+                    let at = self.nb.edit(vec![Change::Hide { key: k }]);
+                    self.structure_changed(at);
+                }
+            }
+            Action::Yank => {
+                if let Some(k) = key {
+                    self.register = self.nb.cell(&k).map(|c| c.raw.clone());
+                    self.message = Some("cell yanked".into());
+                    self.draw = true;
+                }
+            }
+            Action::Paste { above } => {
+                if let Some(raw) = self.register.clone() {
+                    let k = self.nb.copy_cell(&raw);
+                    let index = if len == 0 || above { self.selected.min(len) } else { self.selected + 1 };
+                    let at = self.nb.edit(vec![Change::Show { key: k, index }]);
+                    self.structure_changed(at);
+                }
+            }
+            Action::Undo | Action::Redo => {
+                let at = if action == Action::Undo { self.nb.undo() } else { self.nb.redo() };
+                match at {
+                    Some(i) => self.structure_changed(Some(i)),
                     None => {
-                        let plan = structure::add(&mut self.nb, line, false);
-                        self.apply_plan(tick, plan);
+                        let edge = if action == Action::Undo { "oldest" } else { "newest" };
+                        self.message = Some(format!("Already at {edge} change"));
+                        self.draw = true;
                     }
                 }
             }
+            Action::MoveDown | Action::MoveUp => {
+                let to = if action == Action::MoveDown { self.selected + 1 } else { self.selected.wrapping_sub(1) };
+                if let Some(k) = key.filter(|_| to < len) {
+                    let at = self.nb.edit(vec![Change::Move { key: k, index: to }]);
+                    self.structure_changed(at);
+                }
+            }
+            Action::Merge => {
+                if let (Some(k), Some(next)) = (key, self.nb.order().get(self.selected + 1).cloned()) {
+                    let at = self.nb.edit(vec![Change::Merge { key: k, next }]);
+                    self.structure_changed(at);
+                }
+            }
+            Action::Kind(kind) => {
+                if let Some(k) = key {
+                    let at = self.nb.edit(vec![Change::Kind { key: k, kind }]);
+                    self.structure_changed(at);
+                }
+            }
+            Action::Run => self.run_cells(key.into_iter().collect()).await,
+            Action::RunAdvance => {
+                if let Some(k) = key {
+                    self.run_cells(vec![k.clone()]).await;
+                    self.advance(&k);
+                }
+            }
+            Action::Interrupt => self.interrupt().await,
+            Action::Restart => self.restart().await,
+            Action::Cmdline => {
+                self.forward_since = Some(self.editor.grid.mode_changes);
+                self.editor.calls.input(":");
+            }
+        }
+    }
+
+    async fn on_command(&mut self, action: &str, args: &Value) {
+        let key = self.command_key(args);
+        match action {
             "run_all" => {
                 let keys = self.code_cells();
                 self.run_cells(keys).await;
             }
             "run_above" => {
-                let current = self.key_at(line);
-                let keys = self
-                    .nb
-                    .layout()
-                    .iter()
-                    .take_while(|s| Some(&s.key) != current.as_ref())
-                    .filter(|s| s.kind == CellKind::Code)
-                    .map(|s| s.key.clone())
-                    .collect();
+                let stop = key.and_then(|k| self.nb.index_of(&k)).unwrap_or(0);
+                let above: Vec<CellKey> = self.nb.order()[..stop].to_vec();
+                let keys = self.code_cells().into_iter().filter(|k| above.contains(k)).collect();
                 self.run_cells(keys).await;
             }
-            "interrupt" => {
-                if let Some(k) = self.kernel.as_mut()
-                    && let Err(e) = k.interrupt().await
-                {
-                    self.message = Some(e.to_string());
-                }
-            }
-            "restart" => {
-                if let Some(k) = self.kernel.take() {
-                    tokio::spawn(k.shutdown());
-                }
-                for ev in self.exec.reset(&mut self.nb, KernelStatus::Restarting) {
-                    self.on_exec_event(ev);
-                }
-                self.pending.clear();
-                self.message = None;
-                self.start_kernel();
-            }
-            "cell_add" => {
-                let above = field(args, "above").and_then(Value::as_bool).unwrap_or(false);
-                let plan = structure::add(&mut self.nb, line, above);
-                self.apply_plan(tick, plan);
-            }
-            "cell_delete" => {
-                let plan = structure::delete(&self.nb, line);
-                self.apply_plan(tick, plan);
-            }
-            "cell_split" => {
-                let plan = structure::split(&mut self.nb, line);
-                self.apply_plan(tick, plan);
-            }
-            "cell_merge" => {
-                let plan = structure::merge(&self.nb, line);
-                self.apply_plan(tick, plan);
-            }
-            "cell_move" => {
-                let dir = match field(args, "dir").and_then(Value::as_str) {
-                    Some("up") => Direction::Up,
-                    Some("down") => Direction::Down,
-                    other => {
-                        self.message = Some(format!("NbvCellMove: expected up or down, got {other:?}"));
-                        return;
+            "split" => {
+                let line = field(args, "line").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if let Some(k) = key {
+                    let kind = self.nb.cell(&k).map_or(CellKind::Code, |c| c.kind());
+                    let new = self.nb.new_cell(kind, "");
+                    let at = self.nb.edit(vec![Change::Split { key: k, line, new: new.clone() }]);
+                    if at.is_some() {
+                        self.structure_changed(at);
+                        // Editing continues where the cursor was: the second half.
+                        self.enter(new, false);
                     }
-                };
-                let plan = structure::swap(&self.nb, line, dir);
-                self.apply_plan(tick, plan);
-            }
-            "cell_type" => {
-                let kind = match field(args, "kind").and_then(Value::as_str) {
-                    Some("code") => CellKind::Code,
-                    Some("markdown") => CellKind::Markdown,
-                    Some("raw") => CellKind::Raw,
-                    other => {
-                        self.message = Some(format!("NbvCellType: expected code, markdown or raw, got {other:?}"));
-                        return;
-                    }
-                };
-                let plan = structure::set_type(&self.nb, line, kind);
-                self.apply_plan(tick, plan);
+                }
             }
             "clear_output" => {
                 let all = field(args, "all").and_then(Value::as_bool).unwrap_or(false);
-                let keys = if all { self.code_cells() } else { self.key_at(line).into_iter().collect() };
+                let keys = if all { self.code_cells() } else { key.into_iter().collect() };
                 for k in keys {
                     self.exec.clear_outputs(&mut self.nb, &k);
                     self.views.remove(&k);
                 }
-                self.decorations = true;
-                self.draw = true;
+                self.mark_dirty();
+                self.relayout = true;
+            }
+            "kernel" => {
+                self.kernel_choices = kernel::choices().await;
+                if self.kernel_choices.is_empty() {
+                    self.message =
+                        Some("no kernels found: activate a virtualenv with ipykernel, or install a kernelspec".into());
+                    self.draw = true;
+                    return;
+                }
+                let items = self
+                    .kernel_choices
+                    .iter()
+                    .map(|c| {
+                        let spec = c.spec.as_ref().map(|s| format!(" [{s}]")).unwrap_or_default();
+                        Value::from(format!("{}{spec}", c.display_name))
+                    })
+                    .collect();
+                self.editor.calls.lua("require('nbv').pick_kernel(...)", vec![Value::Array(items)]);
+            }
+            "kernel_chosen" => {
+                let index = field(args, "index").and_then(Value::as_u64).expect("the picker sends an index") as usize;
+                let cmd = self.kernel_choices[index - 1].clone();
+                if let Some(spec) = &cmd.spec {
+                    // Saved with the notebook, as Jupyter does.
+                    self.nb.set_kernelspec(spec, &cmd.display_name, &cmd.language);
+                    self.mark_dirty();
+                }
+                self.editor.set_language(Some(cmd.language.clone()));
+                self.kernel_cmd = Some(cmd);
+                self.last_sent = None;
+                self.relayout = true;
+                self.restart().await;
             }
             "input" => {
                 let value = field(args, "value").and_then(Value::as_str).unwrap_or("").to_string();
@@ -504,13 +836,11 @@ impl App {
                     self.message = Some(e.to_string());
                 }
             }
-            "rerender" => self.decorations = true,
             _ => {}
         }
     }
 
-    fn view(&mut self, key: &CellKey) -> Option<&OutputView> {
-        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+    fn view(&mut self, key: &CellKey, width: u16) -> Option<&OutputView> {
         let font = self.picker.font_size();
         if self.views.get(key).is_none_or(|v| v.width != width) {
             let cell = self.nb.cell(key)?;
@@ -520,109 +850,191 @@ impl App {
         self.views.get(key)
     }
 
-    /// Sends output placeholders and cell status to the companion (§11.1).
-    fn render_decorations(&mut self) {
-        self.decorations = false;
-        let Some(buf) = self.editor.buffer() else { return };
-        let keys: Vec<CellKey> = self.code_cells();
-        let heights: HashMap<CellKey, usize> =
-            keys.into_iter().map(|k| (k.clone(), self.view(&k).map_or(0, |v| v.height))).collect();
-        let placements = decor::placements(&self.nb, |k| heights.get(k).copied().unwrap_or(0));
-        let mut marks = vec![];
-        for span in self.nb.layout() {
-            let Some(marker) = span.marker else { continue };
-            match span.kind {
-                CellKind::Code => {
-                    if let Some((text, hl)) = self.status_text(&span.key) {
-                        marks.push(decor::map(vec![
-                            ("line", (marker as u64).into()),
-                            ("text", Value::Array(vec![Value::Array(vec![text.into(), hl.into()])])),
-                        ]));
-                    }
-                }
-                CellKind::Markdown => marks.push(decor::map(vec![
-                    ("line", (marker as u64).into()),
-                    ("text", Value::Array(vec![])),
-                    ("line_hl", "NbvMarkerMarkdown".into()),
-                ])),
-                CellKind::Raw => {}
-            }
+    /// The document laid out for `g`: every cell's editor lines and output rows.
+    fn layout(&mut self, g: &Geometry) -> Layout {
+        let width = g.inner_x().1;
+        let cells: Vec<(CellKey, CellKind, usize)> = self
+            .nb
+            .order()
+            .iter()
+            .filter_map(|k| {
+                let c = self.nb.cell(k)?;
+                Some((k.clone(), c.kind(), c.source().split('\n').count()))
+            })
+            .collect();
+        let mut items = Vec::with_capacity(cells.len());
+        for (key, kind, lines) in cells {
+            let outputs = if kind == CellKind::Code { self.view(&key, width).map_or(0, |v| v.height) } else { 0 };
+            items.push((key, kind, lines, outputs));
         }
-        self.slots = decor::slot_map(&placements);
-        self.editor.calls.lua(
-            "require('nbv').render(...)",
-            vec![buf.into(), self.editor.tick().into(), decor::to_value(&placements), Value::Array(marks)],
-        );
+        Layout::new(items)
+    }
+
+    /// Lays out the notebook and sends Neovim the editor windows' places, if they changed.
+    fn relayout(&mut self) {
+        self.relayout = false;
+        let Some(g) = self.geometry else { return };
+        let layout = self.layout(&g);
+        let area = g.area_height();
+        self.selected = self.selected.min(layout.blocks.len().saturating_sub(1));
+        match &self.mode {
+            // The edited cell's box stays in view as it grows.
+            Mode::Edit(k) => {
+                if let Some(i) = layout.index_of(k) {
+                    self.scroll = layout.reveal(self.scroll, area, i, true);
+                }
+            }
+            _ if self.reveal => self.scroll = layout.reveal(self.scroll, area, self.selected, false),
+            _ => {}
+        }
+        self.reveal = false;
+        self.scroll = self.scroll.min(layout.max_scroll(area));
+        let active = match &self.mode {
+            Mode::Edit(k) => Some(k.clone()),
+            _ => None,
+        };
+        let rects = layout.editors(&g, self.scroll, active.as_ref());
+        let placement = (active, rects);
+        if self.last_sent.as_ref() == Some(&placement) {
+            // The windows stay put; what nbv draws around them can change with them.
+            match self.sent.back_mut() {
+                Some(last) => (last.1, last.2) = (layout, self.scroll),
+                None => self.shown = Some((layout, self.scroll)),
+            }
+        } else {
+            self.layout_seq += 1;
+            self.editor.layout(&self.nb, self.layout_seq, placement.0.as_ref(), &placement.1);
+            self.sent.push_back((self.layout_seq, layout, self.scroll));
+            self.last_sent = Some(placement);
+        }
         self.draw = true;
     }
 
-    /// The status shown on a code cell's marker line: execution count, state, timing.
-    fn status_text(&self, key: &CellKey) -> Option<(String, &'static str)> {
-        let cell = self.nb.cell(key)?;
-        let count = cell.execution_count().map_or(" ".to_string(), |n| n.to_string());
-        let stale = if cell.is_stale() && cell.execution_count().is_some() { " · edited" } else { "" };
-        Some(match cell.runtime.exec {
-            ExecState::Queued => (format!("  [*] queued{stale}"), "NbvStatusQueued"),
-            ExecState::Running => (format!("  [*] running{stale}"), "NbvStatusRunning"),
-            ExecState::Ok => {
-                let t = cell.runtime.duration.map(|d| format!(" {:.2}s", d.as_secs_f64())).unwrap_or_default();
-                (format!("  [{count}] ✓{t}{stale}"), if stale.is_empty() { "NbvStatusOk" } else { "NbvStatusStale" })
-            }
-            ExecState::Error => (format!("  [{count}] ✗{stale}"), "NbvStatusError"),
-            ExecState::Idle if cell.execution_count().is_some() => {
-                (format!("  [{count}]{stale}"), if stale.is_empty() { "NbvMarker" } else { "NbvStatusStale" })
-            }
-            ExecState::Idle => return None,
-        })
+    fn error_style(&self) -> Style {
+        Style::default().fg(self.color("error").unwrap_or(Color::Reset)).add_modifier(Modifier::BOLD)
     }
 
-    fn slot_key(&self, slot: u16) -> Option<&CellKey> {
-        self.slots.get(slot as usize).and_then(Option::as_ref)
+    fn color(&self, name: &str) -> Option<Color> {
+        rgb(self.theme.get(name).and_then(|c| c.0))
+    }
+
+    /// A code cell's execution count for the gutter, and its status for the box's top border.
+    fn status(&self, key: &CellKey) -> (String, Option<(String, Option<Color>)>) {
+        let Some(cell) = self.nb.cell(key) else { return (String::new(), None) };
+        let count = cell.execution_count().map_or(" ".to_string(), |n| n.to_string());
+        let stale = cell.is_stale() && cell.execution_count().is_some();
+        let edited = if stale { " · edited" } else { "" };
+        let ok_color = if stale { self.color("stale") } else { self.color("ok") };
+        match cell.runtime.exec {
+            ExecState::Queued => ("[*]".into(), Some((format!("queued{edited}"), self.color("queued")))),
+            ExecState::Running => ("[*]".into(), Some((format!("running{edited}"), self.color("running")))),
+            ExecState::Ok => {
+                let t = cell.runtime.duration.map(|d| format!(" {:.2}s", d.as_secs_f64())).unwrap_or_default();
+                (format!("[{count}]"), Some((format!("✓{t}{edited}"), ok_color)))
+            }
+            ExecState::Error => (format!("[{count}]"), Some((format!("✗{edited}"), self.color("error")))),
+            ExecState::Idle if stale => (format!("[{count}]"), Some(("edited".into(), self.color("stale")))),
+            ExecState::Idle => (format!("[{count}]"), None),
+        }
+    }
+
+    fn header(&self) -> Line<'static> {
+        let name = self.nb.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let (state, icon) = match self.exec.status() {
+            KernelStatus::Starting => ("starting", "◌"),
+            KernelStatus::Idle => ("idle", "○"),
+            KernelStatus::Busy => ("busy", "●"),
+            KernelStatus::Restarting => ("restarting", "◌"),
+            KernelStatus::Dead => ("dead", "◌"),
+        };
+        let mode = match self.mode {
+            Mode::Nav => "NAV",
+            Mode::Edit(_) => "EDIT",
+            Mode::Other => "",
+        };
+        let title = Style::default().fg(self.color("header").unwrap_or(Color::Reset)).add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(self.color("dim").unwrap_or(Color::Reset));
+        let mut spans = vec![
+            Span::styled(format!(" {name} "), title),
+            match (&self.kernel_cmd, &self.kernel_error) {
+                (None, _) => Span::styled(" no kernel ", self.error_style()),
+                (Some(c), Some(_)) => Span::styled(format!(" {} ✗ failed ", c.display_name), self.error_style()),
+                (Some(c), None) => Span::styled(format!(" {} {icon} {state} ", c.display_name), dim),
+            },
+            Span::styled(format!(" {mode} {} ", self.nav.partial()), title),
+        ];
+        if let Some(m) = &self.message {
+            spans.push(Span::styled(format!(" {m}"), dim));
+        }
+        Line::from(spans)
     }
 
     fn draw(&mut self) -> anyhow::Result<()> {
         self.draw = false;
-        let grid = &self.editor.grid;
-        if grid.width == 0 {
+        if self.editor.grid.width == 0 {
             return Ok(());
         }
-        let runs =
-            compose::find_runs(grid, |slot| self.slot_key(slot).and_then(|k| self.views.get(k)).map(|v| v.height));
-        // Protocols for the images about to be shown.
-        for run in &runs {
-            let Some(view) = self.slot_key(run.slot).and_then(|k| self.views.get(k)) else { continue };
+        // Views and image protocols for the outputs about to be shown.
+        let visible: Vec<CellKey> = match (self.geometry, &self.shown) {
+            (Some(g), Some((layout, scroll))) => layout
+                .blocks
+                .iter()
+                .filter(|b| b.outputs > 0 && b.top + b.height() > *scroll && b.top < scroll + g.area_height())
+                .map(|b| b.key.clone())
+                .collect(),
+            _ => vec![],
+        };
+        let width = self.geometry.map_or(0, |g| g.inner_x().1);
+        for key in &visible {
+            let Some(view) = self.view(key, width).cloned() else { continue };
             for block in &view.blocks {
-                if let Block::Image { hash, image, cols, rows } = block {
-                    let key = (*hash, *cols, *rows);
-                    if !self.protocols.contains_key(&key)
+                if let outputs::Block::Image { hash, image, cols, rows } = block {
+                    let id = (*hash, *cols, *rows);
+                    if !self.protocols.contains_key(&id)
                         && let Ok(p) =
                             SlicedProtocol::new(&self.picker, (**image).clone(), Some(Size::new(*cols, *rows)))
                     {
-                        self.protocols.insert(key, p);
+                        self.protocols.insert(id, p);
                     }
                 }
             }
         }
+
+        let grid = &self.editor.grid;
         let base = compose::style_of(None, grid.default_fg, grid.default_bg);
-        let status = self.status_line();
-        let (views, slots, protocols) = (&self.views, &self.slots, &self.protocols);
-        let cursor = (!grid.busy).then_some(grid.cursor);
+        let header = self.header();
+        let decorations: Vec<Decoration> = match &self.shown {
+            Some((layout, _)) => layout.blocks.iter().map(|b| self.decoration(b)).collect(),
+            None => vec![],
+        };
+        let empty_hint = self.nb.order().is_empty().then(|| {
+            Line::styled(
+                "empty notebook: o adds a cell",
+                Style::default().fg(self.color("dim").unwrap_or(Color::Reset)),
+            )
+        });
+        let show_cursor = !grid.busy && (self.mode != Mode::Nav || grid.mode_name != "normal");
+        let cursor = show_cursor.then_some(grid.cursor);
+        let (geometry, shown, views, protocols) = (self.geometry, &self.shown, &self.views, &self.protocols);
         self.terminal.draw(|f| {
             let area = f.area();
             let buf = f.buffer_mut();
             buf.set_style(area, base);
-            for run in &runs {
-                if let Some(view) = slots.get(run.slot as usize).and_then(Option::as_ref).and_then(|k| views.get(k)) {
-                    compose::draw_output(buf, run, view, base, protocols);
+            if let Some(g) = geometry {
+                let v = g.viewport;
+                if v.row < area.height {
+                    buf.set_line(v.col, v.row, &header, v.width.min(area.width.saturating_sub(v.col)));
+                }
+                if let Some(hint) = &empty_hint {
+                    buf.set_line(g.inner_x().0, g.area_top(), hint, g.inner_x().1);
+                }
+                if let Some((layout, scroll)) = shown {
+                    for (b, d) in layout.blocks.iter().zip(&decorations) {
+                        draw_block(buf, &g, b, *scroll, d, views.get(&b.key), base, protocols);
+                    }
                 }
             }
             compose::draw_grid(buf, grid);
-            if area.height > 0 {
-                let y = area.height - 1;
-                let rect = Rect { x: 0, y, width: area.width, height: 1 };
-                buf.set_style(rect, base.add_modifier(Modifier::REVERSED));
-                buf.set_line(0, y, &status, area.width);
-            }
             if let Some((row, col)) = cursor {
                 f.set_cursor_position((col as u16, row as u16));
             }
@@ -642,25 +1054,101 @@ impl App {
         Ok(())
     }
 
-    fn status_line(&self) -> Line<'static> {
-        let name = self.nb.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let state = match self.exec.status() {
-            KernelStatus::Starting => "starting",
-            KernelStatus::Idle => "idle",
-            KernelStatus::Busy => "busy",
-            KernelStatus::Restarting => "restarting",
-            KernelStatus::Dead => "dead",
+    fn decoration(&self, b: &Block) -> Decoration {
+        let active = self.mode == Mode::Edit(b.key.clone());
+        let selected = self.mode == Mode::Nav && self.selected_key().as_ref() == Some(&b.key);
+        let border = if active {
+            self.color("edit")
+        } else if selected {
+            self.color("nav")
+        } else {
+            self.color("border")
         };
-        let icon = match self.exec.status() {
-            KernelStatus::Idle => "○",
-            KernelStatus::Busy => "●",
-            _ => "◌",
+        let dim = self.color("dim");
+        let (gutter, status, label) = match b.kind {
+            CellKind::Code => {
+                let (g, s) = self.status(&b.key);
+                (g, s, None)
+            }
+            CellKind::Markdown => (String::new(), None, Some("markdown")),
+            CellKind::Raw => (String::new(), None, Some("raw")),
         };
-        let mut spans = vec![Span::styled(format!(" nbv  {name} "), Style::default().add_modifier(Modifier::BOLD))];
-        if let Some(m) = &self.message {
-            spans.push(Span::raw(format!(" {m} ")));
+        Decoration { border, bold: active || selected, gutter, status, label, dim }
+    }
+}
+
+/// How one block is drawn, beyond its geometry.
+struct Decoration {
+    border: Option<Color>,
+    bold: bool,
+    gutter: String,
+    status: Option<(String, Option<Color>)>,
+    label: Option<&'static str>,
+    dim: Option<Color>,
+}
+
+/// Draws a cell's box, gutter label and outputs; the box's interior is the editor window's.
+#[allow(clippy::too_many_arguments)]
+fn draw_block(
+    buf: &mut Buffer,
+    g: &Geometry,
+    b: &Block,
+    scroll: usize,
+    d: &Decoration,
+    view: Option<&OutputView>,
+    base: Style,
+    protocols: &HashMap<(u64, u16, u16), SlicedProtocol>,
+) {
+    let (top, area) = (g.area_top(), g.area_height());
+    let screen = |row: usize| (row >= scroll && row < scroll + area).then(|| top + (row - scroll) as u16);
+    let (bx, bw) = g.box_x();
+    let mut border = base;
+    if let Some(c) = d.border {
+        border = border.fg(c);
+    }
+    if d.bold {
+        border = border.add_modifier(Modifier::BOLD);
+    }
+    let dim = d.dim.map_or(base, |c| base.fg(c));
+    let rule = |left: &str, right: &str| format!("{left}{}{right}", "─".repeat(bw.saturating_sub(2) as usize));
+
+    if let Some(y) = screen(b.top) {
+        buf.set_string(bx, y, rule("╭", "╮"), border);
+        if let Some(label) = d.label {
+            buf.set_string(bx + 2, y, format!(" {label} "), dim);
         }
-        spans.push(Span::raw(format!(" {} {icon} {state} ", self.kernel_name)));
-        Line::from(spans)
+        if let Some((text, color)) = &d.status {
+            let text = format!(" {text} ");
+            let x = (bx + bw).saturating_sub(2 + text.chars().count() as u16).max(bx + 2);
+            buf.set_string(x, y, text, color.map_or(dim, |c| base.fg(c)));
+        }
+    }
+    for line in 0..b.lines {
+        if let Some(y) = screen(b.top + 1 + line) {
+            buf.set_string(bx, y, "│", border);
+            buf.set_string(bx + bw - 1, y, "│", border);
+            if line == 0 && !d.gutter.is_empty() {
+                let x = bx.saturating_sub(d.gutter.chars().count() as u16 + 1).max(g.viewport.col);
+                buf.set_string(x, y, &d.gutter, dim);
+            }
+        }
+    }
+    if let Some(y) = screen(b.top + b.lines + 1) {
+        buf.set_string(bx, y, rule("╰", "╯"), border);
+    }
+    // Outputs: the visible rows of [first, first + outputs).
+    let Some(view) = view.filter(|_| b.outputs > 0) else { return };
+    let first = b.top + b.box_height();
+    let (from, to) = (first.max(scroll), (first + b.outputs).min(scroll + area));
+    if from < to {
+        let (x, w) = g.inner_x();
+        let region = Region {
+            top: top + (from - scroll) as u16,
+            len: (to - from) as u16,
+            x0: x,
+            x1: x + w,
+            offset: from - first,
+        };
+        compose::draw_output(buf, &region, view, base, protocols);
     }
 }

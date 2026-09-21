@@ -2,7 +2,31 @@
 
 use serde_json::{Map, Value};
 
-use crate::adapter::CellKind;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CellKind {
+    Code,
+    Markdown,
+    Raw,
+}
+
+impl CellKind {
+    pub fn as_nbformat(self) -> &'static str {
+        match self {
+            CellKind::Code => "code",
+            CellKind::Markdown => "markdown",
+            CellKind::Raw => "raw",
+        }
+    }
+
+    pub fn from_nbformat(s: &str) -> Option<CellKind> {
+        match s {
+            "code" => Some(CellKind::Code),
+            "markdown" => Some(CellKind::Markdown),
+            "raw" => Some(CellKind::Raw),
+            _ => None,
+        }
+    }
+}
 
 /// Per-cell runtime state. Never serialised.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -12,6 +36,9 @@ pub struct Runtime {
     pub baseline: String,
     /// Wall time of the most recent completed execution.
     pub duration: Option<std::time::Duration>,
+    /// Why the most recent run could not happen (no kernel, kernel died). Shown under the
+    /// cell; cleared by the next run.
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,9 +92,9 @@ impl Cell {
         cell
     }
 
-    /// Unknown cell types are treated as raw for projection; their `cell_type` is untouched.
+    /// Notebooks with any other `cell_type` are refused at load.
     pub fn kind(&self) -> CellKind {
-        self.raw.get("cell_type").and_then(Value::as_str).and_then(CellKind::from_nbformat).unwrap_or(CellKind::Raw)
+        self.raw.get("cell_type").and_then(Value::as_str).and_then(CellKind::from_nbformat).expect("validated at load")
     }
 
     pub fn set_kind(&mut self, kind: CellKind) {

@@ -18,13 +18,17 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 /// How to start a kernel.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KernelCommand {
     /// `{connection_file}` is replaced with the connection file path.
     pub argv: Vec<String>,
     pub env: HashMap<String, String>,
     pub interrupt_via_message: bool,
     pub display_name: String,
+    /// The language of code cells, lowercased as editors name it (`python`, `r`).
+    pub language: String,
+    /// The installed kernelspec this comes from, if any.
+    pub spec: Option<String>,
 }
 
 /// What a running kernel reports to the application loop.
@@ -54,34 +58,66 @@ fn conn_err(e: impl std::fmt::Display) -> KernelError {
     KernelError::Connection(e.to_string())
 }
 
-/// Chooses the kernel for a notebook. Python notebooks prefer the active virtualenv, so
-/// `nbv` inside an activated environment just works; otherwise the notebook's kernelspec;
-/// otherwise `python3 -m ipykernel_launcher` from `PATH`.
-pub async fn resolve(kernel_name: Option<&str>) -> Result<KernelCommand, KernelError> {
-    let pythonish = kernel_name.is_none_or(|n| n.starts_with("python"));
-    let launcher = |python: String, display: String| KernelCommand {
+fn launcher(python: String, display_name: String) -> KernelCommand {
+    KernelCommand {
         argv: vec![python, "-m".into(), "ipykernel_launcher".into(), "-f".into(), "{connection_file}".into()],
         env: HashMap::new(),
         interrupt_via_message: false,
-        display_name: display,
-    };
-    if pythonish && let Ok(venv) = std::env::var("VIRTUAL_ENV") {
-        let python = Path::new(&venv).join("bin/python");
-        if python.exists() {
-            return Ok(launcher(python.to_string_lossy().into(), format!("Python ({venv})")));
-        }
+        display_name,
+        language: "python".into(),
+        spec: None,
+    }
+}
+
+fn from_spec(spec: zmq::KernelspecDir) -> KernelCommand {
+    KernelCommand {
+        argv: spec.kernelspec.argv,
+        env: spec.kernelspec.env.unwrap_or_default(),
+        interrupt_via_message: spec.kernelspec.interrupt_mode.as_deref() == Some("message"),
+        display_name: spec.kernelspec.display_name,
+        language: spec.kernelspec.language.to_ascii_lowercase(),
+        spec: Some(spec.kernel_name),
+    }
+}
+
+/// The active virtualenv's Python, if a virtualenv is active.
+fn venv() -> Option<KernelCommand> {
+    let venv = std::env::var("VIRTUAL_ENV").ok()?;
+    let python = Path::new(&venv).join("bin/python");
+    python.exists().then(|| launcher(python.to_string_lossy().into(), format!("Python ({venv})")))
+}
+
+/// `python3` from `PATH`, if there is one.
+fn path_python() -> Option<KernelCommand> {
+    let paths = std::env::var_os("PATH")?;
+    let python = std::env::split_paths(&paths).map(|d| d.join("python3")).find(|p| p.is_file())?;
+    Some(launcher(python.to_string_lossy().into(), format!("Python 3 ({})", python.display())))
+}
+
+/// Chooses the kernel for a notebook, as Jupyter picks one automatically: for a Python
+/// notebook the active virtualenv first, then the notebook's kernelspec, then `python3` from
+/// `PATH`. The choice is shown to the user, who can change it (`choices`).
+pub async fn resolve(kernel_name: Option<&str>) -> Result<KernelCommand, KernelError> {
+    let pythonish = kernel_name.is_none_or(|n| n.starts_with("python"));
+    if pythonish && let Some(k) = venv() {
+        return Ok(k);
     }
     let name = kernel_name.unwrap_or("python3");
     match zmq::find_kernelspec(name).await {
-        Ok(spec) => Ok(KernelCommand {
-            argv: spec.kernelspec.argv.clone(),
-            env: spec.kernelspec.env.clone().unwrap_or_default(),
-            interrupt_via_message: spec.kernelspec.interrupt_mode.as_deref() == Some("message"),
-            display_name: spec.kernelspec.display_name.clone(),
-        }),
-        Err(_) if pythonish => Ok(launcher("python3".into(), "Python 3".into())),
-        Err(e) => Err(KernelError::NotFound(name.into(), e.to_string())),
+        Ok(spec) => Ok(from_spec(spec)),
+        Err(e) => match path_python().filter(|_| pythonish) {
+            Some(k) => Ok(k),
+            None => Err(KernelError::NotFound(name.into(), e.to_string())),
+        },
     }
+}
+
+/// Every kernel the user can pick: the active virtualenv, each installed kernelspec, and
+/// `python3` from `PATH`.
+pub async fn choices() -> Vec<KernelCommand> {
+    let mut specs = zmq::list_kernelspecs().await;
+    specs.sort_by(|a, b| a.kernel_name.cmp(&b.kernel_name));
+    venv().into_iter().chain(specs.into_iter().map(from_spec)).chain(path_python()).collect()
 }
 
 /// A running kernel. Messages from every channel arrive on the sender given to `start`.

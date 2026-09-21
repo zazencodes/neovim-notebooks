@@ -1,11 +1,13 @@
 //! The grid model: Neovim's single composed global grid (R7, §10.1).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::redraw::{HlAttr, ModeInfo, RedrawEvent};
 
-/// Prefix of the placeholder highlight groups (§11.3).
-pub const SLOT_PREFIX: &str = "NbvOutputSlot";
+/// The special colour of `NbvTransparent`, the highlight the companion gives the home window.
+/// Neovim reports a window-highlight remap under the original group's name, so the colour,
+/// not the name, marks a transparent cell (§11.2).
+pub const TRANSPARENT_SP: u32 = 0x010203;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GridCell {
@@ -27,13 +29,15 @@ pub struct Grid {
     pub cells: Vec<GridCell>,
     pub cursor: (usize, usize),
     pub hl: HashMap<u32, HlAttr>,
-    /// hl id → output slot, for placeholder highlights.
-    slots: HashMap<u32, u16>,
+    /// hl ids that resolve to `NbvTransparent`.
+    transparent: HashSet<u32>,
     pub default_fg: Option<u32>,
     pub default_bg: Option<u32>,
     pub modes: Vec<ModeInfo>,
     pub mode: usize,
     pub mode_name: String,
+    /// Counts mode changes, so a caller can tell a mode it saw from a later return to it.
+    pub mode_changes: u64,
     pub busy: bool,
     pub title: Option<String>,
 }
@@ -43,9 +47,9 @@ impl Grid {
         &self.cells[row * self.width + col]
     }
 
-    /// The output slot a cell's highlight resolves to, if it is a placeholder (§11.2).
-    pub fn slot_at(&self, row: usize, col: usize) -> Option<u16> {
-        self.slots.get(&self.cell(row, col).hl).copied()
+    /// Whether a cell belongs to the home window, through which the notebook shows (§11.2).
+    pub fn is_transparent(&self, row: usize, col: usize) -> bool {
+        self.transparent.contains(&self.cell(row, col).hl)
     }
 
     pub fn attr(&self, hl: u32) -> Option<&HlAttr> {
@@ -105,12 +109,11 @@ impl Grid {
             }
             RedrawEvent::GridCursorGoto { row, col, .. } => self.cursor = (row, col),
             RedrawEvent::HlAttrDefine { id, attr } => {
-                let slot =
-                    attr.names.iter().find_map(|n| n.strip_prefix(SLOT_PREFIX).and_then(|s| s.parse::<u16>().ok()));
-                match slot {
-                    Some(s) => self.slots.insert(id, s),
-                    None => self.slots.remove(&id),
-                };
+                if attr.sp == Some(TRANSPARENT_SP) {
+                    self.transparent.insert(id);
+                } else {
+                    self.transparent.remove(&id);
+                }
                 self.hl.insert(id, attr);
             }
             RedrawEvent::DefaultColors { fg, bg, .. } => {
@@ -121,6 +124,7 @@ impl Grid {
             RedrawEvent::ModeChange { mode, index } => {
                 self.mode = index;
                 self.mode_name = mode;
+                self.mode_changes += 1;
             }
             RedrawEvent::BusyStart => self.busy = true,
             RedrawEvent::BusyStop => self.busy = false,
@@ -160,9 +164,9 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_highlights_map_to_slots() {
+    fn the_sentinel_colour_marks_transparent_cells() {
         let mut g = Grid::default();
-        let attr = HlAttr { names: vec!["NbvOutputSlot7".into()], ..Default::default() };
+        let attr = HlAttr { sp: Some(TRANSPARENT_SP), names: vec!["Normal".into()], ..Default::default() };
         g.apply(RedrawEvent::HlAttrDefine { id: 42, attr });
         g.apply(RedrawEvent::GridResize { grid: 1, width: 2, height: 1 });
         g.apply(RedrawEvent::GridLine {
@@ -171,6 +175,8 @@ mod tests {
             col: 0,
             cells: vec![LineCell { text: " ".into(), hl: Some(42), repeat: 2 }],
         });
-        assert_eq!(g.slot_at(0, 1), Some(7));
+        assert!(g.is_transparent(0, 1));
+        g.apply(RedrawEvent::HlAttrDefine { id: 42, attr: HlAttr::default() });
+        assert!(!g.is_transparent(0, 1), "a redefined id is opaque again");
     }
 }

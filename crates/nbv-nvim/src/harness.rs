@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nbv_core::Notebook;
+use nbv_core::{CellKey, Notebook};
 use rmpv::Value;
 
-use crate::editor::{self, Editor, EditorEvent};
+use crate::editor::{self, Editor, EditorEvent, EditorRect, Focus, Viewport};
 use crate::{EmbeddedNvim, NvimClient};
 
 /// The Neovim under test: `NBV_NVIM`, the repository's `.tools` download, or `nvim`.
@@ -33,12 +33,17 @@ pub struct State {
     pub flushes: usize,
     pub commands: Vec<(String, Value)>,
     pub errors: Vec<String>,
+    pub focus: Option<(u64, Focus)>,
+    pub viewport: Option<Viewport>,
+    pub layouts_done: u64,
+    pub written: usize,
 }
 
 pub struct Harness {
     pub client: EmbeddedNvim,
     pub state: Arc<Mutex<State>>,
     pub notebook: PathBuf,
+    seq: Mutex<u64>,
     _dir: tempfile::TempDir,
 }
 
@@ -66,7 +71,6 @@ impl Harness {
 
     pub async fn open_path(dir: tempfile::TempDir, notebook: PathBuf, opts: Options) -> Harness {
         let nb = Notebook::open(&notebook).unwrap();
-        let buffer_path = editor::buffer_path(&notebook, &nb);
         let mut extra = vec![];
         let clean = match &opts.init {
             Some(init) => {
@@ -77,16 +81,25 @@ impl Harness {
             }
             None => true,
         };
-        let (client, mut rx) = editor::spawn(nvim_program(), clean, &extra, &buffer_path).await.unwrap();
+        let (client, mut rx) = editor::spawn(nvim_program(), clean, &extra, &notebook).await.unwrap();
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(State {
             nb,
-            editor: Editor::new(client.clone(), etx),
+            editor: {
+                let mut e = Editor::new(client.clone(), etx);
+                // The fixtures are Python notebooks.
+                e.set_language(Some("python".into()));
+                e
+            },
             ready: false,
             exited: false,
             flushes: 0,
             commands: vec![],
             errors: vec![],
+            focus: None,
+            viewport: None,
+            layouts_done: 0,
+            written: 0,
         }));
         let s = state.clone();
         tokio::spawn(async move {
@@ -102,6 +115,13 @@ impl Harness {
                                 EditorEvent::Exited => st.exited = true,
                                 EditorEvent::Flush => st.flushes += 1,
                                 EditorEvent::Command { action, args } => st.commands.push((action, args)),
+                                EditorEvent::Focus { seq, focus } => st.focus = Some((seq, focus)),
+                                EditorEvent::Viewport(v) => st.viewport = Some(v),
+                                EditorEvent::LayoutDone { seq, error } => {
+                                    if let Some(e) = error { st.errors.push(e); }
+                                    st.layouts_done = seq;
+                                }
+                                EditorEvent::Written => st.written += 1,
                                 _ => {}
                             }
                         }
@@ -112,9 +132,9 @@ impl Harness {
                 }
             }
         });
-        editor::handshake(&client, &buffer_path, opts.width, opts.height).await.unwrap();
-        let h = Harness { client, state, notebook, _dir: dir };
-        h.wait("startup", |s| s.ready && s.editor.buffer().is_some()).await;
+        editor::handshake(&client, &notebook, opts.width, opts.height).await.unwrap();
+        let h = Harness { client, state, notebook, seq: Mutex::new(0), _dir: dir };
+        h.wait("startup", |s| s.ready && s.viewport.is_some()).await;
         h.settle().await;
         h
     }
@@ -131,6 +151,68 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    fn next_seq(&self) -> u64 {
+        let mut s = self.seq.lock().unwrap();
+        *s += 1;
+        *s
+    }
+
+    /// Stacks every cell's editor window from the top of the screen, one row apart, and
+    /// waits until they are on screen. Returns the rectangles.
+    pub async fn layout_all(&self, active: Option<&CellKey>) -> Vec<EditorRect> {
+        let rects = {
+            let st = self.state.lock().unwrap();
+            let mut row = 1u16;
+            st.nb
+                .order()
+                .iter()
+                .map(|k| {
+                    let lines = st.nb.cell(k).unwrap().source().split('\n').count() as u16;
+                    let r = EditorRect { key: k.clone(), row, col: 4, width: 40, height: lines, topline: 1 };
+                    row += lines + 1;
+                    r
+                })
+                .collect::<Vec<_>>()
+        };
+        self.layout(active, &rects).await;
+        rects
+    }
+
+    pub async fn layout(&self, active: Option<&CellKey>, rects: &[EditorRect]) {
+        let seq = self.next_seq();
+        {
+            let mut st = self.state.lock().unwrap();
+            let State { nb, editor, .. } = &mut *st;
+            editor.layout(nb, seq, active, rects);
+        }
+        self.wait("layout", |s| s.layouts_done >= seq).await;
+        self.settle().await;
+    }
+
+    /// Focuses a cell's window (laid out as active first), as nbv does.
+    pub async fn enter(&self, key: &CellKey, insert: bool) {
+        self.layout_all(Some(key)).await;
+        let seq = self.next_seq();
+        self.state.lock().unwrap().editor.enter(seq, key, insert);
+        let k = key.clone();
+        self.wait("focus", move |s| s.focus.as_ref() == Some(&(seq, Focus::Cell(k.clone())))).await;
+    }
+
+    pub async fn leave(&self) {
+        let seq = self.next_seq();
+        self.state.lock().unwrap().editor.leave(seq);
+        self.wait("home", move |s| s.focus.as_ref() == Some(&(seq, Focus::Home))).await;
+    }
+
+    pub fn key(&self, i: usize) -> CellKey {
+        self.state.lock().unwrap().nb.order()[i].clone()
+    }
+
+    pub fn source(&self, i: usize) -> String {
+        let st = self.state.lock().unwrap();
+        st.nb.cell(&st.nb.order()[i]).unwrap().source()
     }
 
     pub async fn resize(&self, width: usize, height: usize) {
@@ -168,29 +250,27 @@ impl Harness {
         self.client.exec_lua(code, vec![]).await.unwrap()
     }
 
-    pub async fn buffer_lines(&self) -> Vec<String> {
-        let buf = self.state.lock().unwrap().editor.buffer().unwrap();
-        self.client.buffer_lines(buf).await.unwrap()
-    }
-
-    pub fn mirror(&self) -> Vec<String> {
-        self.state.lock().unwrap().nb.mirror().to_vec()
-    }
-
     pub fn screen(&self) -> String {
         let st = self.state.lock().unwrap();
         (0..st.editor.grid.height).map(|r| st.editor.grid.row_text(r)).collect::<Vec<_>>().join("\n")
     }
 
-    pub fn saved(&self) -> serde_json::Value {
-        serde_json::from_slice(&std::fs::read(&self.notebook).unwrap()).unwrap()
+    /// The screen with every transparent cell shown as `·`.
+    pub fn opaque_screen(&self) -> String {
+        let st = self.state.lock().unwrap();
+        let g = &st.editor.grid;
+        (0..g.height)
+            .map(|r| {
+                (0..g.width)
+                    .map(|c| if g.is_transparent(r, c) { "·" } else { g.cell(r, c).text.as_str() })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    /// Asserts the mirror equals Neovim's buffer and the document matches it.
-    pub async fn assert_in_sync(&self) {
-        self.settle().await;
-        let lines = self.buffer_lines().await;
-        assert_eq!(self.mirror(), lines, "mirror diverged from the buffer");
+    pub fn saved(&self) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(&self.notebook).unwrap()).unwrap()
     }
 
     pub fn dir(&self) -> &Path {

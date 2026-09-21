@@ -28,22 +28,18 @@ fn command(python: &Path) -> KernelCommand {
         env: Default::default(),
         interrupt_via_message: false,
         display_name: "test".into(),
+        language: "python".into(),
+        spec: None,
     }
 }
 
 fn notebook(sources: &[&str]) -> Notebook {
-    let json = br#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
-    let mut nb = Notebook::from_bytes(Path::new("k.ipynb"), json, Default::default()).unwrap();
-    let mut lines = vec![];
-    for s in sources {
-        lines.push("# %%".to_string());
-        lines.extend(s.split('\n').map(str::to_string));
-    }
-    let r = nb.resync(lines);
-    for e in r.normalise {
-        nb.apply_edit(e).unwrap();
-    }
-    nb
+    let cells: Vec<serde_json::Value> = sources
+        .iter()
+        .map(|s| serde_json::json!({"cell_type": "code", "execution_count": null, "metadata": {}, "outputs": [], "source": s}))
+        .collect();
+    let json = serde_json::json!({"cells": cells, "metadata": {}, "nbformat": 4, "nbformat_minor": 5});
+    Notebook::from_bytes(Path::new("k.ipynb"), &serde_json::to_vec(&json).unwrap(), Default::default()).unwrap()
 }
 
 struct Session {

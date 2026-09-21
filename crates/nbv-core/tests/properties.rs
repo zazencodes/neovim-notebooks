@@ -1,372 +1,192 @@
-//! Property tests against `nbv-core` alone (§16.4). Spike 4's kill gate.
+//! Property tests against `nbv-core` alone (§16.4): structural changes, undo and redo.
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use common::*;
-use nbv_core::{CellKey, CellKind, LanguageProjection, LineEdit, Notebook, PythonProjection};
+use nbv_core::{CellKey, CellKind, Change, Notebook};
 use proptest::prelude::*;
 use serde_json::Value;
 
 const KINDS: [CellKind; 3] = [CellKind::Code, CellKind::Markdown, CellKind::Raw];
 
-/// Source text built from fragments that stress the escaping rules.
-fn source() -> impl Strategy<Value = String> {
-    let frag = prop_oneof![
-        Just("# ".to_string()),
-        Just("#".to_string()),
-        Just("%%".to_string()),
-        Just("%".to_string()),
-        Just("%time".to_string()),
-        Just("!".to_string()),
-        Just("!ls".to_string()),
-        Just(" id=\"k\"".to_string()),
-        Just(" [markdown]".to_string()),
-        Just(" [raw]".to_string()),
-        Just("x = ".to_string()),
-        Just("\n".to_string()),
-        Just("\r".to_string()),
-        Just(" ".to_string()),
-        Just("\t".to_string()),
-        "[a-z]{1,3}",
-        Just("é名".to_string()),
+/// An operation, with positions chosen relative to the notebook it is applied to.
+#[derive(Clone, Debug)]
+enum Op {
+    Add(usize, usize),
+    Delete(usize),
+    Move(usize, usize),
+    Kind(usize, usize),
+    Split(usize, usize),
+    Merge(usize),
+    Paste(usize, usize),
+    Type(usize, String),
+    Undo,
+    Redo,
+}
+
+fn op(structural_only: bool) -> BoxedStrategy<Op> {
+    let n = 0..64usize;
+    let structural = prop_oneof![
+        (n.clone(), 0..3usize).prop_map(|(i, k)| Op::Add(i, k)),
+        n.clone().prop_map(Op::Delete),
+        (n.clone(), n.clone()).prop_map(|(i, j)| Op::Move(i, j)),
+        (n.clone(), 0..3usize).prop_map(|(i, k)| Op::Kind(i, k)),
+        (n.clone(), 0..6usize).prop_map(|(i, l)| Op::Split(i, l)),
+        n.clone().prop_map(Op::Merge),
+        (n.clone(), n.clone()).prop_map(|(i, j)| Op::Paste(i, j)),
     ];
-    prop::collection::vec(frag, 0..24).prop_map(|v| v.concat())
+    if structural_only {
+        structural.boxed()
+    } else {
+        prop_oneof![
+            4 => structural,
+            1 => (n, "[a-z\n]{0,12}").prop_map(|(i, s)| Op::Type(i, s)),
+            1 => Just(Op::Undo),
+            1 => Just(Op::Redo),
+        ]
+        .boxed()
+    }
+}
+
+fn nth(nb: &Notebook, i: usize) -> Option<CellKey> {
+    let order = nb.order();
+    (!order.is_empty()).then(|| order[i % order.len()].clone())
+}
+
+fn apply(nb: &mut Notebook, op: &Op) {
+    let len = nb.order().len();
+    match op {
+        Op::Add(i, k) => {
+            let key = nb.new_cell(KINDS[*k], "");
+            nb.edit(vec![Change::Show { key, index: i % (len + 1) }]);
+        }
+        Op::Delete(i) => {
+            if let Some(key) = nth(nb, *i) {
+                nb.edit(vec![Change::Hide { key }]);
+            }
+        }
+        Op::Move(i, j) => {
+            if let Some(key) = nth(nb, *i) {
+                nb.edit(vec![Change::Move { key, index: j % len }]);
+            }
+        }
+        Op::Kind(i, k) => {
+            if let Some(key) = nth(nb, *i) {
+                nb.edit(vec![Change::Kind { key, kind: KINDS[*k] }]);
+            }
+        }
+        Op::Split(i, line) => {
+            if let Some(key) = nth(nb, *i) {
+                let new = nb.new_cell(nb.cell(&key).unwrap().kind(), "");
+                nb.edit(vec![Change::Split { key, line: *line, new }]);
+            }
+        }
+        Op::Merge(i) => {
+            if let Some(key) = nth(nb, *i)
+                && let Some(next) = nb.order().get(nb.index_of(&key).unwrap() + 1).cloned()
+            {
+                nb.edit(vec![Change::Merge { key, next }]);
+            }
+        }
+        Op::Paste(i, j) => {
+            if let Some(src) = nth(nb, *i) {
+                let raw = nb.cell(&src).unwrap().raw.clone();
+                let key = nb.copy_cell(&raw);
+                nb.edit(vec![Change::Show { key, index: j % (len + 1) }]);
+            }
+        }
+        Op::Type(i, s) => {
+            if let Some(key) = nth(nb, *i) {
+                nb.set_source(&key, s);
+            }
+        }
+        Op::Undo => {
+            nb.undo();
+        }
+        Op::Redo => {
+            nb.redo();
+        }
+    }
+}
+
+fn check_integrity(nb: &Notebook, originals: &[(CellKey, Value)]) -> Result<(), TestCaseError> {
+    let keys: HashSet<&CellKey> = nb.order().iter().collect();
+    prop_assert_eq!(keys.len(), nb.order().len(), "duplicate live keys");
+    for k in nb.order() {
+        prop_assert!(nb.is_live(k) && !nb.is_tombstoned(k));
+    }
+    // Only execution changes outputs, so a loaded cell's outputs survive everything else,
+    // whether it is live, tombstoned, or of a type that stashes them.
+    for (k, outputs) in originals {
+        prop_assert!(nb.cell(k).is_some(), "cell {k} was destroyed");
+        prop_assert_eq!(&outputs_anywhere(nb, k), outputs, "outputs of {} changed", k);
+    }
+    Ok(())
+}
+
+fn originals(nb: &Notebook) -> Vec<(CellKey, Value)> {
+    nb.order().iter().map(|k| (k.clone(), outputs_anywhere(nb, k))).collect()
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(4000))]
+    #![proptest_config(ProptestConfig::with_cases(2000))]
 
     #[test]
-    fn adapter_inverse(kind in prop::sample::select(KINDS.to_vec()), s in source()) {
-        let p = PythonProjection;
-        let buf = p.to_buffer(kind, &s);
-        prop_assert!(buf.iter().all(|l| p.parse_marker(l).is_none()), "{buf:?}");
-        prop_assert!(buf.iter().all(|l| !l.contains('\n')));
-        prop_assert_eq!(p.from_buffer(kind, &buf), s);
+    fn integrity_under_arbitrary_editing(ops in prop::collection::vec(op(false), 0..40)) {
+        let mut nb = load("v4.5-outputs.ipynb");
+        let originals = originals(&nb);
+        for op in &ops {
+            apply(&mut nb, op);
+            check_integrity(&nb, &originals)?;
+        }
+    }
+
+    #[test]
+    fn undo_reverses_and_redo_replays(ops in prop::collection::vec(op(true), 0..24)) {
+        let mut nb = load("v4.5-outputs.ipynb");
+        let start = snapshot(&nb);
+        let mut states = vec![start.clone()];
+        for op in &ops {
+            apply(&mut nb, op);
+            if snapshot(&nb) != *states.last().unwrap() {
+                states.push(snapshot(&nb));
+            }
+        }
+        let end = snapshot(&nb);
+        // Each undo step returns to the state before its change group.
+        while nb.undo().is_some() {}
+        prop_assert_eq!(snapshot(&nb), start);
+        while nb.redo().is_some() {}
+        prop_assert_eq!(snapshot(&nb), end);
     }
 }
 
 #[test]
-fn adapter_inverse_over_corpus_cells() {
-    let p = PythonProjection;
-    for path in corpus() {
-        let nb = Notebook::open(&path).unwrap();
-        for k in nb.order() {
-            let c = nb.cell(k).unwrap();
-            let src = c.source();
-            assert_eq!(p.from_buffer(c.kind(), &p.to_buffer(c.kind(), &src)), src, "{path:?} {k}");
-        }
-    }
-}
-
-/// A line to insert, chosen relative to the current state.
-#[derive(Clone, Debug)]
-enum LineGen {
-    Text(String),
-    /// A marker with no key.
-    Bare(usize),
-    /// A marker showing a key the session has seen (live or tombstoned).
-    Seen(usize, usize),
-    /// A marker showing an unknown key.
-    Unknown(usize, u8),
-    /// A copy of an existing line.
-    Copy(usize),
-}
-
-#[derive(Clone, Debug)]
-enum Op {
-    Insert {
-        at: usize,
-        lines: Vec<LineGen>,
-    },
-    Replace {
-        at: usize,
-        len: usize,
-        lines: Vec<LineGen>,
-    },
-    Delete {
-        at: usize,
-        len: usize,
-    },
-    /// Yank a range and paste it elsewhere.
-    Duplicate {
-        at: usize,
-        len: usize,
-        to: usize,
-    },
-    /// Delete a range and paste it elsewhere: two edits.
-    Move {
-        at: usize,
-        len: usize,
-        to: usize,
-    },
-    /// Whole-buffer replacement that keeps marker lines and rewrites bodies.
-    Rewrite {
-        suffix: String,
-    },
-    /// `:%!cmd`: insert the filtered text after the old, then delete the old, with the
-    /// normalisation in between refused.
-    Filter {
-        suffix: String,
-    },
-    /// Return to an earlier normalised state as a single edit, as undo does.
-    Undo {
-        back: usize,
-    },
-    /// Return to an earlier normalised state as a whole-buffer resync.
-    Resync {
-        back: usize,
-    },
-}
-
-fn line_gen() -> impl Strategy<Value = LineGen> + Clone {
-    prop_oneof![
-        4 => "[a-z =%!#]{0,8}".prop_map(LineGen::Text),
-        1 => (0..3usize).prop_map(LineGen::Bare),
-        2 => (0..3usize, any::<usize>()).prop_map(|(k, i)| LineGen::Seen(k, i)),
-        1 => (0..3usize, 0..4u8).prop_map(|(k, i)| LineGen::Unknown(k, i)),
-        2 => any::<usize>().prop_map(LineGen::Copy),
-    ]
-}
-
-fn op() -> impl Strategy<Value = Op> {
-    let lines = prop::collection::vec(line_gen(), 0..5);
-    prop_oneof![
-        3 => (any::<usize>(), lines.clone()).prop_map(|(at, lines)| Op::Insert { at, lines }),
-        3 => (any::<usize>(), 0..4usize, lines).prop_map(|(at, len, lines)| Op::Replace { at, len, lines }),
-        2 => (any::<usize>(), 1..8usize).prop_map(|(at, len)| Op::Delete { at, len }),
-        2 => (any::<usize>(), 1..8usize, any::<usize>()).prop_map(|(at, len, to)| Op::Duplicate { at, len, to }),
-        2 => (any::<usize>(), 1..8usize, any::<usize>()).prop_map(|(at, len, to)| Op::Move { at, len, to }),
-        1 => "[ x#]{0,3}".prop_map(|suffix| Op::Rewrite { suffix }),
-        1 => "[ x]{0,2}".prop_map(|suffix| Op::Filter { suffix }),
-        2 => (1..6usize).prop_map(|back| Op::Undo { back }),
-        1 => (1..6usize).prop_map(|back| Op::Resync { back }),
-    ]
-}
-
-struct Harness {
-    nb: Notebook,
-    /// Every key the session has seen, in first-seen order.
-    seen: Vec<CellKey>,
-    /// Outputs each cell had at load. No execution happens, so they must never change.
-    outputs: HashMap<CellKey, Value>,
-    /// Normalised states: text and the document it corresponds to.
-    history: Vec<(Vec<String>, Snapshot)>,
-    /// Whether edits of the current op leave normalisation pending (insert mode, or a
-    /// normalisation refused by the changedtick guard).
-    defer: bool,
-    pending: bool,
-}
-
-impl Harness {
-    fn new(nb: Notebook) -> Harness {
-        let seen = nb.order().to_vec();
-        let outputs = seen.iter().map(|k| (k.clone(), outputs_anywhere(&nb, k))).collect();
-        let history = vec![(nb.mirror().to_vec(), snapshot(&nb))];
-        Harness { nb, seen, outputs, history, defer: false, pending: false }
-    }
-
-    fn render(&self, g: &LineGen) -> String {
-        let p = PythonProjection;
-        let text = self.nb.mirror();
-        match g {
-            LineGen::Text(s) => s.clone(),
-            LineGen::Bare(k) => match KINDS[*k] {
-                CellKind::Code => "# %%".into(),
-                CellKind::Markdown => "# %% [markdown]".into(),
-                CellKind::Raw => "# %% [raw]".into(),
-            },
-            LineGen::Seen(k, i) if !self.seen.is_empty() => p.format_marker(KINDS[*k], &self.seen[i % self.seen.len()]),
-            LineGen::Seen(k, _) => self.render(&LineGen::Bare(*k)),
-            LineGen::Unknown(k, i) => p.format_marker(KINDS[*k], &CellKey::new(format!("unknown{i}"))),
-            LineGen::Copy(i) if !text.is_empty() => text[i % text.len()].clone(),
-            LineGen::Copy(_) => String::new(),
-        }
-    }
-
-    fn edit(&mut self, e: LineEdit) {
-        let mut expect = self.nb.mirror().to_vec();
-        expect.splice(e.first..e.last, e.lines.clone());
-        self.nb.apply_edit(e).unwrap();
-        assert_eq!(self.nb.mirror(), expect.as_slice());
-        for k in self.nb.order() {
-            if !self.seen.contains(k) {
-                self.seen.push(k.clone());
+fn split_then_merge_round_trips_every_line() {
+    for src in ["", "a", "a\n", "a\nb", "\n\n", "a\n\nb\n"] {
+        for line in 0..=src.split('\n').count() {
+            let json = serde_json::json!({"cells": [{"cell_type": "code", "execution_count": null, "id": "a",
+                "metadata": {}, "outputs": [], "source": src}], "metadata": {}, "nbformat": 4, "nbformat_minor": 5});
+            let mut nb = Notebook::from_bytes(
+                std::path::Path::new("t.ipynb"),
+                &serde_json::to_vec(&json).unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+            let key = CellKey::new("a");
+            let new = nb.new_cell(CellKind::Code, "");
+            let valid = line > 0 && line < src.split('\n').count();
+            assert_eq!(nb.edit(vec![Change::Split { key: key.clone(), line, new: new.clone() }]).is_some(), valid);
+            if !valid {
+                continue;
             }
+            let (head, tail) = (nb.cell(&key).unwrap().source(), nb.cell(&new).unwrap().source());
+            assert_eq!(format!("{head}\n{tail}"), src);
+            nb.undo();
+            assert_eq!(nb.cell(&key).unwrap().source(), src, "{src:?} at {line}: {head:?} + {tail:?}");
+            assert_eq!(nb.order().len(), 1);
         }
-        if self.defer {
-            self.pending = true;
-            self.check_integrity();
-        } else {
-            self.settle();
-        }
-    }
-
-    /// Applies whatever normalisation is pending, as leaving insert mode does.
-    fn settle(&mut self) {
-        let edits = self.nb.pending_normalisation();
-        normalise(&mut self.nb, edits);
-        self.pending = false;
-        self.check_integrity();
-    }
-
-    fn check_integrity(&self) {
-        let nb = &self.nb;
-        let p = PythonProjection;
-        let order: HashSet<&CellKey> = nb.order().iter().collect();
-        assert_eq!(order.len(), nb.order().len(), "two live cells share a key");
-        assert!(nb.order().iter().all(|k| nb.is_live(k) && !nb.is_tombstoned(k)));
-        if !self.pending {
-            // Normalised: every marker shows its key, in order, and there is no leading cell.
-            let shown: Vec<CellKey> =
-                nb.mirror().iter().filter_map(|l| p.parse_marker(l)).map(|m| m.key.expect("normalised")).collect();
-            assert_eq!(shown, nb.order());
-        }
-        // No output belonging to a surviving cell is ever lost.
-        for (k, v) in &self.outputs {
-            if nb.cell(k).is_some() {
-                assert_eq!(&outputs_anywhere(nb, k), v, "outputs of {k} changed");
-            }
-        }
-        // The document matches the text.
-        for span in nb.layout() {
-            let c = nb.cell(&span.key).unwrap();
-            assert_eq!(c.kind(), span.kind);
-            assert_eq!(c.source(), p.from_buffer(span.kind, &nb.mirror()[span.body..span.end]));
-        }
-    }
-
-    fn run(&mut self, op: Op, defer: bool) {
-        // Whole-buffer operations happen in normal mode.
-        if matches!(op, Op::Rewrite { .. } | Op::Undo { .. } | Op::Resync { .. } | Op::Filter { .. }) && self.pending {
-            self.settle();
-        }
-        self.defer = defer;
-        let len = self.nb.mirror().len();
-        let pos = |x: usize| x % (len + 1);
-        match op {
-            Op::Insert { at, lines } => {
-                let lines = lines.iter().map(|g| self.render(g)).collect();
-                self.edit(LineEdit { first: pos(at), last: pos(at), lines });
-            }
-            Op::Replace { at, len: n, lines } => {
-                let first = pos(at);
-                let lines = lines.iter().map(|g| self.render(g)).collect();
-                self.edit(LineEdit { first, last: (first + n).min(len), lines });
-            }
-            Op::Delete { at, len: n } => {
-                let first = pos(at);
-                self.edit(LineEdit { first, last: (first + n).min(len), lines: vec![] });
-            }
-            Op::Duplicate { at, len: n, to } => {
-                let first = pos(at);
-                let yank = self.nb.mirror()[first..(first + n).min(len)].to_vec();
-                let to = pos(to);
-                self.edit(LineEdit { first: to, last: to, lines: yank });
-            }
-            Op::Move { at, len: n, to } => {
-                let first = pos(at);
-                let last = (first + n).min(len);
-                let yank = self.nb.mirror()[first..last].to_vec();
-                self.edit(LineEdit { first, last, lines: vec![] });
-                let to = to % (self.nb.mirror().len() + 1);
-                self.edit(LineEdit { first: to, last: to, lines: yank });
-            }
-            Op::Rewrite { suffix } => {
-                let p = PythonProjection;
-                let before: Vec<CellKey> = self.nb.order().to_vec();
-                // Lines above the first marker stay as they are: filling them would add a cell.
-                let first = self.nb.mirror().iter().position(|l| p.parse_marker(l).is_some());
-                let text: Vec<String> = self
-                    .nb
-                    .mirror()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        if first.is_none_or(|f| i <= f) || p.parse_marker(l).is_some() {
-                            l.clone()
-                        } else {
-                            format!("{l}{suffix}")
-                        }
-                    })
-                    .collect();
-                // Suffixing can turn a body line into a marker; only marker-preserving rewrites count.
-                let markers = |t: &[String]| t.iter().filter(|l| p.parse_marker(l).is_some()).count();
-                if markers(&text) == markers(self.nb.mirror()) {
-                    let r = self.nb.resync(text);
-                    normalise(&mut self.nb, r.normalise);
-                    assert_eq!(self.nb.order(), before.as_slice(), "rewrite lost identity");
-                    self.check_integrity();
-                }
-            }
-            Op::Filter { suffix } => {
-                let p = PythonProjection;
-                let before: Vec<CellKey> = self.nb.order().to_vec();
-                let old = self.nb.mirror().to_vec();
-                let first = old.iter().position(|l| p.parse_marker(l).is_some());
-                let filtered: Vec<String> = old
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        if first.is_none_or(|f| i <= f) || p.parse_marker(l).is_some() {
-                            l.clone()
-                        } else {
-                            format!("{l}{suffix}")
-                        }
-                    })
-                    .collect();
-                let markers = |t: &[String]| t.iter().filter(|l| p.parse_marker(l).is_some()).count();
-                if markers(&filtered) == markers(&old) {
-                    self.defer = true;
-                    self.edit(LineEdit { first: old.len(), last: old.len(), lines: filtered });
-                    self.defer = false;
-                    self.edit(LineEdit { first: 0, last: old.len(), lines: vec![] });
-                    assert_eq!(self.nb.order(), before.as_slice(), "filter lost identity");
-                }
-            }
-            Op::Undo { back } | Op::Resync { back } => {
-                let idx = self.history.len().saturating_sub(back + 1);
-                let (text, snap) = self.history[idx].clone();
-                if matches!(op, Op::Undo { .. }) {
-                    let e = diff_edit(self.nb.mirror(), &text);
-                    self.edit(e);
-                } else {
-                    let r = self.nb.resync(text);
-                    normalise(&mut self.nb, r.normalise);
-                    self.check_integrity();
-                }
-                assert_eq!(snapshot(&self.nb), snap, "returning the text did not return the document");
-            }
-        }
-        if !self.pending {
-            self.history.push((self.nb.mirror().to_vec(), snapshot(&self.nb)));
-        }
-    }
-}
-
-fn corpus_names() -> Vec<String> {
-    corpus()
-        .into_iter()
-        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-        .filter(|n| n != "huge-output.ipynb")
-        .collect()
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(3000))]
-
-    #[test]
-    fn random_edit_sequences_preserve_integrity_and_reversibility(
-        name in prop::sample::select(corpus_names()),
-        ops in prop::collection::vec((op(), prop::bool::weighted(0.3)), 1..30),
-    ) {
-        let mut h = Harness::new(load(&name));
-        h.check_integrity();
-        for (op, defer) in ops {
-            h.run(op, defer);
-        }
-        h.settle();
     }
 }

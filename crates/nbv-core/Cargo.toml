@@ -1,6 +1,6 @@
 [package]
 name = "nbv-core"
-description = "Neovim Notebooks core: lossless notebook model, projection, reconciliation, persistence, kernel state"
+description = "Neovim Notebooks core: lossless notebook model, structural editing with undo, persistence, kernel state"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

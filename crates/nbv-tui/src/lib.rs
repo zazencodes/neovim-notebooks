@@ -4,8 +4,9 @@
 pub mod ansi;
 pub mod app;
 pub mod compose;
-pub mod decor;
 pub mod keys;
+pub mod layout;
+pub mod nav;
 pub mod outputs;
 pub mod query;
 pub mod terminal;
