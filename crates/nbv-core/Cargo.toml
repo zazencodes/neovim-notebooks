@@ -13,6 +13,10 @@ thiserror.workspace = true
 rand = "0.9"
 sha2 = "0.10"
 tempfile = "3"
+jupyter-zmq-client = { version = "1", features = ["tokio-runtime"] }
+jupyter-protocol = "2"
+tokio = { version = "1", features = ["full"] }
+libc = "0.2.189"
 
 [dev-dependencies]
 proptest = "1"

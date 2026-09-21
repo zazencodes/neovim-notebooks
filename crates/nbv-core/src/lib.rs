@@ -2,6 +2,8 @@
 
 pub mod adapter;
 pub mod document;
+pub mod exec;
+pub mod kernel;
 pub mod key;
 pub mod notebook;
 
