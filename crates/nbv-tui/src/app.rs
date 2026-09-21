@@ -251,7 +251,7 @@ impl App {
                     }
                 }
                 self.kernel = Some(k);
-                self.exec.reset(&mut self.nb, KernelStatus::Idle);
+                self.exec.connected();
             }
             Err(e) => {
                 self.message = Some(e.to_string());

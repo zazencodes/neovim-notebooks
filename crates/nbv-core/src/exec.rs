@@ -51,6 +51,11 @@ impl Executor {
         self.status
     }
 
+    /// A kernel has connected. Requests made while it started stay correlated.
+    pub fn connected(&mut self) {
+        self.status = KernelStatus::Idle;
+    }
+
     /// Builds the `execute_request` for `key` and records it. `None` if the cell is not a live
     /// code cell. The request's source becomes the cell's staleness baseline (§7.6).
     pub fn request(&mut self, nb: &mut Notebook, key: &CellKey) -> Option<JupyterMessage> {
