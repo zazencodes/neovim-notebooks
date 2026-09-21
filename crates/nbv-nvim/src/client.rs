@@ -18,6 +18,8 @@ pub enum NvimEvent {
     Redraw(Vec<RedrawEvent>),
     /// `nvim_buf_lines_event`: lines `[first, last)` replaced; `last == -1` is the whole buffer.
     BufLines { buf: i64, tick: Option<u64>, first: i64, last: i64, lines: Vec<String> },
+    /// `nvim_buf_changedtick_event`: the tick moved without a text change (e.g. after `:w`).
+    BufChangedTick { buf: i64, tick: u64 },
     BufDetach { buf: i64 },
     /// An `rpcnotify` from the companion.
     Notify { name: String, args: Vec<Value> },
@@ -168,7 +170,10 @@ impl Handler for Forwarder {
                 lines: args.get(4).map(strings).unwrap_or_default(),
             },
             "nvim_buf_detach_event" => NvimEvent::BufDetach { buf: buffer_handle(&args[0]) },
-            "nvim_buf_changedtick_event" => return,
+            "nvim_buf_changedtick_event" => NvimEvent::BufChangedTick {
+                buf: buffer_handle(&args[0]),
+                tick: args.get(1).and_then(Value::as_u64).unwrap_or(0),
+            },
             _ => NvimEvent::Notify { name, args },
         };
         let _ = self.tx.send(ev);

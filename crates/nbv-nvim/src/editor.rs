@@ -182,6 +182,12 @@ impl Editor {
                     }
                 }
             }
+            NvimEvent::BufChangedTick { buf, tick } => {
+                if Some(buf) == self.buf && self.attached {
+                    self.tick = tick;
+                }
+                vec![]
+            }
             NvimEvent::BufDetach { buf } => {
                 if Some(buf) == self.buf {
                     if self.expected_detaches > 0 {

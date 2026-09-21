@@ -282,18 +282,25 @@ end
 --- Redraws all nbv decorations: output placeholders (virt_lines of the right height) and
 --- cell status (virt_text on marker lines). Each placeholder row is one chunk wider than
 --- any window, so its highlight reaches the end of the row.
-function M.render(buf, outputs, marks)
+function M.render(buf, tick, outputs, marks)
   if not api.nvim_buf_is_valid(buf) then
+    return
+  end
+  if api.nvim_buf_get_changedtick(buf) ~= tick then
+    -- Rust has not seen the latest change yet; it re-renders once it has.
+    vim.rpcnotify(M.chan, 'nbv', 'rerender', {})
     return
   end
   api.nvim_buf_clear_namespace(buf, M.ns, 0, -1)
   local count = api.nvim_buf_line_count(buf)
   local pad = string.rep(' ', math.max(vim.o.columns, 80) + 8)
   for _, o in ipairs(outputs) do
+    -- Each row carries its index as `#n#`: placeholder cells are drawn transparent, so the
+    -- tag is never seen, but it tells Rust exactly which output row landed where.
     local rows = {}
-    local chunk = { { pad, 'NbvOutputSlot' .. o.slot } }
+    local group = 'NbvOutputSlot' .. o.slot
     for r = 1, o.height do
-      rows[r] = chunk
+      rows[r] = { { ('#%d#'):format(r - 1) .. pad, group } }
     end
     local line = math.min(o.line, count - 1)
     pcall(api.nvim_buf_set_extmark, buf, M.ns, line, 0, {
