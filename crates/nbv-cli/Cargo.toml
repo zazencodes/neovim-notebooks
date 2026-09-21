@@ -13,3 +13,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 nbv-tui = { version = "0.1.0", path = "../nbv-tui" }
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"
