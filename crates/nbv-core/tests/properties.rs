@@ -77,22 +77,48 @@ enum LineGen {
 
 #[derive(Clone, Debug)]
 enum Op {
-    Insert { at: usize, lines: Vec<LineGen> },
-    Replace { at: usize, len: usize, lines: Vec<LineGen> },
-    Delete { at: usize, len: usize },
+    Insert {
+        at: usize,
+        lines: Vec<LineGen>,
+    },
+    Replace {
+        at: usize,
+        len: usize,
+        lines: Vec<LineGen>,
+    },
+    Delete {
+        at: usize,
+        len: usize,
+    },
     /// Yank a range and paste it elsewhere.
-    Duplicate { at: usize, len: usize, to: usize },
+    Duplicate {
+        at: usize,
+        len: usize,
+        to: usize,
+    },
     /// Delete a range and paste it elsewhere: two edits.
-    Move { at: usize, len: usize, to: usize },
+    Move {
+        at: usize,
+        len: usize,
+        to: usize,
+    },
     /// Whole-buffer replacement that keeps marker lines and rewrites bodies.
-    Rewrite { suffix: String },
+    Rewrite {
+        suffix: String,
+    },
     /// `:%!cmd`: insert the filtered text after the old, then delete the old, with the
     /// normalisation in between refused.
-    Filter { suffix: String },
+    Filter {
+        suffix: String,
+    },
     /// Return to an earlier normalised state as a single edit, as undo does.
-    Undo { back: usize },
+    Undo {
+        back: usize,
+    },
     /// Return to an earlier normalised state as a whole-buffer resync.
-    Resync { back: usize },
+    Resync {
+        back: usize,
+    },
 }
 
 fn line_gen() -> impl Strategy<Value = LineGen> + Clone {
@@ -284,7 +310,11 @@ impl Harness {
                     .iter()
                     .enumerate()
                     .map(|(i, l)| {
-                        if first.is_none_or(|f| i <= f) || p.parse_marker(l).is_some() { l.clone() } else { format!("{l}{suffix}") }
+                        if first.is_none_or(|f| i <= f) || p.parse_marker(l).is_some() {
+                            l.clone()
+                        } else {
+                            format!("{l}{suffix}")
+                        }
                     })
                     .collect();
                 let markers = |t: &[String]| t.iter().filter(|l| p.parse_marker(l).is_some()).count();

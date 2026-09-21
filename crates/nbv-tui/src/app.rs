@@ -26,9 +26,9 @@ use ratatui_image::sliced::SlicedProtocol;
 use rmpv::Value;
 use tokio::sync::mpsc;
 
-use crate::{compose, decor};
 use crate::outputs::{self, Block, Images, OutputView};
 use crate::terminal::{self as term, Tmux};
+use crate::{compose, decor};
 
 pub struct Options {
     pub notebook: PathBuf,
@@ -304,7 +304,9 @@ impl App {
                 self.editor.calls.request("nvim_paste", vec![text.into(), true.into(), (-1).into()]);
             }
             Event::Resize(w, h) => {
-                self.editor.calls.request("nvim_ui_try_resize", vec![(w as u64).into(), (h.saturating_sub(1) as u64).into()]);
+                self.editor
+                    .calls
+                    .request("nvim_ui_try_resize", vec![(w as u64).into(), (h.saturating_sub(1) as u64).into()]);
                 self.views.clear();
                 self.protocols.clear();
                 self.decorations = true;
@@ -584,9 +586,8 @@ impl App {
         if grid.width == 0 {
             return Ok(());
         }
-        let runs = compose::find_runs(grid, |slot| {
-            self.slot_key(slot).and_then(|k| self.views.get(k)).map(|v| v.height)
-        });
+        let runs =
+            compose::find_runs(grid, |slot| self.slot_key(slot).and_then(|k| self.views.get(k)).map(|v| v.height));
         // Protocols for the images about to be shown.
         for run in &runs {
             let Some(view) = self.slot_key(run.slot).and_then(|k| self.views.get(k)) else { continue };
@@ -594,7 +595,8 @@ impl App {
                 if let Block::Image { hash, image, cols, rows } = block {
                     let key = (*hash, *cols, *rows);
                     if !self.protocols.contains_key(&key)
-                        && let Ok(p) = SlicedProtocol::new(&self.picker, (**image).clone(), Some(Size::new(*cols, *rows)))
+                        && let Ok(p) =
+                            SlicedProtocol::new(&self.picker, (**image).clone(), Some(Size::new(*cols, *rows)))
                     {
                         self.protocols.insert(key, p);
                     }

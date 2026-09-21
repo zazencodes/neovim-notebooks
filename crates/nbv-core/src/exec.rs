@@ -4,9 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use jupyter_protocol::{
-    ExecuteRequest, ExecutionState, JupyterMessage, JupyterMessageContent, ReplyStatus, Stdio,
-};
+use jupyter_protocol::{ExecuteRequest, ExecutionState, JupyterMessage, JupyterMessageContent, ReplyStatus, Stdio};
 use serde_json::{Map, Value, json};
 
 use crate::document::ExecState;
@@ -31,7 +29,11 @@ pub enum ExecEvent {
     Cell(CellKey),
     Status(KernelStatus),
     /// The kernel asked for input on behalf of a cell (`input()`).
-    InputRequested { key: Option<CellKey>, prompt: String, password: bool },
+    InputRequested {
+        key: Option<CellKey>,
+        prompt: String,
+        password: bool,
+    },
 }
 
 #[derive(Default, Debug)]
@@ -348,8 +350,8 @@ fn media_json(media: &jupyter_protocol::Media) -> Value {
 mod tests {
     use super::*;
     use jupyter_protocol::{
-        ClearOutput, DisplayData, ErrorOutput, ExecuteInput, ExecuteReply, ExecutionCount, Media,
-        MediaType, Status, StreamContent, Transient, UpdateDisplayData,
+        ClearOutput, DisplayData, ErrorOutput, ExecuteInput, ExecuteReply, ExecutionCount, Media, MediaType, Status,
+        StreamContent, Transient, UpdateDisplayData,
     };
     use std::path::Path;
 
@@ -386,7 +388,10 @@ mod tests {
         let (mut nb, mut ex, req, key) = setup();
         ex.handle(&mut nb, &JupyterMessage::new(Status::busy(), Some(&req)));
         assert_eq!(nb.cell(&key).unwrap().runtime.exec, ExecState::Running);
-        ex.handle(&mut nb, &JupyterMessage::new(ExecuteInput { code: "".into(), execution_count: ExecutionCount::new(7) }, Some(&req)));
+        ex.handle(
+            &mut nb,
+            &JupyterMessage::new(ExecuteInput { code: "".into(), execution_count: ExecutionCount::new(7) }, Some(&req)),
+        );
         ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout("1\n"), Some(&req)));
         ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout("2\n"), Some(&req)));
         ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stderr("warn\n"), Some(&req)));

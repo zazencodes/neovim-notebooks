@@ -18,8 +18,7 @@ impl CellKey {
 
     /// Whether `s` is a valid nbformat 4.5 cell id: 1–64 characters of `[a-zA-Z0-9-_]`.
     pub fn is_valid_nbformat_id(s: &str) -> bool {
-        (1..=64).contains(&s.len())
-            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     }
 }
 

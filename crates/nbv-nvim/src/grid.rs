@@ -105,10 +105,8 @@ impl Grid {
             }
             RedrawEvent::GridCursorGoto { row, col, .. } => self.cursor = (row, col),
             RedrawEvent::HlAttrDefine { id, attr } => {
-                let slot = attr
-                    .names
-                    .iter()
-                    .find_map(|n| n.strip_prefix(SLOT_PREFIX).and_then(|s| s.parse::<u16>().ok()));
+                let slot =
+                    attr.names.iter().find_map(|n| n.strip_prefix(SLOT_PREFIX).and_then(|s| s.parse::<u16>().ok()));
                 match slot {
                     Some(s) => self.slots.insert(id, s),
                     None => self.slots.remove(&id),

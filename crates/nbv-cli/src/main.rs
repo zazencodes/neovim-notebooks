@@ -40,7 +40,12 @@ fn main() -> ExitCode {
     match nvim_version(&nvim) {
         Ok(v) if v >= MIN_NVIM => {}
         Ok((major, minor)) => {
-            eprintln!("nbv: Neovim {}.{} or newer is required; {} is {major}.{minor}", MIN_NVIM.0, MIN_NVIM.1, nvim.display());
+            eprintln!(
+                "nbv: Neovim {}.{} or newer is required; {} is {major}.{minor}",
+                MIN_NVIM.0,
+                MIN_NVIM.1,
+                nvim.display()
+            );
             return ExitCode::FAILURE;
         }
         Err(e) => {

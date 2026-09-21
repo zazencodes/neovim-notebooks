@@ -17,15 +17,33 @@ use crate::redraw::{self, RedrawEvent};
 pub enum NvimEvent {
     Redraw(Vec<RedrawEvent>),
     /// `nvim_buf_lines_event`: lines `[first, last)` replaced; `last == -1` is the whole buffer.
-    BufLines { buf: i64, tick: Option<u64>, first: i64, last: i64, lines: Vec<String> },
+    BufLines {
+        buf: i64,
+        tick: Option<u64>,
+        first: i64,
+        last: i64,
+        lines: Vec<String>,
+    },
     /// `nvim_buf_changedtick_event`: the tick moved without a text change (e.g. after `:w`).
-    BufChangedTick { buf: i64, tick: u64 },
-    BufDetach { buf: i64 },
+    BufChangedTick {
+        buf: i64,
+        tick: u64,
+    },
+    BufDetach {
+        buf: i64,
+    },
     /// An `rpcnotify` from the companion.
-    Notify { name: String, args: Vec<Value> },
+    Notify {
+        name: String,
+        args: Vec<Value>,
+    },
     /// An `rpcrequest` from the companion. Neovim blocks until `reply` is answered, so the
     /// answer must not depend on a request back to Neovim.
-    Request { name: String, args: Vec<Value>, reply: oneshot::Sender<Value> },
+    Request {
+        name: String,
+        args: Vec<Value>,
+        reply: oneshot::Sender<Value>,
+    },
     Exited,
 }
 
@@ -87,14 +105,8 @@ pub trait NvimClient: Clone + Send + Sync + 'static {
         row: usize,
         col: usize,
     ) -> impl Future<Output = Result<(), NvimError>> + Send {
-        let args = vec![
-            button.into(),
-            action.into(),
-            modifier.into(),
-            0u64.into(),
-            (row as u64).into(),
-            (col as u64).into(),
-        ];
+        let args =
+            vec![button.into(), action.into(), modifier.into(), 0u64.into(), (row as u64).into(), (col as u64).into()];
         async move {
             self.request("nvim_input_mouse", args).await?;
             Ok(())
@@ -138,7 +150,9 @@ struct Forwarder {
 /// A `buffer` ext value carries the handle as msgpack.
 fn buffer_handle(v: &Value) -> i64 {
     match v {
-        Value::Ext(_, data) => rmpv::decode::read_value(&mut data.as_slice()).ok().and_then(|v| v.as_i64()).unwrap_or(-1),
+        Value::Ext(_, data) => {
+            rmpv::decode::read_value(&mut data.as_slice()).ok().and_then(|v| v.as_i64()).unwrap_or(-1)
+        }
         v => v.as_i64().unwrap_or(-1),
     }
 }

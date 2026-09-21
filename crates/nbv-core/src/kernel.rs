@@ -32,7 +32,10 @@ pub struct KernelCommand {
 pub enum KernelMessage {
     Message(Box<JupyterMessage>),
     /// The kernel process exited. Carries the tail of its stderr.
-    Died { generation: u64, stderr: String },
+    Died {
+        generation: u64,
+        stderr: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -167,9 +170,8 @@ impl Kernel {
             let shell = zmq::create_client_shell_connection_with_identity(&info, &session, identity.clone())
                 .await
                 .map_err(conn_err)?;
-            let stdin = zmq::create_client_stdin_connection_with_identity(&info, &session, identity)
-                .await
-                .map_err(conn_err)?;
+            let stdin =
+                zmq::create_client_stdin_connection_with_identity(&info, &session, identity).await.map_err(conn_err)?;
             let control = zmq::create_client_control_connection(&info, &session).await.map_err(conn_err)?;
             let (mut shell_tx, mut shell_rx) = shell.split();
             // Probe until iopub delivers something: subscriptions are live once it does.
@@ -200,11 +202,23 @@ impl Kernel {
             move |m: JupyterMessage| tx.send(KernelMessage::Message(Box::new(m))).is_ok()
         };
         let send = fwd(tx.clone());
-        tasks.push(tokio::spawn(async move { while let Ok(m) = iopub.read().await && send(m) {} }));
+        tasks.push(tokio::spawn(async move {
+            while let Ok(m) = iopub.read().await
+                && send(m)
+            {}
+        }));
         let send = fwd(tx.clone());
-        tasks.push(tokio::spawn(async move { while let Ok(m) = shell_rx.read().await && send(m) {} }));
+        tasks.push(tokio::spawn(async move {
+            while let Ok(m) = shell_rx.read().await
+                && send(m)
+            {}
+        }));
         let send = fwd(tx.clone());
-        tasks.push(tokio::spawn(async move { while let Ok(m) = stdin_rx.read().await && send(m) {} }));
+        tasks.push(tokio::spawn(async move {
+            while let Ok(m) = stdin_rx.read().await
+                && send(m)
+            {}
+        }));
 
         let mut kernel = Kernel {
             pid: child.id(),

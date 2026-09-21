@@ -111,8 +111,7 @@ impl Notebook {
 
     /// Parses notebook JSON without touching the disk. `path` is only used for naming.
     pub fn from_bytes(path: &Path, bytes: &[u8], mut minter: KeyMinter) -> Result<Notebook, OpenError> {
-        let value: Value =
-            serde_json::from_slice(bytes).map_err(|e| OpenError::Json(path.into(), e))?;
+        let value: Value = serde_json::from_slice(bytes).map_err(|e| OpenError::Json(path.into(), e))?;
         let Value::Object(mut top) = value else {
             return Err(OpenError::NotANotebook(path.into(), "top level is not an object"));
         };
@@ -141,9 +140,7 @@ impl Notebook {
             }
         }
         let usable = |c: &Cell| {
-            c.persisted_id()
-                .filter(|id| CellKey::is_valid_nbformat_id(id) && counts[id] == 1)
-                .map(CellKey::new)
+            c.persisted_id().filter(|id| CellKey::is_valid_nbformat_id(id) && counts[id] == 1).map(CellKey::new)
         };
         let keys: Vec<Option<CellKey>> = cells.iter().map(usable).collect();
         for k in keys.iter().flatten() {
@@ -290,11 +287,8 @@ impl Notebook {
         self.mirror.splice(first..last, lines);
 
         // Old marker positions mapped into new coordinates, for markers outside the edit.
-        let old_by_line: HashMap<usize, CellKey> = self
-            .layout
-            .iter()
-            .filter_map(|s| s.marker.map(|m| (m, s.key.clone())))
-            .collect();
+        let old_by_line: HashMap<usize, CellKey> =
+            self.layout.iter().filter_map(|s| s.marker.map(|m| (m, s.key.clone()))).collect();
         let old_leading = self.layout.first().filter(|s| s.marker.is_none()).map(|s| s.key.clone());
         let survivor = |line: usize| -> Option<&CellKey> {
             let old = if line < first {
@@ -307,14 +301,11 @@ impl Notebook {
             old_by_line.get(&old)
         };
 
-        let markers: Vec<(usize, Marker)> = self
-            .mirror
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| self.adapter.parse_marker(l).map(|m| (i, m)))
-            .collect();
+        let markers: Vec<(usize, Marker)> =
+            self.mirror.iter().enumerate().filter_map(|(i, l)| self.adapter.parse_marker(l).map(|m| (i, m))).collect();
 
-        let claimable = |k: &CellKey| self.live.contains_key(k) || self.tombstones.contains_key(k) || self.pending.contains(k);
+        let claimable =
+            |k: &CellKey| self.live.contains_key(k) || self.tombstones.contains_key(k) || self.pending.contains(k);
         let survivors: Vec<Option<&CellKey>> = markers.iter().map(|(i, _)| survivor(*i)).collect();
 
         // Step 1: an untouched marker showing the key it already had keeps it.
@@ -361,8 +352,7 @@ impl Notebook {
         }
 
         // Everything else is a new cell.
-        let assigned: Vec<CellKey> =
-            assigned.into_iter().map(|k| k.unwrap_or_else(|| self.minter.mint())).collect();
+        let assigned: Vec<CellKey> = assigned.into_iter().map(|k| k.unwrap_or_else(|| self.minter.mint())).collect();
 
         let mut spans = Vec::with_capacity(markers.len() + 1);
         if let Some(k) = leading_key {
@@ -399,7 +389,11 @@ impl Notebook {
             }
         }
         if let Some(lead) = self.layout.first().filter(|s| s.marker.is_none()) {
-            edits.push(LineEdit { first: 0, last: 0, lines: vec![self.adapter.format_marker(CellKind::Code, &lead.key)] });
+            edits.push(LineEdit {
+                first: 0,
+                last: 0,
+                lines: vec![self.adapter.format_marker(CellKind::Code, &lead.key)],
+            });
         }
         edits
     }

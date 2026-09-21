@@ -35,6 +35,8 @@ pub struct Marker {
     pub key: Option<CellKey>,
 }
 
+/// §8's interface. `from_buffer` keeps the spec's name despite taking `self`.
+#[allow(clippy::wrong_self_convention)]
 pub trait LanguageProjection {
     fn filetype(&self) -> &str;
     fn buffer_suffix(&self) -> &str;
@@ -189,11 +191,7 @@ fn is_magic_body(body: &str) -> bool {
 /// jupytext-style: a magic line, commented or not, gains one `# ` after its indentation.
 fn escape_magic(line: &str) -> String {
     let (indent, _, body) = split_comment_stack(line);
-    if is_magic_body(body) {
-        format!("{}{COMMENT}{}", &line[..indent], &line[indent..])
-    } else {
-        line.to_string()
-    }
+    if is_magic_body(body) { format!("{}{COMMENT}{}", &line[..indent], &line[indent..]) } else { line.to_string() }
 }
 
 fn unescape_magic(line: &str) -> String {

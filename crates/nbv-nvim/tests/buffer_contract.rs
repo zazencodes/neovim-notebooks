@@ -1,7 +1,7 @@
 //! Spike 2: the buffer contract (§6, §7, §9) through a real Neovim.
 
-use nbv_nvim::harness::{Harness, Options, repo_root};
 use nbv_nvim::NvimClient;
+use nbv_nvim::harness::{Harness, Options, repo_root};
 use serde_json::Value;
 
 fn ids(saved: &Value) -> Vec<Option<String>> {

@@ -67,11 +67,7 @@ impl Cell {
 
     /// Unknown cell types are treated as raw for projection; their `cell_type` is untouched.
     pub fn kind(&self) -> CellKind {
-        self.raw
-            .get("cell_type")
-            .and_then(Value::as_str)
-            .and_then(CellKind::from_nbformat)
-            .unwrap_or(CellKind::Raw)
+        self.raw.get("cell_type").and_then(Value::as_str).and_then(CellKind::from_nbformat).unwrap_or(CellKind::Raw)
     }
 
     pub fn set_kind(&mut self, kind: CellKind) {

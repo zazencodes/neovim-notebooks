@@ -74,7 +74,8 @@ fn legacy_upgrades_on_first_mutation() {
     for (i, c) in expected["cells"].as_array_mut().unwrap().iter_mut().enumerate() {
         c["id"] = keys[i].clone().into();
     }
-    expected["cells"][1]["source"] = serde_json::json!(["import numpy as np\n", "print('hello')\n", "print('world')\n", "x = 1"]);
+    expected["cells"][1]["source"] =
+        serde_json::json!(["import numpy as np\n", "print('hello')\n", "print('world')\n", "x = 1"]);
     assert_eq!(after, expected);
 }
 

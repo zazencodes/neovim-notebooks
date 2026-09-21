@@ -192,7 +192,8 @@ fn two_step_filter_insert_then_delete_keeps_every_key() {
     let before = snapshot(&nb);
     let text = nb.mirror().to_vec();
     let n = text.len();
-    let filtered: Vec<String> = text.iter().map(|l| if l.starts_with("# %%") { l.clone() } else { format!("{l} ") }).collect();
+    let filtered: Vec<String> =
+        text.iter().map(|l| if l.starts_with("# %%") { l.clone() } else { format!("{l} ") }).collect();
     let r = nb.apply_edit(LineEdit { first: n, last: n, lines: filtered }).unwrap();
     assert!(!r.normalise.is_empty(), "copies are fresh cells until the originals go");
     let r = nb.apply_edit(LineEdit { first: 0, last: n, lines: vec![] }).unwrap();

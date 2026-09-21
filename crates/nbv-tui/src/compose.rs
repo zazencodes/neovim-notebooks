@@ -78,7 +78,7 @@ pub fn find_runs(grid: &Grid, height_of: impl Fn(u16) -> Option<usize>) -> Vec<R
                 if o.tag.is_none() {
                     o.tag = tag.map(|t| (t, o.len - 1));
                 }
-            } else if let Some(i) = open.iter().position(|o| overlaps(o)) {
+            } else if let Some(i) = open.iter().position(overlaps) {
                 let mut o = open.remove(i);
                 o.len += 1;
                 o.x0 = o.x0.min(x0);

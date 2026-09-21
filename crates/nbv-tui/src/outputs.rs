@@ -206,7 +206,9 @@ mod tests {
         let img = DynamicImage::new_rgb8(400, 200);
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-        let c = cell(json!([{"output_type": "display_data", "data": {"image/png": b64, "text/plain": ["<Figure>"]}, "metadata": {}}]));
+        let c = cell(
+            json!([{"output_type": "display_data", "data": {"image/png": b64, "text/plain": ["<Figure>"]}, "metadata": {}}]),
+        );
         let v = build(&c, 22, FontSize::new(10, 20), &mut Images::default());
         let Block::Image { cols, rows, .. } = v.blocks[0] else { panic!("expected an image") };
         assert_eq!((cols, rows), (20, 5));

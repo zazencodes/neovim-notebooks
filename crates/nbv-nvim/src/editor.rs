@@ -61,7 +61,10 @@ pub enum EditorEvent {
     /// The document was reloaded from disk.
     Reloaded,
     /// A companion notification: a command or keymap the user invoked.
-    Command { action: String, args: Value },
+    Command {
+        action: String,
+        args: Value,
+    },
     Exited,
 }
 
@@ -301,7 +304,12 @@ pub async fn spawn(
 
 /// Loads the companion before the user's config (pre-config, §10.3), then attaches the UI,
 /// which lets startup proceed: user config, then the notebook buffer via `BufReadCmd`.
-pub async fn handshake<C: NvimClient>(client: &C, buffer_path: &Path, width: usize, height: usize) -> Result<(), NvimError> {
+pub async fn handshake<C: NvimClient>(
+    client: &C,
+    buffer_path: &Path,
+    width: usize,
+    height: usize,
+) -> Result<(), NvimError> {
     let info = client.request("nvim_get_api_info", vec![]).await?;
     let chan = info.as_array().and_then(|a| a.first()).and_then(Value::as_i64).unwrap_or(1);
     let path = buffer_path.to_string_lossy().into_owned();

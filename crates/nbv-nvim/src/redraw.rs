@@ -104,11 +104,9 @@ pub fn parse(args: &[Value]) -> Vec<RedrawEvent> {
             let a = call.as_array().map(Vec::as_slice).unwrap_or(&[]);
             let arg = |n: usize| a.get(n).unwrap_or(&Value::Nil);
             let ev = match name {
-                "grid_resize" => RedrawEvent::GridResize {
-                    grid: u(arg(0)),
-                    width: u(arg(1)) as usize,
-                    height: u(arg(2)) as usize,
-                },
+                "grid_resize" => {
+                    RedrawEvent::GridResize { grid: u(arg(0)), width: u(arg(1)) as usize, height: u(arg(2)) as usize }
+                }
                 "grid_line" => {
                     let cells = arg(3)
                         .as_array()
@@ -134,12 +132,12 @@ pub fn parse(args: &[Value]) -> Vec<RedrawEvent> {
                     rows: i(arg(5)),
                 },
                 "grid_clear" => RedrawEvent::GridClear { grid: u(arg(0)) },
-                "grid_cursor_goto" => RedrawEvent::GridCursorGoto {
-                    grid: u(arg(0)),
-                    row: u(arg(1)) as usize,
-                    col: u(arg(2)) as usize,
-                },
-                "hl_attr_define" => RedrawEvent::HlAttrDefine { id: u(arg(0)) as u32, attr: parse_attr(arg(1), a.get(3)) },
+                "grid_cursor_goto" => {
+                    RedrawEvent::GridCursorGoto { grid: u(arg(0)), row: u(arg(1)) as usize, col: u(arg(2)) as usize }
+                }
+                "hl_attr_define" => {
+                    RedrawEvent::HlAttrDefine { id: u(arg(0)) as u32, attr: parse_attr(arg(1), a.get(3)) }
+                }
                 "default_colors_set" => {
                     RedrawEvent::DefaultColors { fg: color(arg(0)), bg: color(arg(1)), sp: color(arg(2)) }
                 }
