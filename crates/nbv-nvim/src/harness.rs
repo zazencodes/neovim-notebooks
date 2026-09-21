@@ -1,23 +1,23 @@
 //! Integration harness (§16.6): drives an embedded Neovim through scripted input with no
-//! terminal attached, asserting on the composed grid and the saved JSON. Reusable by later
-//! spikes.
-#![allow(dead_code)]
+//! terminal attached, so tests can assert on the composed grid and the saved JSON. Enabled by
+//! the `harness` feature; used by this crate's tests and by the frontend's.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nbv_core::Notebook;
-use nbv_nvim::editor::{self, Editor, EditorEvent};
-use nbv_nvim::{EmbeddedNvim, NvimClient};
 use rmpv::Value;
+
+use crate::editor::{self, Editor, EditorEvent};
+use crate::{EmbeddedNvim, NvimClient};
 
 /// The Neovim under test: `NBV_NVIM`, the repository's `.tools` download, or `nvim`.
 pub fn nvim_program() -> PathBuf {
     if let Some(p) = std::env::var_os("NBV_NVIM") {
         return p.into();
     }
-    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tools/nvim-macos-arm64/bin/nvim");
+    let local = repo_root().join(".tools/nvim-macos-arm64/bin/nvim");
     if local.exists() { local } else { "nvim".into() }
 }
 
@@ -131,6 +131,11 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    pub async fn resize(&self, width: usize, height: usize) {
+        self.client.resize(width, height).await.unwrap();
+        self.settle().await;
     }
 
     /// Waits until Neovim has processed everything sent so far, including companion calls.

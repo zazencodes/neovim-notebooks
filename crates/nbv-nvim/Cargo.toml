@@ -1,18 +1,25 @@
 [package]
 name = "nbv-nvim"
+description = "Neovim Notebooks: NvimClient boundary, grid model and notebook buffer adapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# The integration harness (§16.6), for this crate's tests and the frontend's.
+harness = ["dep:serde_json", "dep:tempfile"]
+
 [dependencies]
 async-trait = "0.1"
-nbv-core = { version = "0.1.0", path = "../nbv-core" }
+nbv-core.workspace = true
 nvim-rs = { version = "0.9", features = ["use_tokio"] }
 rmpv = "1"
-thiserror = "2"
-tokio = { workspace = true, features = ["full"] }
+serde_json = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }
+thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-serde_json = "1"
-tempfile = "3"
+nbv-nvim = { path = ".", features = ["harness"] }
+serde_json.workspace = true

@@ -4,6 +4,8 @@
 pub mod client;
 pub mod editor;
 pub mod grid;
+#[cfg(feature = "harness")]
+pub mod harness;
 pub mod redraw;
 
 pub use client::{EmbeddedNvim, NvimClient, NvimError, NvimEvent};

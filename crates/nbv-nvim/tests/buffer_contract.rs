@@ -1,8 +1,6 @@
 //! Spike 2: the buffer contract (§6, §7, §9) through a real Neovim.
 
-mod harness;
-
-use harness::{Harness, Options, repo_root};
+use nbv_nvim::harness::{Harness, Options, repo_root};
 use nbv_nvim::NvimClient;
 use serde_json::Value;
 
