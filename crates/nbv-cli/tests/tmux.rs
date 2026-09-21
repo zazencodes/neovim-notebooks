@@ -1,4 +1,4 @@
-//! The second integration harness (§16.6): the real `nbv` binary in a detached tmux session,
+//! The second integration harness (§16.6): the real `nvb` binary in a detached tmux session,
 //! driven with `send-keys` and checked with `capture-pane`. Halfblock images are text in tmux's
 //! grid, so image placement and clipping are checked here too. Skipped without tmux, Neovim
 //! 0.12 (`NBV_NVIM` or `.tools/`), or a Python with ipykernel (`.venv/`).
@@ -29,7 +29,7 @@ impl Session {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    /// Starts nbv on a notebook written from `cells` (source strings), under a tmux with no
+    /// Starts nvb on a notebook written from `cells` (source strings), under a tmux with no
     /// configuration.
     fn start(cells: &[&str]) -> Option<Session> {
         Session::start_with(cells, "")
@@ -57,11 +57,11 @@ impl Session {
         // The temporary directory's name is unique, so parallel tests get their own servers.
         let socket = format!("nbv-test-{}", dir.path().file_name().unwrap().to_string_lossy());
         let cmd = format!(
-            "cd {0} && XDG_STATE_HOME={0}/state VIRTUAL_ENV={1} NBV_NVIM={2} {3} --clean t.ipynb; echo NBV-EXITED-$?; sleep 30",
+            "cd {0} && XDG_STATE_HOME={0}/state VIRTUAL_ENV={1} NBV_NVIM={2} {3} --clean t.ipynb; echo NVB-EXITED-$?; sleep 30",
             dir.path().display(),
             venv.display(),
             nvim.display(),
-            env!("CARGO_BIN_EXE_nbv"),
+            env!("CARGO_BIN_EXE_nvb"),
         );
         let s = Session { socket, dir };
         let conf_path = s.dir.path().join("tmux.conf");
@@ -182,7 +182,7 @@ fn run_image_input_edit_and_save_inside_tmux() {
     s.wait_for(" NAV");
 
     s.keys(&[":wq", "Enter"]);
-    s.wait_for("NBV-EXITED-0");
+    s.wait_for("NVB-EXITED-0");
     let saved = s.saved();
     // The cell keeps the string form it was loaded with.
     assert_eq!(saved["cells"][0]["source"], serde_json::json!("print(6 * 7)  # edited"));
@@ -213,7 +213,7 @@ fn run_advance_and_leave_cells() {
     s.keys(&["u"]);
     s.wait_for("x + 1");
     s.keys(&[":wq", "Enter"]);
-    s.wait_for("NBV-EXITED-0");
+    s.wait_for("NVB-EXITED-0");
     let sources: Vec<serde_json::Value> =
         s.saved()["cells"].as_array().unwrap().iter().map(|c| c["source"].clone()).collect();
     assert_eq!(sources, [serde_json::json!("x = 1"), serde_json::json!("x + 1"), serde_json::json!(["y = 3"])]);
@@ -229,7 +229,7 @@ fn clean_exit_leaves_no_processes() {
     s.keys(&[":q", "Enter"]);
     s.wait_for("E37");
     s.keys(&[":q!", "Enter"]);
-    s.wait_for("NBV-EXITED-0");
+    s.wait_for("NVB-EXITED-0");
     let ps = Command::new("ps").args(["-eo", "command"]).output().unwrap();
     let ps = String::from_utf8_lossy(&ps.stdout);
     let dir = s.dir.path().to_string_lossy().into_owned();
@@ -285,7 +285,7 @@ fn help_and_the_header() {
     s.keys(&["Escape"]);
     s.wait_for(" NAV");
     s.keys(&[":wq", "Enter"]);
-    s.wait_for("NBV-EXITED-0");
+    s.wait_for("NVB-EXITED-0");
     assert!(!s.dir.path().join("t.ipynb").exists());
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(s.dir.path().join("u.ipynb")).unwrap()).unwrap();

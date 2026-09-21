@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Neovim Notebooks (`nbv`): a Rust/Ratatui TUI that edits Jupyter notebooks with an embedded Neovim. The project is changing rapidly; treat `docs/specs/` and the code as the source of truth over this file.
+Neovim Notebooks (`nvb`): a Rust/Ratatui TUI that edits Jupyter notebooks with an embedded Neovim. The project is changing rapidly; treat `docs/specs/` and the code as the source of truth over this file.
 
 ## Project Instructions
 
@@ -11,7 +11,7 @@ Neovim Notebooks (`nbv`): a Rust/Ratatui TUI that edits Jupyter notebooks with a
 - `crates/nbv-core`: notebook model, persistence, kernel. Must not depend on Neovim or Ratatui (`scripts/check-core-deps.sh`).
 - `crates/nbv-nvim`: embedded Neovim client and cell buffer adapter.
 - `crates/nbv-tui`: event loop, layout, drawing.
-- `crates/nbv-cli`: the `nbv` binary.
+- `crates/nbv-cli`: the `nvb` binary.
 - `lua/nbv/init.lua`: Lua companion loaded into the embedded Neovim.
 - `docs/specs/`: design specs.
 

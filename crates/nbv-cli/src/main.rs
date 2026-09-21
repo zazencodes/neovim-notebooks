@@ -1,4 +1,4 @@
-//! `nbv`: open a Jupyter notebook in an embedded Neovim.
+//! `nvb`: open a Jupyter notebook in an embedded Neovim.
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -7,11 +7,11 @@ use clap::Parser;
 
 /// Neovim Notebooks: edit and run Jupyter notebooks in a real Neovim.
 #[derive(Parser)]
-#[command(name = "nbv", version)]
+#[command(name = "nvb", version)]
 struct Cli {
     /// The notebook to open.
     notebook: PathBuf,
-    /// Start Neovim without your configuration, to tell nbv bugs from plugin conflicts.
+    /// Start Neovim without your configuration, to tell nvb bugs from plugin conflicts.
     #[arg(long)]
     clean: bool,
     /// The Neovim to embed (default: $NBV_NVIM, then `nvim` on PATH). Must be 0.12 or newer.
@@ -44,7 +44,7 @@ fn main() -> ExitCode {
         Ok(v) if v >= MIN_NVIM => {}
         Ok((major, minor)) => {
             eprintln!(
-                "nbv: Neovim {}.{} or newer is required; {} is {major}.{minor}",
+                "nvb: Neovim {}.{} or newer is required; {} is {major}.{minor}",
                 MIN_NVIM.0,
                 MIN_NVIM.1,
                 nvim.display()
@@ -52,7 +52,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         Err(e) => {
-            eprintln!("nbv: {e}");
+            eprintln!("nvb: {e}");
             return ExitCode::FAILURE;
         }
     }
@@ -63,7 +63,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("nbv: {e}");
+            eprintln!("nvb: {e}");
             ExitCode::FAILURE
         }
     }

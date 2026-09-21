@@ -1,13 +1,13 @@
-# Neovim Notebooks (`nbv`)
+# Neovim Notebooks (`nvb`)
 
-Jupyter notebooks in a real Neovim. `nbv` is a Rust/Ratatui application that owns the terminal,
+Jupyter notebooks in a real Neovim. `nvb` is a Rust/Ratatui application that owns the terminal,
 embeds `nvim --embed` as its editing engine, and runs cells on an unmodified Jupyter kernel.
 The notebook is a list of distinct cells with their outputs below them. Move between cells
 with Vim keys, press `Enter` to edit one in your own Neovim (config, plugins, LSP, Treesitter),
 and press `Esc` in Normal mode to leave it. Outputs, images included, render inline.
 
 ```
-nbv analysis.ipynb
+nvb analysis.ipynb
 ```
 
 One notebook application. No notebook plugin stack. No nbv-specific configuration.
@@ -38,7 +38,7 @@ cargo install --path crates/nbv-cli
 
 ## Use
 
-`nbv <notebook.ipynb>` opens the notebook. Each cell is a box with its execution count on the
+`nvb <notebook.ipynb>` opens the notebook. Each cell is a box with its execution count on the
 left and its outputs underneath. nbv has two modes, shown in the header.
 
 **Navigation mode** (`NAV`) acts on whole cells:
@@ -98,7 +98,7 @@ where it would be.
 **Language servers.** Each cell is its own buffer, so a language server sees each cell as a
 separate file. Names defined in one cell show as undefined in the next. This is a known gap.
 
-**Troubleshooting.** `nbv --clean` starts Neovim without your configuration. If a problem goes
+**Troubleshooting.** `nvb --clean` starts Neovim without your configuration. If a problem goes
 away with `--clean`, its source is in your config or plugins.
 
 ## Images
@@ -159,7 +159,7 @@ ipykernel ruff`). CI runs everything on Linux and macOS.
 | `nbv-core` | Lossless document, cell identity, structural changes with undo, persistence, kernel state machine and transport. Depends on neither Neovim nor Ratatui (`scripts/check-core-deps.sh`). |
 | `nbv-nvim` | `NvimClient` boundary, redraw stream and grid model, cell buffer adapter, and the integration harness (`harness` feature). |
 | `nbv-tui` | Event loop, notebook layout, navigation mode, compositor, output layer, image backend, terminal and tmux detection. |
-| `nbv-cli` | The `nbv` binary, and the tmux end-to-end harness. |
+| `nbv-cli` | The `nvb` binary, and the tmux end-to-end harness. |
 | `lua/nbv` | The Lua companion loaded into the embedded Neovim. It holds no notebook state. |
 
 `tests/corpus/` holds deliberately ugly notebooks. Every one must survive open → save without

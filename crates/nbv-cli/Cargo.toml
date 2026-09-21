@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [[bin]]
-name = "nbv"
+name = "nvb"
 path = "src/main.rs"
 
 [dependencies]
