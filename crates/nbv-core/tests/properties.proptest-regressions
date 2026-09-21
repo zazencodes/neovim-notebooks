@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fe2cfb2a9c3cb6027915f9cf04bd15e80eafc7ee22def8fa1ae2f260037befa6 # shrinks to name = "non-python-kernel.ipynb", ops = [Replace { at: 5820646468204165752, len: 2, lines: [Copy(2241076326136593502), Copy(533882007912144331)] }, Duplicate { at: 1781381511651168674, len: 1, to: 0 }, Insert { at: 1722927718739290630, lines: [Text("#"), Bare(0), Unknown(0, 0)] }, Delete { at: 3900971002378044191, len: 1 }, Duplicate { at: 15091053682869590729, len: 6, to: 1092701527167613346 }, Replace { at: 6171812395106629, len: 3, lines: [Bare(0), Text("")] }, Insert { at: 0, lines: [Bare(0)] }, Duplicate { at: 3148099420434185185, len: 4, to: 2962352717760282158 }, Delete { at: 1177908061823235718, len: 1 }, Replace { at: 15133591751759156027, len: 1, lines: [Text(""), Bare(1)] }, Move { at: 1499229858098437367, len: 6, to: 109047154054720577 }, Replace { at: 0, len: 1, lines: [Text("="), Bare(0), Bare(0)] }, Undo { back: 1 }, Replace { at: 14181811298068099035, len: 2, lines: [Seen(0, 11420303977732795006)] }, Insert { at: 0, lines: [] }, Undo { back: 2 }]
+cc 4ba8e1f36a3a212cd3231d3c1b8c30e08c312e1aa6cb077838b375c6415f4622 # shrinks to name = "ids-missing-duplicate-invalid.ipynb", ops = [Replace { at: 13235755027422630127, len: 1, lines: [Bare(0)] }, Replace { at: 27640873227820890, len: 1, lines: [] }, Insert { at: 0, lines: [Seen(1, 1660595951657419272)] }, Insert { at: 0, lines: [] }]
+cc c456cd05f8ccfbc107f04ef2b575000b4e5e2a44a808a9d4fa21c86277201c65 # shrinks to name = "malformed-metadata.ipynb", ops = [Replace { at: 8450467712456929153, len: 3, lines: [Text("")] }, Duplicate { at: 5469221855783664111, len: 1, to: 2463203180302221030 }, Rewrite { suffix: "#" }]
