@@ -85,6 +85,8 @@ pub struct Notebook {
     live: HashMap<CellKey, Cell>,
     tombstones: HashMap<CellKey, Cell>,
     minter: KeyMinter,
+    /// Keys minted for cells a structural command is inserting, adopted when they appear.
+    pending: HashSet<CellKey>,
     adapter: PythonProjection,
     mirror: Vec<String>,
     layout: Vec<CellSpan>,
@@ -158,6 +160,7 @@ impl Notebook {
             live: keys.into_iter().zip(cells).collect(),
             tombstones: HashMap::new(),
             minter,
+            pending: HashSet::new(),
             adapter: PythonProjection,
             mirror: vec![],
             layout: vec![],
@@ -222,7 +225,9 @@ impl Notebook {
 
     /// Mints a key for a cell a structural command is about to insert (§7.5).
     pub fn mint_key(&mut self) -> CellKey {
-        self.minter.mint()
+        let key = self.minter.mint();
+        self.pending.insert(key.clone());
+        key
     }
 
     /// The projected text of the whole document (§7.1).
@@ -319,7 +324,7 @@ impl Notebook {
                 continue;
             }
             if let Some(k) = &marker.key
-                && (self.live.contains_key(k) || self.tombstones.contains_key(k))
+                && (self.live.contains_key(k) || self.tombstones.contains_key(k) || self.pending.contains(k))
                 && !taken.contains(k)
             {
                 taken.insert(k.clone());
@@ -351,28 +356,35 @@ impl Notebook {
             spans.push(CellSpan { key, kind: marker.kind, marker: Some(*line), body: line + 1, end });
         }
 
+        for s in &spans {
+            self.pending.remove(&s.key);
+        }
         let changed = self.adopt(&spans);
         self.mutated |= changed;
 
-        let mut normalise = Vec::new();
-        for (span, (line, marker)) in spans.iter().rev().zip(markers.iter().rev()) {
-            if marker.key.as_ref() != Some(&span.key) {
-                normalise.push(LineEdit {
-                    first: *line,
+        self.layout = spans;
+        Ok(Reconciled { changed, normalise: self.pending_normalisation() })
+    }
+
+    /// Edits that make every marker show its assigned key and give a leading region its
+    /// marker (§7.3), computed against the current text. Ordered bottom-up.
+    pub fn pending_normalisation(&self) -> Vec<LineEdit> {
+        let mut edits = Vec::new();
+        for span in self.layout.iter().rev() {
+            let Some(line) = span.marker else { continue };
+            let shown = self.adapter.parse_marker(&self.mirror[line]).and_then(|m| m.key);
+            if shown.as_ref() != Some(&span.key) {
+                edits.push(LineEdit {
+                    first: line,
                     last: line + 1,
                     lines: vec![self.adapter.format_marker(span.kind, &span.key)],
                 });
             }
         }
-        if let Some(lead) = spans.first().filter(|s| s.marker.is_none()) {
-            normalise.push(LineEdit {
-                first: 0,
-                last: 0,
-                lines: vec![self.adapter.format_marker(CellKind::Code, &lead.key)],
-            });
+        if let Some(lead) = self.layout.first().filter(|s| s.marker.is_none()) {
+            edits.push(LineEdit { first: 0, last: 0, lines: vec![self.adapter.format_marker(CellKind::Code, &lead.key)] });
         }
-        self.layout = spans;
-        Ok(Reconciled { changed, normalise })
+        edits
     }
 
     /// Makes the document match `spans` over the current mirror. Returns whether it changed.

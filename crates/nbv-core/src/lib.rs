@@ -6,6 +6,7 @@ pub mod exec;
 pub mod kernel;
 pub mod key;
 pub mod notebook;
+pub mod structure;
 
 pub use adapter::{CellKind, LanguageProjection, Marker, PythonProjection};
 pub use document::{Cell, ExecState, Runtime};
