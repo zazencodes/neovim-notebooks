@@ -1,0 +1,4 @@
+/target
+/.tools
+/.venv
+.DS_Store
