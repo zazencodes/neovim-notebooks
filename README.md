@@ -88,7 +88,7 @@ selected one.
 
 **Saving.** `:w` from anywhere writes the `.ipynb` (and so do `:wq` and `:x`, as in any
 Neovim buffer), and only the `.ipynb`: nothing is written under the cell buffers' names. Format-on-save works per cell,
-because `BufWritePre` and `BufWritePost` fire around the commit, but write hooks see buffers,
+because `BufWritePre` and `BufWritePost` fire around the commit on every changed cell, from wherever you ran `:w`, but write hooks see buffers,
 not files. Running cells counts as a change, so `:q` asks you to save outputs (`:q!` discards
 them). A notebook changed on disk since it was loaded is not overwritten: `:w!` overwrites it,
 `:e!` reloads it. Opening and saving without edits loses nothing, and older (4.0–4.4)

@@ -439,6 +439,7 @@ impl App {
                     self.relayout = true;
                     self.draw = true;
                 }
+                EditorEvent::Rows => self.relayout = true,
                 EditorEvent::Reloaded => {
                     self.views.clear();
                     self.mode = Mode::Nav;
@@ -1052,7 +1053,9 @@ impl App {
         self.views.get(key)
     }
 
-    /// The document laid out for `g`: every cell's editor lines and output rows.
+    /// The document laid out for `g`: every cell's editor rows and output rows. A cell has the
+    /// display rows Neovim measured in its window; one Neovim has not yet shown at this width
+    /// has one row per line.
     fn layout(&mut self, g: &Geometry) -> Layout {
         let width = g.inner_x().1;
         let cells: Vec<(CellKey, CellKind, usize)> = self
@@ -1061,7 +1064,8 @@ impl App {
             .iter()
             .filter_map(|k| {
                 let c = self.nb.cell(k)?;
-                Some((k.clone(), c.kind(), c.source().split('\n').count()))
+                let rows = self.editor.rows(k, width).unwrap_or_else(|| c.source().split('\n').count());
+                Some((k.clone(), c.kind(), rows))
             })
             .collect();
         let mut items = Vec::with_capacity(cells.len());
@@ -1354,17 +1358,17 @@ fn draw_block(
             buf.set_string(x, y, text, color.map_or(dim, |c| base.fg(c)));
         }
     }
-    for line in 0..b.lines {
-        if let Some(y) = screen(b.top + 1 + line) {
+    for row in 0..b.rows {
+        if let Some(y) = screen(b.top + 1 + row) {
             buf.set_string(bx, y, "│", border);
             buf.set_string(bx + bw - 1, y, "│", border);
-            if line == 0 && !d.gutter.is_empty() {
+            if row == 0 && !d.gutter.is_empty() {
                 let x = bx.saturating_sub(d.gutter.chars().count() as u16 + 1).max(g.viewport.col);
                 buf.set_string(x, y, &d.gutter, dim);
             }
         }
     }
-    if let Some(y) = screen(b.top + b.lines + 1) {
+    if let Some(y) = screen(b.top + b.rows + 1) {
         buf.set_string(bx, y, rule("╰", "╯"), border);
     }
     // Outputs: the visible rows of [first, first + outputs).

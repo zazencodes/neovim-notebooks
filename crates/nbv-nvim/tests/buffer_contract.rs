@@ -134,6 +134,24 @@ async fn format_on_save_formats_the_cell_before_commit() {
 }
 
 #[tokio::test]
+async fn write_hooks_run_on_modified_cells_when_writing_from_home() {
+    // A common config: trim trailing whitespace in whatever buffer is being written.
+    let init = r#"
+        vim.api.nvim_create_autocmd('BufWritePre', {
+          pattern = '*',
+          callback = function() vim.cmd([[%s/\s\+$//e]]) end,
+        })
+    "#;
+    let h = Harness::open("v4.5-outputs.ipynb", Options { init: Some(init.into()), ..Default::default() }).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    h.keys("Goy = 2   <Esc>").await;
+    h.leave().await;
+    h.cmd("w").await;
+    assert_eq!(h.saved()["cells"][1]["source"], json!(["import numpy as np\n", "np.arange(3)\n", "y = 2"]));
+}
+
+#[tokio::test]
 async fn quitting_a_cell_window_returns_home() {
     let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
     let code = h.key(1);
@@ -277,15 +295,57 @@ async fn home_stays_transparent_under_user_decorations() {
 }
 
 #[tokio::test]
-async fn windows_are_clipped_with_topline() {
+async fn windows_are_clipped_with_skip() {
     let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
     let code = h.key(1);
     // Only the second line of `import numpy as np / np.arange(3)` is visible.
-    let rect = nbv_nvim::EditorRect { key: code, row: 2, col: 4, width: 30, height: 1, topline: 2 };
+    let rect = nbv_nvim::EditorRect { key: code, row: 2, col: 4, width: 30, height: 1, skip: Some(1) };
     h.layout(None, &[rect]).await;
     let screen = h.screen();
     let row: String = screen.lines().nth(2).unwrap().to_string();
     assert!(row.contains("np.arange(3)"), "{screen}");
     assert!(!screen.contains("import numpy"), "{screen}");
     assert!(!screen.contains("## Results"), "windows of unlisted cells are closed\n{screen}");
+}
+
+#[tokio::test]
+async fn windows_wrap_and_start_on_whole_lines() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let md = h.key(0);
+    let long = format!("{}{}{}", "a".repeat(20), "b".repeat(20), "c".repeat(10));
+    h.state.lock().unwrap().nb.set_source(&md, &format!("short\n{long}\nend"));
+    // The window shows the rows of the cell from `skip` down to screen row 6.
+    let rect = |skip: usize| nbv_nvim::EditorRect {
+        key: md.clone(),
+        row: 2,
+        col: 4,
+        width: 20,
+        height: 5 - skip as u16,
+        skip: Some(skip),
+    };
+    h.layout(None, &[rect(0)]).await;
+    // `short`, the long line in three rows, `end`.
+    h.wait("rows measured", |s| s.editor.rows(&md, 20) == Some(5)).await;
+    let rows = || -> Vec<String> {
+        h.screen()
+            .lines()
+            .skip(2)
+            .take(5)
+            .map(|l| l.chars().skip(4).take(20).collect::<String>().trim().to_string())
+            .collect()
+    };
+    let (a, b, c) = ("a".repeat(20), "b".repeat(20), "c".repeat(10));
+    h.layout(None, &[rect(1)]).await;
+    assert_eq!(rows(), [a.as_str(), &b, &c, "end", ""]);
+    // Rows inside the long line: the window starts at the next line, lower down.
+    h.layout(None, &[rect(2)]).await;
+    assert_eq!(rows(), ["", "", "end", "", ""]);
+    h.layout(None, &[rect(3)]).await;
+    assert_eq!(rows(), ["", "end", "", "", ""]);
+    h.layout(None, &[rect(4)]).await;
+    assert_eq!(rows(), ["end", "", "", "", ""]);
+    // A window whose rows all fall inside the line is hidden.
+    let tail = nbv_nvim::EditorRect { height: 1, ..rect(2) };
+    h.layout(None, &[tail]).await;
+    assert_eq!(rows(), ["", "", "", "", ""]);
 }

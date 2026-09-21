@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!  [12] ╭──────────────────── ✓ 0.12s ╮
-//!       │import numpy as np            │   ← the cell's Neovim window
+//!       │import numpy as np            │   ← the cell's Neovim window, one row per display row
 //!       ╰──────────────────────────────╯
 //!        array([0, 1, 2])                  ← outputs, drawn by nbv
 //! ```
@@ -24,16 +24,16 @@ pub struct Block {
     pub kind: CellKind,
     /// First row: the top border.
     pub top: usize,
-    /// Editor lines (at least one).
-    pub lines: usize,
+    /// Editor rows (at least one): the cell's display rows, wrapped as Neovim wraps them.
+    pub rows: usize,
     /// Output rows.
     pub outputs: usize,
 }
 
 impl Block {
-    /// Top border, lines, bottom border.
+    /// Top border, rows, bottom border.
     pub fn box_height(&self) -> usize {
-        self.lines + 2
+        self.rows + 2
     }
 
     /// The box, the outputs, and a blank row after outputs.
@@ -79,12 +79,12 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Lays out cells given as `(key, kind, lines, output rows)`, in order.
+    /// Lays out cells given as `(key, kind, editor rows, output rows)`, in order.
     pub fn new(cells: impl IntoIterator<Item = (CellKey, CellKind, usize, usize)>) -> Layout {
         let mut blocks = vec![];
         let mut top = 0;
-        for (key, kind, lines, outputs) in cells {
-            let b = Block { key, kind, top, lines: lines.max(1), outputs };
+        for (key, kind, rows, outputs) in cells {
+            let b = Block { key, kind, top, rows: rows.max(1), outputs };
             top += b.height();
             blocks.push(b);
         }
@@ -119,7 +119,7 @@ impl Layout {
     }
 
     /// The editor windows for the blocks visible at `scroll`: each window shows the visible
-    /// rows of its cell, scrolled with `topline`. The active cell's window is left to scroll
+    /// rows of its cell, skipping the rows above. The active cell's window is left to scroll
     /// itself when it is clipped, so Neovim keeps its cursor in view.
     pub fn editors(&self, g: &Geometry, scroll: usize, active: Option<&CellKey>) -> Vec<EditorRect> {
         let area = g.area_height();
@@ -127,19 +127,19 @@ impl Layout {
         let mut out = vec![];
         for b in &self.blocks {
             let body = b.top + 1;
-            let (from, to) = (body.max(scroll), (body + b.lines).min(scroll + area));
+            let (from, to) = (body.max(scroll), (body + b.rows).min(scroll + area));
             if from >= to {
                 continue;
             }
             let height = to - from;
-            let topline = if Some(&b.key) == active { if height >= b.lines { 1 } else { 0 } } else { from - body + 1 };
+            let skip = if Some(&b.key) == active { (height >= b.rows).then_some(0) } else { Some(from - body) };
             out.push(EditorRect {
                 key: b.key.clone(),
                 row: g.area_top() + (from - scroll) as u16,
                 col,
                 width,
                 height: height as u16,
-                topline,
+                skip,
             });
         }
         out
@@ -178,24 +178,24 @@ mod tests {
         let tops: Vec<usize> = l.blocks.iter().map(|b| b.top).collect();
         assert_eq!(tops, [0, 3, 12]);
         assert_eq!(l.total, 24);
-        assert_eq!(Layout::new([(CellKey::new("e"), CellKind::Code, 0, 0)]).blocks[0].lines, 1);
+        assert_eq!(Layout::new([(CellKey::new("e"), CellKind::Code, 0, 0)]).blocks[0].rows, 1);
     }
 
     #[test]
-    fn editors_are_clipped_with_topline() {
+    fn editors_are_clipped_with_skip() {
         let l = layout();
         let g = geometry(11); // header + 10 rows
-        // Scrolled to 5: `b`'s body rows 4..7 show rows 5, 6 → lines 2..3 of b.
+        // Scrolled to 5: `b`'s body rows 4..7 show rows 5, 6 → rows 1..2 of b.
         let eds = l.editors(&g, 5, None);
         let b = eds.iter().find(|e| e.key.as_str() == "b").unwrap();
-        assert_eq!((b.row, b.height, b.topline), (1, 2, 2));
+        assert_eq!((b.row, b.height, b.skip), (1, 2, Some(1)));
         // `c`'s body starts at 13 → screen row 1 + 8 = 9; two rows fit.
         let c = eds.iter().find(|e| e.key.as_str() == "c").unwrap();
-        assert_eq!((c.row, c.height, c.topline), (9, 2, 1));
+        assert_eq!((c.row, c.height, c.skip), (9, 2, Some(0)));
         assert!(!eds.iter().any(|e| e.key.as_str() == "a"));
         // The active cell, clipped, scrolls itself.
         let eds = l.editors(&g, 5, Some(&CellKey::new("b")));
-        assert_eq!(eds.iter().find(|e| e.key.as_str() == "b").unwrap().topline, 0);
+        assert_eq!(eds.iter().find(|e| e.key.as_str() == "b").unwrap().skip, None);
     }
 
     #[test]

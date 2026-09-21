@@ -170,7 +170,7 @@ impl Harness {
                 .iter()
                 .map(|k| {
                     let lines = st.nb.cell(k).unwrap().source().split('\n').count() as u16;
-                    let r = EditorRect { key: k.clone(), row, col: 4, width: 40, height: lines, topline: 1 };
+                    let r = EditorRect { key: k.clone(), row, col: 4, width: 40, height: lines, skip: Some(0) };
                     row += lines + 1;
                     r
                 })

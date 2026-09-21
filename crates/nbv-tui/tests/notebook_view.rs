@@ -43,7 +43,7 @@ async fn windows_follow_the_layout_while_scrolling() {
                 let row = (r.row + dy) as usize;
                 covered[row] = true;
                 let shown: String = rows[row].chars().skip(r.col as usize).take(r.width as usize).collect();
-                let line = &sources[i][r.topline - 1 + dy as usize];
+                let line = &sources[i][r.skip.unwrap() + dy as usize];
                 assert!(
                     shown.starts_with(line.as_str()),
                     "scroll {scroll}: row {row} shows {shown:?}, not {line:?}\n{screen}"

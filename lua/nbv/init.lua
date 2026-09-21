@@ -140,7 +140,7 @@ end
 -- Cell windows take the user's global values instead.
 local CELL_OPTIONS = {
   'number', 'relativenumber', 'signcolumn', 'foldcolumn', 'statuscolumn', 'cursorcolumn',
-  'colorcolumn', 'list', 'spell', 'fillchars',
+  'colorcolumn', 'list', 'spell', 'fillchars', 'wrap', 'linebreak', 'breakindent', 'breakindentopt',
 }
 
 local function setup_cell_window(win, key)
@@ -149,31 +149,99 @@ local function setup_cell_window(win, key)
   end
   local user = api.nvim_get_option_value('winhighlight', { scope = 'global' })
   set_local(win, 'winhighlight', 'NormalFloat:Normal,FloatBorder:Normal' .. (user ~= '' and (',' .. user) or ''))
-  -- The window is exactly as tall as its cell has lines; wrapped lines would not fit.
-  set_local(win, 'wrap', false)
   vim.w[win].nbv_key = key
 end
 
---- The cursorline shows only in the cell being edited, if the user has it on.
-local function set_active(win, active)
-  set_local(win, 'cursorline', active and api.nvim_get_option_value('cursorline', { scope = 'global' }))
+--- Shows display rows from `skip` (from 0) of a cell in its window, placed at `cfg`. A window
+--- starts on a whole line, as Neovim draws one: when row `skip` falls inside a wrapped line,
+--- the window moves down to the next line, and the box shows the rows between as empty. With
+--- nothing left to show, it is hidden.
+local function show_from(win, skip, cfg)
+  local view = { topline = 1 }
+  if skip > 0 then
+    -- The first `skip` rows end in line `end_row`; the lines up to its end take `rows` rows.
+    local r = api.nvim_win_text_height(win, { max_height = skip })
+    local rows = api.nvim_win_text_height(win, { end_row = r.end_row }).all
+    view.topline = r.end_row + 2
+    local gap = rows - skip
+    if view.topline > api.nvim_buf_line_count(api.nvim_win_get_buf(win)) or gap >= cfg.height then
+      api.nvim_win_set_config(win, { hide = true })
+      return
+    end
+    if gap > 0 then
+      api.nvim_win_set_config(win, vim.tbl_extend('force', cfg, { row = cfg.row + gap, height = cfg.height - gap }))
+    end
+  end
+  -- Neovim scrolls a window back to its cursor, so a clipped window's cursor goes to its first
+  -- line. A window showing all its rows keeps its cursor.
+  if skip > 0 or api.nvim_win_text_height(win, {}).all > cfg.height then
+    view.lnum, view.col = view.topline, 0
+  end
+  api.nvim_win_call(win, function()
+    vim.fn.winrestview(view)
+  end)
 end
 
---- BufWriteCmd (§9.2): commit every cell buffer → canonical document → .ipynb.
+--- Reports the cell windows whose display rows (`nvim_win_text_height`) or width changed
+--- since their last report. Runs after every redraw, so it follows whatever changes a
+--- cell's height: its text, window options, folds, virtual lines.
+local function report_rows()
+  local rows = {}
+  for _, w in ipairs(api.nvim_list_wins()) do
+    local key = window_key(w)
+    if key then
+      local m = { key = key, width = api.nvim_win_get_width(w), rows = api.nvim_win_text_height(w, {}).all }
+      local last = vim.w[w].nbv_rows
+      if not (last and last.width == m.width and last.rows == m.rows) then
+        vim.w[w].nbv_rows = m
+        rows[#rows + 1] = m
+      end
+    end
+  end
+  if #rows > 0 then
+    notify('rows', rows)
+  end
+end
+
+--- The cursorline shows only in the cell being edited, if the user has it on. Only that
+--- cell has the user's 'scrolloff': the others show the rows nbv gives them (`show_from`).
+local function set_active(win, active)
+  set_local(win, 'cursorline', active and api.nvim_get_option_value('cursorline', { scope = 'global' }))
+  set_local(win, 'scrolloff', active and -1 or 0)
+end
+
+--- Fires an emulated write event on each of `bufs`, each current while its hooks run.
+local function write_event(event, bufs)
+  for _, b in ipairs(bufs) do
+    api.nvim_buf_call(b, function()
+      api.nvim_exec_autocmds(event, { buffer = b, modeline = false })
+    end)
+  end
+end
+
+--- BufWriteCmd (§9.2): commit every cell buffer → canonical document → .ipynb. The write
+--- events fire on the modified cell buffers, as for `:wall`, from whichever buffer `:w` ran in.
 local function on_write(ev)
   local buf = ev.buf
   local name = api.nvim_buf_get_name(buf)
   if ev.match ~= name and vim.fn.fnamemodify(ev.match, ':p') ~= name then
     fail('notebook buffers can only be written to their notebook (use :w)')
   end
-  api.nvim_exec_autocmds('BufWritePre', { buffer = buf, modeline = false })
+  local force = vim.v.cmdbang == 1
+  local modified = {}
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if vim.b[b].nbv_key and vim.bo[b].modified then
+      modified[#modified + 1] = b
+    end
+  end
+  write_event('BufWritePre', modified)
   local buffers = {}
   for _, b in ipairs(api.nvim_list_bufs()) do
     if vim.b[b].nbv_key then
       buffers[#buffers + 1] = { b, api.nvim_buf_get_lines(b, 0, -1, false) }
     end
   end
-  local res = vim.rpcrequest(M.chan, 'nbv_commit', vim.v.cmdbang == 1, buffers)
+  local res = vim.rpcrequest(M.chan, 'nbv_commit', force, buffers)
   if res.error then
     fail(res.error)
   end
@@ -182,7 +250,7 @@ local function on_write(ev)
       vim.bo[b].modified = false
     end
   end
-  api.nvim_exec_autocmds('BufWritePost', { buffer = buf, modeline = false })
+  write_event('BufWritePost', modified)
   api.nvim_echo({ { res.message } }, false, {})
 end
 
@@ -257,7 +325,9 @@ local function create_buffer(key, spec)
 end
 
 --- Places a window for every listed cell and closes the rest (§11.1). Each cell is
---- `{ key, row, col, width, height, topline, create? }`; `create` makes the cell's buffer.
+--- `{ key, row, col, width, height, skip?, create? }`: `skip` is the display rows of the
+--- cell above the window (`show_from`; without it, the window scrolls itself); `create`
+--- makes the cell's buffer.
 --- Ends with a redraw, then tells Rust the layout is on screen, so Rust always draws the
 --- notebook around the windows as Neovim has them.
 function M.layout(seq, spec)
@@ -315,10 +385,8 @@ function M.layout(seq, spec)
           wins[c.key] = w
         end
         set_active(w, active)
-        if c.topline > 0 then
-          api.nvim_win_call(w, function()
-            vim.fn.winrestview({ topline = c.topline })
-          end)
+        if c.skip then
+          show_from(w, c.skip, cfg)
         end
       end
     end
@@ -546,6 +614,20 @@ local function post()
     vim.o.laststatus = 3
   end
   setup_home_window(M.home_win)
+
+  -- Measure after each redraw, once Neovim has settled what it shows.
+  local measuring = false
+  api.nvim_set_decoration_provider(api.nvim_create_namespace('nbv_rows'), {
+    on_end = function()
+      if not measuring then
+        measuring = true
+        vim.schedule(function()
+          measuring = false
+          report_rows()
+        end)
+      end
+    end,
+  })
 
   local group = api.nvim_create_augroup('nbv_post', { clear = true })
   api.nvim_create_autocmd('WinEnter', { group = group, callback = report_focus })

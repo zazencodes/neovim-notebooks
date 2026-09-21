@@ -115,6 +115,8 @@ pub enum EditorEvent {
     Ready,
     /// A cell's source changed through its buffer.
     SourceChanged(CellKey),
+    /// Neovim measured the display rows of cells' windows (`Editor::rows`).
+    Rows,
     /// The document was reloaded from disk.
     Reloaded,
     /// The document was written.
@@ -139,8 +141,8 @@ pub enum EditorEvent {
     Exited,
 }
 
-/// Where a cell's editor window goes, in screen cells. `topline` 0 leaves the window's scroll
-/// position to Neovim.
+/// Where a cell's editor window goes, in screen cells. `skip` is the cell's display rows above
+/// the window; `None` leaves the window's scroll position to Neovim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorRect {
     pub key: CellKey,
@@ -148,7 +150,7 @@ pub struct EditorRect {
     pub col: u16,
     pub width: u16,
     pub height: u16,
-    pub topline: usize,
+    pub skip: Option<usize>,
 }
 
 /// A cell buffer as Rust mirrors it.
@@ -168,6 +170,9 @@ pub struct Editor {
     creating: HashMap<CellKey, CellKind>,
     /// The kernel's language, which code cells are edited in.
     language: Option<String>,
+    /// Each cell's display rows, as Neovim last measured them in its window, with the
+    /// window's width.
+    rows: HashMap<CellKey, (u16, usize)>,
 }
 
 pub fn field<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
@@ -216,6 +221,7 @@ impl Editor {
             by_key: HashMap::new(),
             creating: HashMap::new(),
             language: None,
+            rows: HashMap::new(),
         }
     }
 
@@ -237,6 +243,11 @@ impl Editor {
         self.by_key.get(key).copied()
     }
 
+    /// A cell's display rows in a window `width` wide, if Neovim has measured it at that width.
+    pub fn rows(&self, key: &CellKey, width: u16) -> Option<usize> {
+        self.rows.get(key).filter(|(w, _)| *w == width).map(|(_, r)| *r)
+    }
+
     /// Places the cell editor windows (§11.1). Buffers are created for cells that have none;
     /// windows for cells not listed are closed. `active` is the cell being edited.
     pub fn layout(&mut self, nb: &Notebook, seq: u64, active: Option<&CellKey>, rects: &[EditorRect]) {
@@ -248,8 +259,10 @@ impl Editor {
                 ("col", (r.col as u64).into()),
                 ("width", (r.width as u64).into()),
                 ("height", (r.height as u64).into()),
-                ("topline", (r.topline as u64).into()),
             ];
+            if let Some(skip) = r.skip {
+                entries.push(("skip", (skip as u64).into()));
+            }
             if !self.by_key.contains_key(&r.key)
                 && !self.creating.contains_key(&r.key)
                 && let Some(cell) = nb.cell(&r.key)
@@ -446,6 +459,15 @@ impl Editor {
                     out.push(EditorEvent::Viewport(v));
                 }
                 out
+            }
+            "rows" => {
+                for m in payload.as_array().into_iter().flatten() {
+                    let key = field(m, "key").and_then(Value::as_str).map(CellKey::new);
+                    let rows = field(m, "rows").and_then(Value::as_u64);
+                    let (Some(key), Some(rows)) = (key, rows) else { continue };
+                    self.rows.insert(key, (u16_field(m, "width"), rows as usize));
+                }
+                vec![EditorEvent::Rows]
             }
             "viewport" => viewport(&payload).map(EditorEvent::Viewport).into_iter().collect(),
             "theme" => vec![EditorEvent::Theme(theme(&payload))],
