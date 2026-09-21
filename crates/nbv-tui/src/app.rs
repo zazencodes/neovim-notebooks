@@ -26,12 +26,9 @@ use ratatui_image::sliced::SlicedProtocol;
 use rmpv::Value;
 use tokio::sync::mpsc;
 
-use crate::compose;
+use crate::{compose, decor};
 use crate::outputs::{self, Block, Images, OutputView};
 use crate::terminal::{self as term, Tmux};
-
-/// Placeholder highlight groups (§11.3).
-const SLOTS: usize = 64;
 
 pub struct Options {
     pub notebook: PathBuf,
@@ -163,7 +160,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         protocols: HashMap::new(),
         picker,
         tmux,
-        slots: vec![None; SLOTS],
+        slots: vec![None; decor::SLOTS],
         terminal,
         decorations: false,
         draw: true,
@@ -525,55 +522,34 @@ impl App {
     fn render_decorations(&mut self) {
         self.decorations = false;
         let Some(buf) = self.editor.buffer() else { return };
-        let layout = self.nb.layout().to_vec();
-        let last_line = self.nb.mirror().len().saturating_sub(1);
-        let mut outputs = vec![];
+        let keys: Vec<CellKey> = self.code_cells();
+        let heights: HashMap<CellKey, usize> =
+            keys.into_iter().map(|k| (k.clone(), self.view(&k).map_or(0, |v| v.height))).collect();
+        let placements = decor::placements(&self.nb, |k| heights.get(k).copied().unwrap_or(0));
         let mut marks = vec![];
-        let mut slots = vec![None; SLOTS];
-        let mut n = 0;
-        for (i, span) in layout.iter().enumerate() {
+        for span in self.nb.layout() {
             let Some(marker) = span.marker else { continue };
             match span.kind {
                 CellKind::Code => {
-                    if let Some(text) = self.status_text(&span.key) {
-                        marks.push(map(vec![
+                    if let Some((text, hl)) = self.status_text(&span.key) {
+                        marks.push(decor::map(vec![
                             ("line", (marker as u64).into()),
-                            ("text", Value::Array(vec![Value::Array(vec![text.0.into(), text.1.into()])])),
+                            ("text", Value::Array(vec![Value::Array(vec![text.into(), hl.into()])])),
                         ]));
                     }
-                    let height = self.view(&span.key).map_or(0, |v| v.height);
-                    if height == 0 {
-                        continue;
-                    }
-                    let slot = n % SLOTS;
-                    n += 1;
-                    slots[slot] = Some(span.key.clone());
-                    // Anchor above the next cell's marker, so appended lines push output down.
-                    let (line, above) = match layout.get(i + 1).and_then(|s| s.marker) {
-                        Some(next) => (next, true),
-                        None => (last_line, false),
-                    };
-                    outputs.push(map(vec![
-                        ("line", (line as u64).into()),
-                        ("above", above.into()),
-                        ("height", (height as u64).into()),
-                        ("slot", (slot as u64).into()),
-                    ]));
                 }
-                CellKind::Markdown => {
-                    marks.push(map(vec![
-                        ("line", (marker as u64).into()),
-                        ("text", Value::Array(vec![])),
-                        ("line_hl", "NbvMarkerMarkdown".into()),
-                    ]));
-                }
+                CellKind::Markdown => marks.push(decor::map(vec![
+                    ("line", (marker as u64).into()),
+                    ("text", Value::Array(vec![])),
+                    ("line_hl", "NbvMarkerMarkdown".into()),
+                ])),
                 CellKind::Raw => {}
             }
         }
-        self.slots = slots;
+        self.slots = decor::slot_map(&placements);
         self.editor.calls.lua(
             "require('nbv').render(...)",
-            vec![buf.into(), self.editor.tick().into(), Value::Array(outputs), Value::Array(marks)],
+            vec![buf.into(), self.editor.tick().into(), decor::to_value(&placements), Value::Array(marks)],
         );
         self.draw = true;
     }
@@ -685,8 +661,4 @@ impl App {
         spans.push(Span::raw(format!(" {} {icon} {state} ", self.kernel_name)));
         Line::from(spans)
     }
-}
-
-fn map(entries: Vec<(&str, Value)>) -> Value {
-    Value::Map(entries.into_iter().map(|(k, v)| (k.into(), v)).collect())
 }

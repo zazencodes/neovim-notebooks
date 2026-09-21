@@ -4,6 +4,7 @@
 pub mod ansi;
 pub mod app;
 pub mod compose;
+pub mod decor;
 pub mod keys;
 pub mod outputs;
 pub mod query;
