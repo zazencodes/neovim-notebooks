@@ -66,7 +66,7 @@ impl Session {
         let s = Session { socket, dir };
         let conf_path = s.dir.path().join("tmux.conf");
         std::fs::write(&conf_path, conf).unwrap();
-        s.tmux(&["-f", &conf_path.to_string_lossy(), "new-session", "-d", "-s", "t", "-x", "90", "-y", "30", &cmd]);
+        s.tmux(&["-f", &conf_path.to_string_lossy(), "new-session", "-d", "-s", "t", "-x", "120", "-y", "30", &cmd]);
         s.wait_for(" NAV");
         Some(s)
     }
@@ -207,7 +207,21 @@ fn run_advance_and_leave_cells() {
     s.keys(&["Escape"]);
     s.keys(&["Escape"]);
     s.wait_for(" NAV");
-    s.keys(&["k", "d", "d"]);
+    // o adds a cell and stays in navigation, so it repeats; Enter edits the selected one.
+    s.keys(&["o", "o"]);
+    let screen = s.screen();
+    assert_eq!(screen.matches('╭').count(), 5, "{screen}");
+    assert!(screen.contains(" NAV"), "{screen}");
+    s.keys(&["Enter"]);
+    s.wait_for(" EDIT");
+    // <C-c> leaves Insert mode, then <C-c> in Normal mode leaves the cell.
+    // Neovim drops typeahead on <C-c>, so each key waits for the one before it.
+    s.keys(&["i", "z = 4"]);
+    s.wait_for("z = 4");
+    s.keys(&["C-c"]);
+    s.keys(&["C-c"]);
+    s.wait_for(" NAV");
+    s.keys(&["k", "k", "k", "d", "d"]);
     let screen = s.wait_for("y = 3");
     assert!(!screen.contains("x + 1"), "dd deleted the selected cell\n{screen}");
     s.keys(&["u"]);
@@ -216,7 +230,16 @@ fn run_advance_and_leave_cells() {
     s.wait_for("NVB-EXITED-0");
     let sources: Vec<serde_json::Value> =
         s.saved()["cells"].as_array().unwrap().iter().map(|c| c["source"].clone()).collect();
-    assert_eq!(sources, [serde_json::json!("x = 1"), serde_json::json!("x + 1"), serde_json::json!(["y = 3"])]);
+    assert_eq!(
+        sources,
+        [
+            serde_json::json!("x = 1"),
+            serde_json::json!("x + 1"),
+            serde_json::json!(["y = 3"]),
+            serde_json::json!([]),
+            serde_json::json!(["z = 4"]),
+        ]
+    );
 }
 
 #[test]

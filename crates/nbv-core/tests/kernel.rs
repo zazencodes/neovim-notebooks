@@ -160,3 +160,22 @@ async fn death_is_reported() {
         }
     }
 }
+
+#[tokio::test]
+async fn offers_to_install_ipykernel_only_where_it_is_missing() {
+    let Some(python) = python() else { return };
+    assert_eq!(nbv_core::kernel::ipykernel_install(&command(&python)).await.unwrap(), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let venv = dir.path().join("bare");
+    let made = std::process::Command::new(&python).args(["-m", "venv", "--without-pip"]).arg(&venv).status().unwrap();
+    assert!(made.success());
+    let bare = venv.join("bin/python");
+    let bare_str = bare.to_string_lossy().into_owned();
+    // Without pip, uv installs it.
+    match nbv_core::kernel::ipykernel_install(&command(&bare)).await {
+        Ok(Some(argv)) => assert_eq!(argv[1..], ["pip", "install", "--python", bare_str.as_str(), "ipykernel"]),
+        Err(nbv_core::kernel::KernelError::Install(_)) => {} // no uv on PATH
+        other => panic!("unexpected {other:?}"),
+    }
+}

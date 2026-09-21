@@ -52,6 +52,8 @@ pub enum KernelError {
     Timeout(Duration, String),
     #[error("kernel connection: {0}")]
     Connection(String),
+    #[error("cannot install ipykernel: {0}")]
+    Install(String),
 }
 
 fn conn_err(e: impl std::fmt::Display) -> KernelError {
@@ -87,19 +89,45 @@ fn venv() -> Option<KernelCommand> {
     python.exists().then(|| launcher(python.to_string_lossy().into(), format!("Python ({venv})")))
 }
 
+/// The virtualenvs in the directory nbv was started from: each subdirectory with a
+/// `pyvenv.cfg`, by name. The active virtualenv is left to `venv`.
+fn local_venvs() -> Vec<KernelCommand> {
+    let Ok(cwd) = std::env::current_dir() else { return vec![] };
+    venvs_in(&cwd, std::env::var_os("VIRTUAL_ENV").map(PathBuf::from))
+}
+
+fn venvs_in(dir: &Path, active: Option<PathBuf>) -> Vec<KernelCommand> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|d| d.join("pyvenv.cfg").is_file() && d.join("bin/python").exists())
+        .filter(|d| active.as_ref() != Some(d))
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .map(|d| launcher(d.join("bin/python").to_string_lossy().into(), format!("Python ({})", d.display())))
+        .collect()
+}
+
+/// `name` from `PATH`, if it is there.
+fn on_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
 /// `python3` from `PATH`, if there is one.
 fn path_python() -> Option<KernelCommand> {
-    let paths = std::env::var_os("PATH")?;
-    let python = std::env::split_paths(&paths).map(|d| d.join("python3")).find(|p| p.is_file())?;
+    let python = on_path("python3")?;
     Some(launcher(python.to_string_lossy().into(), format!("Python 3 ({})", python.display())))
 }
 
-/// Chooses the kernel for a notebook, as Jupyter picks one automatically: for a Python
-/// notebook the active virtualenv first, then the notebook's kernelspec, then `python3` from
+/// Chooses the kernel for a notebook, as Jupyter picks one automatically, and preferring a
+/// project's own virtualenv: for a Python notebook the active virtualenv first, then a
+/// virtualenv in the working directory, then the notebook's kernelspec, then `python3` from
 /// `PATH`. The choice is shown to the user, who can change it (`choices`).
 pub async fn resolve(kernel_name: Option<&str>) -> Result<KernelCommand, KernelError> {
     let pythonish = kernel_name.is_none_or(|n| n.starts_with("python"));
-    if pythonish && let Some(k) = venv() {
+    if pythonish && let Some(k) = venv().or_else(|| local_venvs().into_iter().next()) {
         return Ok(k);
     }
     let name = kernel_name.unwrap_or("python3");
@@ -112,12 +140,69 @@ pub async fn resolve(kernel_name: Option<&str>) -> Result<KernelCommand, KernelE
     }
 }
 
-/// Every kernel the user can pick: the active virtualenv, each installed kernelspec, and
-/// `python3` from `PATH`.
+/// Every kernel the user can pick: the active virtualenv, the virtualenvs in the working
+/// directory, each installed kernelspec, and `python3` from `PATH`.
 pub async fn choices() -> Vec<KernelCommand> {
     let mut specs = zmq::list_kernelspecs().await;
     specs.sort_by(|a, b| a.kernel_name.cmp(&b.kernel_name));
-    venv().into_iter().chain(specs.into_iter().map(from_spec)).chain(path_python()).collect()
+    venv().into_iter().chain(local_venvs()).chain(specs.into_iter().map(from_spec)).chain(path_python()).collect()
+}
+
+/// The Python a kernel runs ipykernel with, if it is started as `<python> -m ipykernel_launcher`.
+fn ipykernel_python(cmd: &KernelCommand) -> Option<&str> {
+    match cmd.argv.as_slice() {
+        [python, m, module, ..] if m == "-m" && module == "ipykernel_launcher" => Some(python),
+        _ => None,
+    }
+}
+
+/// Whether `program args` exits successfully.
+async fn succeeds(program: &str, args: &[&str], env: &HashMap<String, String>) -> Result<bool, KernelError> {
+    let status = tokio::process::Command::new(program)
+        .args(args)
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(KernelError::Spawn)?;
+    Ok(status.success())
+}
+
+/// The command that installs ipykernel for `cmd`, if `cmd` runs ipykernel with a Python that
+/// lacks it: that Python's pip, or uv for a virtualenv without pip (as uv creates them).
+pub async fn ipykernel_install(cmd: &KernelCommand) -> Result<Option<Vec<String>>, KernelError> {
+    let Some(python) = ipykernel_python(cmd) else { return Ok(None) };
+    if succeeds(python, &["-c", "import ipykernel"], &cmd.env).await? {
+        return Ok(None);
+    }
+    if succeeds(python, &["-m", "pip", "--version"], &cmd.env).await? {
+        return Ok(Some([python, "-m", "pip", "install", "ipykernel"].map(String::from).to_vec()));
+    }
+    let uv = on_path("uv").ok_or_else(|| {
+        KernelError::Install(format!("ipykernel is missing, and there is neither pip in {python} nor uv on PATH"))
+    })?;
+    let uv = uv.to_string_lossy().into_owned();
+    Ok(Some([uv.as_str(), "pip", "install", "--python", python, "ipykernel"].map(String::from).to_vec()))
+}
+
+/// Runs a command from `ipykernel_install`. A failure carries the tail of its output.
+pub async fn install(argv: &[String]) -> Result<(), KernelError> {
+    let (program, args) = argv.split_first().expect("an install command is never empty");
+    let out = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| KernelError::Install(format!("cannot run {program}: {e}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    Err(KernelError::Install(format!("`{}` failed ({}):\n{tail}", argv.join(" "), out.status)))
 }
 
 /// A running kernel. Messages from every channel arrive on the sender given to `start`.
@@ -353,4 +438,27 @@ impl Drop for Kernel {
 /// Whether a message is an `input_request`, which the frontend answers via `reply_input`.
 pub fn is_input_request(msg: &JupyterMessage) -> bool {
     matches!(msg.content, JupyterMessageContent::InputRequest(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn venv(dir: &Path) {
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("pyvenv.cfg"), "").unwrap();
+        std::fs::write(dir.join("bin/python"), "").unwrap();
+    }
+
+    #[test]
+    fn finds_virtualenvs_in_a_directory_except_the_active_one() {
+        let dir = tempfile::tempdir().unwrap();
+        venv(&dir.path().join(".venv"));
+        venv(&dir.path().join("active"));
+        std::fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        let found = venvs_in(dir.path(), Some(dir.path().join("active")));
+        let pythons: Vec<&str> = found.iter().map(|k| k.argv[0].as_str()).collect();
+        assert_eq!(pythons, [dir.path().join(".venv/bin/python").to_string_lossy()]);
+        assert_eq!(ipykernel_python(&found[0]), Some(pythons[0]));
+    }
 }

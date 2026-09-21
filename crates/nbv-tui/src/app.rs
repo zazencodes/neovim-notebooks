@@ -49,7 +49,10 @@ pub struct Options {
 const PICK_KERNEL: &str = "pick one in the header: gg k l <CR>";
 
 enum KernelStart {
-    Ready(u64, Result<Kernel, KernelError>),
+    Ready(u64, Box<Result<Kernel, KernelError>>),
+    /// The kernel's Python lacks ipykernel; the command installs it.
+    MissingIpykernel(u64, Vec<String>),
+    Installed(u64, Result<(), KernelError>),
 }
 
 /// Where keys go.
@@ -84,6 +87,10 @@ struct App {
     kernel_error: Option<String>,
     /// What the kernel picker last offered, in the order shown.
     kernel_choices: Vec<KernelCommand>,
+    /// The ipykernel install offered for a kernel start, and that start's generation.
+    install: Option<(u64, Vec<String>)>,
+    /// Whether Neovim has finished starting, so prompts can be shown.
+    nvim_ready: bool,
     generation: u64,
     kernel_tx: mpsc::UnboundedSender<KernelMessage>,
     start_tx: mpsc::UnboundedSender<KernelStart>,
@@ -213,6 +220,8 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         kernel_cmd,
         kernel_error,
         kernel_choices: vec![],
+        install: None,
+        nvim_ready: false,
         generation: 0,
         kernel_tx,
         start_tx,
@@ -263,7 +272,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 _ => app.quit = true,
             },
             Some(msg) = kernel_rx.recv() => app.on_kernel(msg).await,
-            Some(KernelStart::Ready(generation, result)) = start_rx.recv() => app.on_kernel_ready(generation, result).await,
+            Some(start) = start_rx.recv() => app.on_kernel_start(start).await,
             Some(e) = err_rx.recv() => {
                 app.message = Some(e.to_string());
                 app.draw = true;
@@ -307,12 +316,75 @@ impl App {
             return;
         };
         self.kernel_error = None;
+        self.install = None;
         let generation = self.generation;
         let cwd = self.nb.path().parent().expect("the notebook path is absolute").to_path_buf();
         let (tx, start) = (self.kernel_tx.clone(), self.start_tx.clone());
         tokio::spawn(async move {
-            let result = Kernel::start(&cmd, &cwd, generation, tx).await;
-            let _ = start.send(KernelStart::Ready(generation, result));
+            let result = match kernel::ipykernel_install(&cmd).await {
+                Ok(Some(install)) => {
+                    let _ = start.send(KernelStart::MissingIpykernel(generation, install));
+                    return;
+                }
+                Ok(None) => Kernel::start(&cmd, &cwd, generation, tx).await,
+                Err(e) => Err(e),
+            };
+            let _ = start.send(KernelStart::Ready(generation, Box::new(result)));
+        });
+    }
+
+    fn kernel_name(&self) -> &str {
+        self.kernel_cmd.as_ref().map_or("kernel", |c| c.display_name.as_str())
+    }
+
+    async fn on_kernel_start(&mut self, start: KernelStart) {
+        match start {
+            KernelStart::Ready(generation, result) => self.on_kernel_ready(generation, *result).await,
+            KernelStart::MissingIpykernel(generation, install) if generation == self.generation => {
+                self.install = Some((generation, install));
+                self.offer_install();
+            }
+            KernelStart::Installed(generation, result) if generation == self.generation => {
+                match result {
+                    Ok(()) => {
+                        self.message = Some(format!("installed ipykernel for {}", self.kernel_name()));
+                        self.start_kernel();
+                    }
+                    Err(e) => self.kernel_failed(format!(
+                        "{} could not start (00 retries; {PICK_KERNEL}):\n{e}",
+                        self.kernel_name()
+                    )),
+                }
+                self.draw = true;
+            }
+            KernelStart::MissingIpykernel(..) | KernelStart::Installed(..) => {}
+        }
+    }
+
+    /// Asks whether to install ipykernel for the kernel being started, once Neovim can ask.
+    fn offer_install(&mut self) {
+        let Some((generation, install)) = self.install.as_ref().filter(|_| self.nvim_ready) else { return };
+        let prompt = format!("{} has no ipykernel. Install it with `{}`?", self.kernel_name(), install.join(" "));
+        self.editor.calls.lua("require('nbv').offer_install(...)", vec![prompt.into(), (*generation).into()]);
+    }
+
+    /// The user answered `offer_install`: install ipykernel, then start the kernel.
+    fn install_answered(&mut self, generation: u64, yes: bool) {
+        let Some((_, install)) = self.install.take_if(|(g, _)| *g == generation) else { return };
+        if !yes {
+            self.kernel_failed(format!(
+                "{} has no ipykernel (00 offers to install it; {PICK_KERNEL})",
+                self.kernel_name()
+            ));
+            self.draw = true;
+            return;
+        }
+        self.message = Some(format!("installing ipykernel: {}", install.join(" ")));
+        self.draw = true;
+        let start = self.start_tx.clone();
+        tokio::spawn(async move {
+            let result = kernel::install(&install).await;
+            let _ = start.send(KernelStart::Installed(generation, result));
         });
     }
 
@@ -345,8 +417,7 @@ impl App {
                 self.exec.connected();
             }
             Err(e) => {
-                let name = self.kernel_cmd.as_ref().map_or("kernel", |c| c.display_name.as_str());
-                self.kernel_failed(format!("{name} could not start (00 retries; {PICK_KERNEL}):\n{e}"));
+                self.kernel_failed(format!("{} could not start (00 retries; {PICK_KERNEL}):\n{e}", self.kernel_name()));
             }
         }
         self.draw = true;
@@ -356,7 +427,11 @@ impl App {
         for e in self.editor.handle(&mut self.nb, ev) {
             match e {
                 EditorEvent::Flush => self.draw = true,
-                EditorEvent::Ready => self.relayout = true,
+                EditorEvent::Ready => {
+                    self.nvim_ready = true;
+                    self.offer_install();
+                    self.relayout = true;
+                }
                 EditorEvent::SourceChanged(_) => {
                     // So `:x` in the home window writes it, as for any changed buffer.
                     self.mark_dirty();
@@ -641,16 +716,17 @@ impl App {
         if i + 1 < self.nb.order().len() {
             self.select(i + 1);
         } else {
-            self.open(i + 1);
+            let key = self.add(i + 1);
+            self.enter(key, true);
         }
     }
 
-    /// A new code cell at `index`, edited in insert mode.
-    fn open(&mut self, index: usize) {
+    /// Adds an empty code cell at `index` and selects it.
+    fn add(&mut self, index: usize) -> CellKey {
         let key = self.nb.new_cell(CellKind::Code, "");
         let at = self.nb.edit(vec![Change::Show { key: key.clone(), index }]);
         self.structure_changed(at);
-        self.enter(key, true);
+        key
     }
 
     /// Brings the buffers, the selection and the screen up to date after a structural change.
@@ -752,11 +828,14 @@ impl App {
             Action::HalfPageUp => self.scroll_by(-area / 2),
             Action::Edit => match key {
                 Some(k) => self.enter(k, false),
-                None => self.open(0),
+                None => {
+                    let key = self.add(0);
+                    self.enter(key, true);
+                }
             },
             Action::Open { above } => {
                 let at = if len == 0 || above { self.selected.min(len) } else { self.selected + 1 };
-                self.open(at);
+                self.add(at);
             }
             Action::Delete => {
                 if let Some(k) = key {
@@ -944,6 +1023,12 @@ impl App {
                 self.last_sent = None;
                 self.relayout = true;
                 self.restart().await;
+            }
+            "install_ipykernel" => {
+                let generation =
+                    field(args, "generation").and_then(Value::as_u64).expect("the prompt sends a generation");
+                let yes = field(args, "install").and_then(Value::as_bool).expect("the prompt sends an answer");
+                self.install_answered(generation, yes);
             }
             "input" => {
                 let value = field(args, "value").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1169,13 +1254,7 @@ impl App {
                 let v = g.viewport;
                 if v.row < area.height {
                     let width = v.width.min(area.width.saturating_sub(v.col));
-                    // The hint keeps its place at the right end; the header's text gives way.
-                    let hint = hint.filter(|h| h.width() < width as usize);
-                    let hint_width = hint.as_ref().map_or(0, |h| h.width() as u16);
-                    buf.set_line(v.col, v.row, &header, width - hint_width);
-                    if let Some(hint) = &hint {
-                        buf.set_line(v.col + width - hint_width, v.row, hint, hint_width);
-                    }
+                    draw_header(buf, v.col, v.row, width, &header, hint.as_ref());
                 }
                 if let Some(hint) = &empty_hint {
                     buf.set_line(g.inner_x().0, g.area_top(), hint, g.inner_x().1);
@@ -1302,5 +1381,69 @@ fn draw_block(
             offset: from - first,
         };
         compose::draw_output(buf, &region, view, base, protocols);
+    }
+}
+
+/// Draws the header row: the notebook name, mode and kernel state at the left, and the hint at the right.
+/// When the screen is narrow, the header (including the kernel) remains visible, and the hint gives way.
+fn draw_header(buf: &mut Buffer, col: u16, row: u16, width: u16, header: &Line, hint: Option<&Line>) {
+    let header_width = header.width() as u16;
+    buf.set_line(col, row, header, width);
+    if let Some(hint) = hint {
+        let hint_width = hint.width() as u16;
+        let remaining = width.saturating_sub(header_width);
+        if remaining > 0 {
+            if hint_width <= remaining {
+                buf.set_line(col + width - hint_width, row, hint, hint_width);
+            } else {
+                buf.set_line(col + header_width, row, hint, remaining);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+
+    use super::draw_header;
+
+    fn buffer_row_to_string(buf: &Buffer, row: u16, width: u16) -> String {
+        (0..width).map(|x| buf[(x, row)].symbol()).collect()
+    }
+
+    #[test]
+    fn header_keeps_kernel_visible_when_screen_is_narrow() {
+        let header = Line::raw(" test.ipynb NAV python3 ○ idle ");
+        let hint = Line::raw(" ? help ");
+        let header_w = header.width() as u16; // 31
+
+        // 1. Wide screen: hint is right-aligned.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 1));
+        draw_header(&mut buf, 0, 0, 50, &header, Some(&hint));
+        let text = buffer_row_to_string(&buf, 0, 50);
+        assert!(text.starts_with(" test.ipynb NAV python3 ○ idle "));
+        assert!(text.ends_with(" ? help "));
+
+        // 2. Narrow screen: header + hint > width, but header <= width.
+        // Kernel remains visible; hint starts after header and gets cut off on the right.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 35, 1));
+        draw_header(&mut buf, 0, 0, 35, &header, Some(&hint));
+        let text = buffer_row_to_string(&buf, 0, 35);
+        assert_eq!(text, " test.ipynb NAV python3 ○ idle  ? h");
+
+        // 3. Exact width: header fits exactly, hint omitted.
+        let mut buf = Buffer::empty(Rect::new(0, 0, header_w, 1));
+        draw_header(&mut buf, 0, 0, header_w, &header, Some(&hint));
+        let text = buffer_row_to_string(&buf, 0, header_w);
+        assert_eq!(text, " test.ipynb NAV python3 ○ idle ");
+
+        // 4. Very narrow screen: header truncated, no hint.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        draw_header(&mut buf, 0, 0, 20, &header, Some(&hint));
+        let text = buffer_row_to_string(&buf, 0, 20);
+        assert_eq!(text, " test.ipynb NAV pyth");
     }
 }

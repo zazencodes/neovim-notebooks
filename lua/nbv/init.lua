@@ -237,12 +237,15 @@ local function create_buffer(key, spec)
   set_initial_text(buf, spec.lines)
   vim.b[buf].nbv_key = key
   intercept_io(buf)
-  -- The one way out of a cell: <Esc> in Normal mode, which otherwise does nothing. It also
-  -- clears search highlighting, the usual job of a user's own <Esc> mapping.
-  vim.keymap.set('n', '<Esc>', function()
-    vim.cmd.nohlsearch()
-    M.leave()
-  end, { buffer = buf, silent = true, desc = 'nbv: leave the cell' })
+  -- The way out of a cell: <Esc> or <C-c> in Normal mode, which otherwise do nothing. <C-c>
+  -- mirrors its Insert-mode job of going up a level. Leaving also clears search highlighting,
+  -- the usual job of a user's own <Esc> mapping.
+  for _, lhs in ipairs({ '<Esc>', '<C-c>' }) do
+    vim.keymap.set('n', lhs, function()
+      vim.cmd.nohlsearch()
+      M.leave()
+    end, { buffer = buf, silent = true, desc = 'nbv: leave the cell' })
+  end
   -- Running from inside the cell. As mappings, they apply after every edit typed before them.
   vim.keymap.set({ 'n', 'i' }, '<S-CR>', function()
     M.act('run_advance')
@@ -349,7 +352,7 @@ function M.enter(seq, key, insert)
 end
 
 --- Returns to the home window. Rust queues this as input, after `<C-\><C-n>`, with its
---- latest focus request; `<Esc>` in a cell calls it without one.
+--- latest focus request; `<Esc>` or `<C-c>` in a cell calls it without one.
 function M.leave(seq)
   M.focus_seq = seq or M.focus_seq
   if M.home_win and api.nvim_win_is_valid(M.home_win) and api.nvim_get_current_win() ~= M.home_win then
@@ -491,6 +494,15 @@ function M.help(sections)
   for _, key in ipairs({ 'q', '<Esc>', '?' }) do
     vim.keymap.set('n', key, close, { buffer = buf, nowait = true, silent = true, desc = 'nbv: close the key list' })
   end
+end
+
+--- Asks whether to install ipykernel for the kernel being started (`generation`).
+function M.offer_install(prompt, generation)
+  vim.schedule(function()
+    vim.ui.select({ 'Install', 'Do not install' }, { prompt = prompt }, function(choice)
+      notify('install_ipykernel', { generation = generation, install = choice == 'Install' })
+    end)
+  end)
 end
 
 --- Asks the user for a line on behalf of the kernel (`input()`), without blocking RPC.

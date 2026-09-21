@@ -4,7 +4,7 @@ Jupyter notebooks in a real Neovim. `nvb` is a Rust/Ratatui application that own
 embeds `nvim --embed` as its editing engine, and runs cells on an unmodified Jupyter kernel.
 The notebook is a list of distinct cells with their outputs below them. Move between cells
 with Vim keys, press `Enter` to edit one in your own Neovim (config, plugins, LSP, Treesitter),
-and press `Esc` in Normal mode to leave it. Outputs, images included, render inline.
+and press `Esc` or `Ctrl-C` in Normal mode to leave it. Outputs, images included, render inline.
 
 ```
 nvb analysis.ipynb
@@ -20,14 +20,19 @@ as amended by [`docs/specs/2026-09-21-nbv-cell-editors.md`](docs/specs/2026-09-2
 - **Neovim 0.12 or newer** on `PATH`, or passed with `--nvim` / `$NBV_NVIM`. nbv does not ship Neovim.
 - **A Jupyter kernel** for running cells. nbv picks one at startup, in order:
   1. the active virtualenv (`$VIRTUAL_ENV/bin/python -m ipykernel_launcher`), for Python notebooks;
-  2. the notebook's kernelspec (`metadata.kernelspec.name`) in the Jupyter data directories;
-  3. `python3 -m ipykernel_launcher` on `PATH`.
+  2. a virtualenv in the directory you start nbv from (such as `.venv`), for Python notebooks;
+  3. the notebook's kernelspec (`metadata.kernelspec.name`) in the Jupyter data directories;
+  4. `python3 -m ipykernel_launcher` on `PATH`.
 
   The header shows which kernel is in use. Selecting it there (see below) picks another from
-  the active virtualenv, every installed kernelspec and `python3` on `PATH`; choosing a
+  the active virtualenv, the virtualenvs in the working directory, every installed kernelspec
+  and `python3` on `PATH`; choosing a
   kernelspec saves it in the notebook. nbv remembers your pick for each notebook
   (`~/.local/state/nbv/kernels.json`) and starts with it next time, ahead of the order above. Code cells are edited in the kernel's language. Non-Python kernels are
   experimental (spec §4.3).
+
+  If the chosen Python lacks `ipykernel`, nbv offers to install it (with that Python's pip, or
+  `uv pip install` for a virtualenv without pip) before starting the kernel.
 - **tmux 3.3 or newer**, if you run nbv inside tmux (3.5 for `Shift+Enter` / `Ctrl+Enter`, see [tmux](#tmux)).
 
 ## Install
@@ -49,7 +54,7 @@ left and its outputs underneath. nbv has two modes, shown in the header.
 | `gg` `G` `{n}G` | First / last / nth cell |
 | `<C-d>` `<C-u>` | Scroll half a page |
 | `Enter` | Edit the cell |
-| `o` `O` | New code cell below / above, in insert mode |
+| `o` `O` | New code cell below / above, selected; repeat to add several |
 | `dd` `yy` `p` `P` | Delete / yank / paste below / paste above |
 | `u` `<C-r>` | Undo / redo a cell change (delete, move, type, join, paste…) |
 | `J` | Join the next cell onto this one |
@@ -69,8 +74,8 @@ goes back to the cells. `gg` and `G` always stay on cells.
 undo and text objects stop at the cell's edges. Your config applies as in any buffer: code
 cells are buffers of the notebook's language, markdown cells are `markdown` buffers.
 
-`<Esc>` in Normal mode leaves the cell (from Insert mode, `<Esc><Esc>`), and clears search
-highlighting. `Shift+Enter` runs the cell and moves to the next one; `Ctrl+Enter` runs it and
+`<Esc>` or `<C-c>` in Normal mode leaves the cell (from Insert mode, `<Esc><Esc>` or
+`<C-c><C-c>`), and clears search highlighting. `Shift+Enter` runs the cell and moves to the next one; `Ctrl+Enter` runs it and
 keeps you editing. Both work from Normal and Insert mode.
 
 `Shift+Enter` and `Ctrl+Enter` need a terminal that reports modifier keys: Kitty, Ghostty,
