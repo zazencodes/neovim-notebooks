@@ -83,40 +83,37 @@ impl Session {
         std::thread::sleep(Duration::from_millis(150));
     }
 
+    /// Waits until the screen satisfies `done`. A capture can land mid-redraw, so tests wait
+    /// for the state they expect instead of asserting on one capture.
+    fn wait_until(&self, what: &str, done: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let s = self.screen();
+            if done(&s) {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}\n{s}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The screen once it has stopped changing, for checks that must hold of a whole frame.
+    fn settled(&self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last = self.screen();
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let s = self.screen();
+            if s == last {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "the screen never settled\n{s}");
+            last = s;
+        }
+    }
+
     fn wait_for(&self, text: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let s = self.screen();
-            if s.contains(text) {
-                return s;
-            }
-            assert!(Instant::now() < deadline, "timed out waiting for {text:?}\n{s}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    fn wait_for_any(&self, chars: &[char]) -> String {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let s = self.screen();
-            if s.contains(chars) {
-                return s;
-            }
-            assert!(Instant::now() < deadline, "timed out waiting for {chars:?}\n{s}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    fn wait_for_gone(&self, text: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let s = self.screen();
-            if !s.contains(text) {
-                return s;
-            }
-            assert!(Instant::now() < deadline, "timed out waiting for {text:?} to go\n{s}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        self.wait_until(&format!("{text:?}"), |s| s.contains(text))
     }
 
     fn saved(&self) -> serde_json::Value {
@@ -149,21 +146,20 @@ fn run_image_input_edit_and_save_inside_tmux() {
         return;
     };
     // tmux here has no allow-passthrough, so images fall back to halfblocks.
-    let screen = s.wait_for("print(6 * 7)");
-    assert!(screen.contains("╭") && screen.contains("│print(6 * 7)"), "each cell is a box\n{screen}");
+    // Each cell is a box.
+    s.wait_until("boxed cells", |s| s.contains('╭') && s.contains("│print(6 * 7)"));
 
     s.keys(&[":NvbRunAll", "Enter"]);
-    let screen = s.wait_for("42");
-    assert!(screen.contains("[1]"), "{screen}");
     // The output sits below its cell's box, outside it.
-    let lines: Vec<&str> = screen.lines().collect();
-    let out = lines.iter().position(|l| l.trim() == "42").unwrap();
-    assert!(lines[out - 1].contains("╰"), "{screen}");
+    s.wait_until("42 below the first box", |s| {
+        let lines: Vec<&str> = s.lines().collect();
+        s.contains("[1]") && lines.iter().position(|l| l.trim() == "42").is_some_and(|i| lines[i - 1].contains('╰'))
+    });
     // The image is halfblock text, between its cell's box and the next cell's box.
-    let screen = s.wait_for_any(&['▀', '▄']);
-    let lines: Vec<&str> = screen.lines().collect();
-    let first_block = lines.iter().position(|l| l.contains(['▀', '▄'])).unwrap();
-    assert!(lines[first_block - 1].contains("╰"), "{screen}");
+    s.wait_until("an image below its box", |s| {
+        let lines: Vec<&str> = s.lines().collect();
+        lines.iter().position(|l| l.contains(['▀', '▄'])).is_some_and(|i| lines[i - 1].contains('╰'))
+    });
 
     // input() is answered through Neovim's prompt, from navigation mode.
     s.wait_for("name? ");
@@ -172,10 +168,10 @@ fn run_image_input_edit_and_save_inside_tmux() {
 
     // Scroll through the notebook: at every step the image rows are one contiguous block,
     // never drawn over a box.
-    let full = count_blocks(&s.screen());
+    let full = count_blocks(&s.settled());
     s.keys(&["g", "g"]);
     for _ in 0..14 {
-        let screen = s.screen();
+        let screen = s.settled();
         let lines: Vec<&str> = screen.lines().collect();
         let rows: Vec<usize> = (0..lines.len()).filter(|i| lines[*i].contains(['▀', '▄'])).collect();
         if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
@@ -213,8 +209,7 @@ fn run_advance_and_leave_cells() {
     s.keys(&["x"]);
     s.wait_for("[2]");
     // Past the last cell, a new one opens in insert mode.
-    let screen = s.wait_for(" EDIT");
-    assert_eq!(screen.matches('╭').count(), 3, "{screen}");
+    s.wait_until("a third cell, in edit", |s| s.contains(" EDIT") && s.matches('╭').count() == 3);
     s.keys(&["y = 3"]);
     // Esc leaves insert mode, then Esc in Normal mode leaves the cell.
     s.keys(&["Escape"]);
@@ -222,9 +217,7 @@ fn run_advance_and_leave_cells() {
     s.wait_for(" NAV");
     // o adds a cell and stays in navigation, so it repeats; Enter edits the selected one.
     s.keys(&["o", "o"]);
-    let screen = s.screen();
-    assert_eq!(screen.matches('╭').count(), 5, "{screen}");
-    assert!(screen.contains(" NAV"), "{screen}");
+    s.wait_until("five cells, in navigation", |s| s.contains(" NAV") && s.matches('╭').count() == 5);
     s.keys(&["Enter"]);
     s.wait_for(" EDIT");
     // <C-c> leaves Insert mode, then <C-c> in Normal mode leaves the cell.
@@ -235,8 +228,8 @@ fn run_advance_and_leave_cells() {
     s.keys(&["C-c"]);
     s.wait_for(" NAV");
     s.keys(&["k", "k", "k", "d", "d"]);
-    let screen = s.wait_for("y = 3");
-    assert!(!screen.contains("x + 1"), "dd deleted the selected cell\n{screen}");
+    // dd deletes the selected cell.
+    s.wait_until("x + 1 deleted", |s| s.contains("y = 3") && !s.contains("x + 1"));
     s.keys(&["u"]);
     s.wait_for("x + 1");
     s.keys(&[":wq", "Enter"]);
@@ -286,35 +279,32 @@ fn help_and_the_header() {
     // The way to the key list is always on screen, and ? opens it.
     s.wait_for("? help");
     s.keys(&["?"]);
-    let screen = s.wait_for("nbv keys");
-    assert!(screen.contains("set -s extended-keys-format csi-u"), "the fix heads the list\n{screen}");
-    assert!(screen.contains("Cells (NAV)"), "{screen}");
+    // The fix heads the list.
+    s.wait_until("the key list", |s| {
+        s.contains("nbv keys") && s.contains("set -s extended-keys-format csi-u") && s.contains("Cells (NAV)")
+    });
     s.keys(&["q"]);
-    s.wait_for(" NAV");
-    assert!(!s.screen().contains("nbv keys"));
+    s.wait_until("the key list closed", |s| s.contains(" NAV") && !s.contains("nbv keys"));
 
     // gg and G stay on cells; k past the first cell reaches the header, j comes back.
     s.keys(&["G", "g", "g"]);
-    assert!(!s.screen().contains("h l select"));
+    assert!(!s.settled().contains("h l select"));
     s.keys(&["k"]);
     s.wait_for("h l select");
     s.keys(&["j"]);
-    s.wait_for("? help");
-    assert!(!s.screen().contains("h l select"));
+    s.wait_until("the cells' hint", |s| s.contains("? help") && !s.contains("h l select"));
 
     // The kernel item opens a list moved through with motions; q cancels it.
     s.keys(&["k", "l", "Enter"]);
-    let screen = s.wait_for("<CR> picks · q cancels");
-    assert!(screen.contains("neovim-notebooks/.venv"), "the active virtualenv is offered\n{screen}");
+    // The active virtualenv is offered.
+    s.wait_until("the kernel list", |s| s.contains("<CR> picks · q cancels") && s.contains("neovim-notebooks/.venv"));
     s.keys(&["j", "k", "q"]);
-    s.wait_for(" NAV");
-    assert!(!s.screen().contains("<CR> picks"));
+    s.wait_until("the kernel list closed", |s| s.contains(" NAV") && !s.contains("<CR> picks"));
     // <CR> picks the kernel under the cursor, and nbv restarts onto it.
     s.keys(&["Enter"]);
     s.wait_for("<CR> picks");
     s.keys(&["Enter"]);
-    s.wait_for(" NAV");
-    assert!(!s.screen().contains("<CR> picks"));
+    s.wait_until("the kernel picked", |s| s.contains(" NAV") && !s.contains("<CR> picks"));
 
     // The file name item renames the notebook; later writes follow it.
     s.keys(&["h", "Enter"]);
@@ -349,19 +339,17 @@ fn shift_and_ctrl_enter_run_cells() {
     s.keys(&["C-Enter"]);
     s.wait_for("[2]");
     s.keys(&["C-Enter"]);
-    let screen = s.wait_for("[3]");
-    assert!(screen.contains("[1]") && !screen.contains("[4]"), "<C-CR> stayed on the second cell\n{screen}");
+    // <C-CR> stayed on the second cell.
+    s.wait_until("[3] on the second cell", |s| s.contains("[1]") && s.contains("[3]") && !s.contains("[4]"));
 
     // From inside a cell, in Insert mode: <C-CR> runs what was just typed and keeps editing.
     s.keys(&["Enter", "A", " + 40"]);
     s.keys(&["C-Enter"]);
-    let screen = s.wait_for("42");
-    assert!(screen.contains(" EDIT"), "{screen}");
+    s.wait_until("42, still editing", |s| s.contains("42") && s.contains(" EDIT"));
     // <S-CR> runs and moves on: past the last cell, into a new one.
     s.keys(&["S-Enter"]);
     s.wait_for("[5]");
-    let screen = s.wait_for(" EDIT");
-    assert_eq!(screen.matches('╭').count(), 3, "{screen}");
+    s.wait_until("a third cell, in edit", |s| s.contains(" EDIT") && s.matches('╭').count() == 3);
 }
 
 #[test]
@@ -372,9 +360,7 @@ fn survives_pane_splits_and_closes() {
     // Splitting shrinks nvb's pane before Neovim has resized; closing the new pane grows it back.
     s.tmux(&["split-window", "-d", "-v", "-t", "t", "sleep 60"]);
     s.tmux(&["split-window", "-d", "-h", "-t", "t", "sleep 60"]);
-    let screen = s.wait_for_gone("│f = 6");
-    assert!(screen.contains("│a = 1"), "{screen}");
+    s.wait_until("the first cell only", |s| s.contains("│a = 1") && !s.contains("│f = 6"));
     s.tmux(&["kill-pane", "-a", "-t", "t"]);
-    let screen = s.wait_for("│f = 6");
-    assert_eq!(screen.matches('╭').count(), 6, "{screen}");
+    s.wait_until("all six cells", |s| s.contains("│f = 6") && s.matches('╭').count() == 6);
 }
