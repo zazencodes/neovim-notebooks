@@ -25,6 +25,9 @@ pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
 }
 
+/// How long Neovim has to answer a request, or a wait to come true.
+const ANSWER: Duration = Duration::from_secs(10);
+
 pub struct State {
     pub nb: Notebook,
     pub editor: Editor,
@@ -132,7 +135,10 @@ impl Harness {
                 }
             }
         });
-        editor::handshake(&client, &notebook, opts.width, opts.height).await.unwrap();
+        tokio::time::timeout(ANSWER, editor::handshake(&client, &notebook, opts.width, opts.height))
+            .await
+            .expect("Neovim did not answer the handshake")
+            .unwrap();
         let h = Harness { client, state, notebook, seq: Mutex::new(0), _dir: dir };
         h.wait("startup", |s| s.ready && s.viewport.is_some()).await;
         h.settle().await;
@@ -141,15 +147,28 @@ impl Harness {
 
     /// Waits until `pred` holds, failing with the screen after 10 s.
     pub async fn wait(&self, what: &str, pred: impl Fn(&State) -> bool) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + ANSWER;
         loop {
             if pred(&self.state.lock().unwrap()) {
                 return;
             }
             if tokio::time::Instant::now() > deadline {
-                panic!("timed out waiting for {what}\n{}", self.screen());
+                let errors = self.state.lock().unwrap().errors.clone();
+                let messages =
+                    tokio::time::timeout(ANSWER, self.client.exec_lua("return vim.fn.execute('messages')", vec![]))
+                        .await;
+                panic!("timed out waiting for {what}\nerrors: {errors:?}\nmessages: {messages:?}\n{}", self.screen());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Awaits Neovim's answer to a request, failing with the screen after 10 s: a Neovim
+    /// stuck at a prompt would otherwise hang the test forever.
+    async fn answer<T>(&self, what: &str, request: impl std::future::Future<Output = T>) -> T {
+        match tokio::time::timeout(ANSWER, request).await {
+            Ok(v) => v,
+            Err(_) => panic!("Neovim did not answer {what:?}\n{}", self.screen()),
         }
     }
 
@@ -188,6 +207,8 @@ impl Harness {
             editor.layout(nb, seq, active, rects);
         }
         self.wait("layout", |s| s.layouts_done >= seq).await;
+        let errors = self.state.lock().unwrap().errors.clone();
+        assert!(errors.is_empty(), "layout failed: {errors:?}");
         self.settle().await;
     }
 
@@ -216,7 +237,7 @@ impl Harness {
     }
 
     pub async fn resize(&self, width: usize, height: usize) {
-        self.client.resize(width, height).await.unwrap();
+        self.answer("resize", self.client.resize(width, height)).await.unwrap();
         self.settle().await;
     }
 
@@ -224,30 +245,34 @@ impl Harness {
     pub async fn settle(&self) {
         for _ in 0..3 {
             // A round trip through the same channel orders after all earlier requests.
-            let _ = self.client.request("nvim_eval", vec!["1".into()]).await;
+            let _ = self.answer("settle", self.client.request("nvim_eval", vec!["1".into()])).await;
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     }
 
     pub async fn keys(&self, keys: &str) {
-        self.client.input(keys).await.unwrap();
+        self.answer(keys, self.client.input(keys)).await.unwrap();
         self.settle().await;
     }
 
     pub async fn cmd(&self, cmd: &str) {
-        self.client.request("nvim_command", vec![cmd.into()]).await.unwrap();
+        self.answer(cmd, self.client.request("nvim_command", vec![cmd.into()])).await.unwrap();
         self.settle().await;
     }
 
     /// Runs an Ex command, returning Neovim's error message if it failed.
     pub async fn try_cmd(&self, cmd: &str) -> Result<(), String> {
-        let r = self.client.request("nvim_command", vec![cmd.into()]).await.map(|_| ()).map_err(|e| e.to_string());
+        let r = self
+            .answer(cmd, self.client.request("nvim_command", vec![cmd.into()]))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
         self.settle().await;
         r
     }
 
     pub async fn lua(&self, code: &str) -> Value {
-        self.client.exec_lua(code, vec![]).await.unwrap()
+        self.answer(code, self.client.exec_lua(code, vec![])).await.unwrap()
     }
 
     pub fn screen(&self) -> String {
