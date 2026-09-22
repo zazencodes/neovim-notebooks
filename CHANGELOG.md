@@ -5,6 +5,8 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+## 0.1.0 - 2026-09-22
+
 First public release.
 
 ### Added
