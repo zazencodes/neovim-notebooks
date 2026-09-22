@@ -42,7 +42,7 @@ One notebook application. No notebook plugin stack. No nbv-specific configuratio
 ## Install
 
 ```
-cargo install --git https://github.com/zazencodes/neovim-notebooks nbv-cli
+cargo install --git https://github.com/zazencodes/neovim-notebooks --tag v0.1.0 nbv-cli
 ```
 
 This installs the `nvb` binary. macOS and Linux are supported.
