@@ -20,6 +20,8 @@ Neovim Notebooks (`nvb`): a Rust/Ratatui TUI that edits Jupyter notebooks with a
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`.
 - Neovim, kernel and tmux tests need `.tools/nvim-macos-arm64` and a `.venv` with `ipykernel` and `ruff` (see README); without them they skip.
 - `cargo` lives in `~/.cargo/bin`, which may not be on PATH in non-login shells.
+- CI must be green. A test that fails only sometimes is a bug to find and fix at its cause; never rerun until it passes.
+- Tests wait for the state they expect, with a deadline, and never assert on one capture of a screen that may be mid-redraw (`wait_until`, `settled` in `crates/nbv-cli/tests/tmux.rs`; `Harness::wait`). Each harness Neovim has its own XDG directories.
 
 ## Changelog
 
