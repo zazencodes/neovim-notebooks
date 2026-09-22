@@ -17,7 +17,7 @@ and press `Esc` or `Ctrl-C` in Normal mode to leave it. Outputs, images included
 nvb analysis.ipynb
 ```
 
-One notebook application. No notebook plugin stack. No nbv-specific configuration.
+https://github.com/user-attachments/assets/05df38a2-bb52-4fdd-b78e-aa6ffe8e3304
 
 ## Requirements
 
