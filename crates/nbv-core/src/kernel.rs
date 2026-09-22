@@ -220,6 +220,8 @@ pub struct Kernel {
     tasks: Vec<JoinHandle<()>>,
 }
 
+static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 impl Kernel {
     /// Launches a kernel and waits until its iopub channel is live. `generation` tags death
     /// notices so a restarted session can ignore the previous process's.
@@ -229,8 +231,11 @@ impl Kernel {
         generation: u64,
         tx: UnboundedSender<KernelMessage>,
     ) -> Result<Kernel, KernelError> {
+        // Ports are free when picked, until the kernel binds them. Starting one kernel at a time
+        // and holding the ports until the spawn keep this process from giving them out twice.
+        let _one_at_a_time = STARTING.lock().await;
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let ports = zmq::peek_ports(ip, 5).await.map_err(conn_err)?;
+        let (ports, listeners) = zmq::peek_ports_with_listeners(ip, 5).await.map_err(conn_err)?;
         let key: String = (0..32).map(|_| format!("{:x}", rand::random::<u8>() & 0xf)).collect();
         let info = ConnectionInfo {
             ip: ip.to_string(),
@@ -256,6 +261,7 @@ impl Kernel {
         };
         let file = connection_file.to_string_lossy().into_owned();
         let args = cmd.argv[1..].iter().map(|a| if a == "{connection_file}" { file.clone() } else { a.clone() });
+        drop(listeners);
         let mut child = tokio::process::Command::new(program)
             .args(args)
             .envs(&cmd.env)

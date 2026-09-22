@@ -9,6 +9,8 @@ before 1.0, a breaking change bumps the minor version.
 
 - Opening cells no longer fails with `E303` when Neovim cannot create its swap directory:
   cell buffers never had swap files, but naming them briefly tried to make one.
+- Kernel ports stay reserved until the kernel is launched, narrowing the moment in which
+  another program could take them.
 
 ## 0.1.0 - 2026-09-22
 
