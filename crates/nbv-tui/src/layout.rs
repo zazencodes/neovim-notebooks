@@ -118,6 +118,14 @@ impl Layout {
         scroll.min(self.max_scroll(area))
     }
 
+    /// The scroll offset that puts block `i` in the middle of the area. A block taller than
+    /// the area shows its top.
+    pub fn center(&self, area: usize, i: usize) -> Option<usize> {
+        let b = self.blocks.get(i)?;
+        let above = area.saturating_sub(b.height()) / 2;
+        Some(b.top.saturating_sub(above).min(self.max_scroll(area)))
+    }
+
     /// The editor windows for the blocks visible at `scroll`: each window shows the visible
     /// rows of its cell, skipping the rows above. The active cell's window is left to scroll
     /// itself when it is clipped, so Neovim keeps its cursor in view.
@@ -206,6 +214,16 @@ mod tests {
         assert_eq!(l.reveal(20, 10, 0, false), 0);
         assert_eq!(l.reveal(0, 10, 2, true), 12, "a box taller than the area shows its top");
         assert_eq!(l.reveal(12, 10, 2, false), 12);
+    }
+
+    #[test]
+    fn center_puts_the_block_mid_area() {
+        let l = layout();
+        assert_eq!(l.center(13, 1), Some(1), "(13 - 9) / 2 = 2 rows above b's top at 3");
+        assert_eq!(l.center(10, 0), Some(0), "the first block cannot go lower");
+        assert_eq!(l.center(10, 2), Some(12), "a block taller than the area shows its top");
+        assert_eq!(l.center(20, 2), Some(4), "the last block stops at the largest offset");
+        assert_eq!(l.center(10, 3), None);
     }
 
     #[test]

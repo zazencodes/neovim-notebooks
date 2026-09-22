@@ -766,6 +766,15 @@ impl App {
         self.relayout = true;
     }
 
+    /// Scrolls the selected cell to the middle of the view.
+    fn center(&mut self) {
+        let Some(g) = self.geometry else { return };
+        if let Some(scroll) = self.layout(&g).center(g.area_height(), self.selected) {
+            self.scroll = scroll;
+            self.relayout = true;
+        }
+    }
+
     /// Gives a cell's window focus. The layout goes first, so the window exists and accepts
     /// focus when the request arrives.
     fn enter(&mut self, key: CellKey, insert: bool) {
@@ -827,6 +836,7 @@ impl App {
             Action::Last(Some(n)) => self.select(n.saturating_sub(1)),
             Action::HalfPageDown => self.scroll_by(area / 2),
             Action::HalfPageUp => self.scroll_by(-area / 2),
+            Action::Center => self.center(),
             Action::Edit => match key {
                 Some(k) => self.enter(k, false),
                 None => {

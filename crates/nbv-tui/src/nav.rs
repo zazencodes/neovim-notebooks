@@ -12,6 +12,8 @@ pub enum Action {
     Last(Option<usize>),
     HalfPageDown,
     HalfPageUp,
+    /// Scroll the selected cell to the middle of the view.
+    Center,
     /// Edit the selected cell.
     Edit,
     /// A new code cell below (or above), edited in insert mode.
@@ -64,6 +66,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("j k", "next / previous cell; counts work (3j)"),
             ("gg G {n}G", "first / last / nth cell"),
             ("<C-d> <C-u>", "scroll half a page"),
+            ("zz", "center the cell on screen"),
             ("<CR>", "edit the cell"),
             ("o O", "new code cell below / above"),
             ("dd yy", "delete / yank the cell"),
@@ -105,7 +108,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
 ];
 
 /// Keys that start a two-key chord.
-const PREFIXES: [&str; 8] = ["g", "d", "y", "t", "i", "0", "]", "["];
+const PREFIXES: [&str; 9] = ["g", "d", "y", "t", "i", "0", "]", "[", "z"];
 
 #[derive(Debug, Default)]
 pub struct Nav {
@@ -141,6 +144,7 @@ impl Nav {
             (None, "G") => Last(count),
             (None, "<C-d>") => HalfPageDown,
             (None, "<C-u>") => HalfPageUp,
+            (Some("z"), "z") => Center,
             (None, "<CR>") => Edit,
             (None, "o") => Open { above: false },
             (None, "O") => Open { above: true },
@@ -195,7 +199,7 @@ mod tests {
     #[test]
     fn chords() {
         assert_eq!(
-            feed(&["d", "d", "y", "y", "t", "m", "i", "i", "0", "0", "]", "e", "[", "e"]),
+            feed(&["d", "d", "y", "y", "t", "m", "i", "i", "0", "0", "]", "e", "[", "e", "z", "z"]),
             [
                 Action::Delete,
                 Action::Yank,
@@ -204,6 +208,7 @@ mod tests {
                 Action::Restart,
                 Action::MoveDown,
                 Action::MoveUp,
+                Action::Center,
             ]
         );
     }

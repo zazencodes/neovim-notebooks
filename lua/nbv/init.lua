@@ -203,11 +203,42 @@ local function report_rows()
   end
 end
 
+local function normal_mode()
+  return api.nvim_get_mode().mode:sub(1, 1) == 'n'
+end
+
+--- Cells not being edited show as in Normal mode (§4.3). Markdown plugins re-render a window
+--- by the current mode when it scrolls or resizes, so while Neovim is out of Normal mode those
+--- cells ignore WinScrolled and WinResized, and keep what the plugin drew in Normal mode.
+local function hold(win, active)
+  local value = (not active and not normal_mode()) and 'WinScrolled,WinResized' or ''
+  if vim.wo[win].eventignorewin ~= value then
+    set_local(win, 'eventignorewin', value)
+  end
+end
+
 --- The cursorline shows only in the cell being edited, if the user has it on. Only that
 --- cell has the user's 'scrolloff': the others show the rows nbv gives them (`show_from`).
 local function set_active(win, active)
   set_local(win, 'cursorline', active and api.nvim_get_option_value('cursorline', { scope = 'global' }))
   set_local(win, 'scrolloff', active and -1 or 0)
+  hold(win, active)
+end
+
+--- Opens a cell window opened out of Normal mode again, in Normal mode, so plugins that
+--- rendered it as it opened (BufWinEnter, FileType) render it again (§4.3). The buffer keeps
+--- its window options, as whenever a cell scrolls back into view.
+local function reopen(win)
+  local buf, key = api.nvim_win_get_buf(win), vim.w[win].nbv_key
+  local cfg = api.nvim_win_get_config(win)
+  local view = api.nvim_win_call(win, vim.fn.winsaveview)
+  api.nvim_win_close(win, true)
+  local w = api.nvim_open_win(buf, false, cfg)
+  setup_cell_window(w, key)
+  set_active(w, false)
+  api.nvim_win_call(w, function()
+    vim.fn.winrestview(view)
+  end)
 end
 
 --- Fires an emulated write event on each of `bufs`, each current while its hooks run.
@@ -382,6 +413,8 @@ function M.layout(seq, spec)
           cfg.border = 'none'
           w = api.nvim_open_win(buf, false, cfg)
           setup_cell_window(w, c.key)
+          -- Plugins render a window as it opens, by the current mode (§4.3).
+          vim.w[w].nbv_reopen = not active and not normal_mode()
           wins[c.key] = w
         end
         set_active(w, active)
@@ -631,6 +664,23 @@ local function post()
 
   local group = api.nvim_create_augroup('nbv_post', { clear = true })
   api.nvim_create_autocmd('WinEnter', { group = group, callback = report_focus })
+  api.nvim_create_autocmd('ModeChanged', {
+    group = group,
+    -- Reopening fires the window's events for plugins.
+    nested = true,
+    callback = function()
+      local current = api.nvim_get_current_win()
+      for _, w in ipairs(api.nvim_list_wins()) do
+        if window_key(w) then
+          if w ~= current and vim.w[w].nbv_reopen and normal_mode() then
+            reopen(w)
+          else
+            hold(w, w == current)
+          end
+        end
+      end
+    end,
+  })
   api.nvim_create_autocmd({ 'WinResized', 'VimResized' }, {
     group = group,
     callback = function()

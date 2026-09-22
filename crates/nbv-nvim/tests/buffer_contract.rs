@@ -349,3 +349,69 @@ async fn windows_wrap_and_start_on_whole_lines() {
     h.layout(None, &[tail]).await;
     assert_eq!(rows(), ["", "", "", "", ""]);
 }
+
+#[tokio::test]
+async fn cells_take_the_height_of_rendered_markdown() {
+    // Markdown plugins (render-markdown.nvim, markview.nvim) render with extmarks: virtual
+    // lines (a table's border) and concealed lines (a code fence). The cell's height follows.
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let md = h.key(0);
+    h.state.lock().unwrap().nb.set_source(&md, "| a |\n```\nx\n```");
+    h.layout(None, &[nbv_nvim::EditorRect { key: md.clone(), row: 2, col: 4, width: 20, height: 4, skip: Some(0) }])
+        .await;
+    h.wait("rows measured", |s| s.editor.rows(&md, 20) == Some(4)).await;
+    h.lua(
+        "local buf = vim.fn.bufnr('.e5f6a7b8.md$')
+         local ns = vim.api.nvim_create_namespace('render')
+         vim.api.nvim_buf_set_extmark(buf, ns, 0, 0, { virt_lines = { { { '└───┘' } } } })
+         vim.api.nvim_buf_set_extmark(buf, ns, 1, 0, { conceal_lines = '' })
+         vim.api.nvim_buf_set_extmark(buf, ns, 3, 0, { conceal_lines = '' })
+         vim.wo[vim.fn.bufwinid(buf)].conceallevel = 2",
+    )
+    .await;
+    h.wait("rendered rows measured", |s| s.editor.rows(&md, 20) == Some(3)).await;
+}
+
+/// A stand-in for a Markdown plugin that renders by mode, as render-markdown.nvim does: it
+/// renders a markdown buffer as its window opens, scrolls or resizes, and records the mode.
+const MODE_RENDERER: &str = r#"
+local function render(buf) vim.b[buf].rendered = vim.api.nvim_get_mode().mode end
+vim.api.nvim_create_autocmd('FileType', { pattern = 'markdown', callback = function(a)
+  render(a.buf)
+  vim.api.nvim_create_autocmd({ 'BufWinEnter', 'WinScrolled' }, { buffer = a.buf, callback = function() render(a.buf) end })
+end })
+vim.api.nvim_create_autocmd('WinResized', { callback = function()
+  for _, w in ipairs(vim.v.event.windows) do
+    local buf = vim.api.nvim_win_get_buf(w)
+    if vim.b[buf].rendered then render(buf) end
+  end
+end })
+"#;
+
+async fn rendered(h: &Harness) -> String {
+    let v = h.lua("return vim.b[vim.fn.bufnr('.e5f6a7b8.md$')].rendered").await;
+    v.as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn cells_not_being_edited_render_as_in_normal_mode() {
+    let h =
+        Harness::open("v4.5-outputs.ipynb", Options { init: Some(MODE_RENDERER.into()), ..Default::default() }).await;
+    let (md, code) = (h.key(0), h.key(1));
+    h.state.lock().unwrap().nb.set_source(&md, "# a\nb\nc");
+    let rects = h.layout_all(None).await;
+    assert_eq!(rendered(&h).await, "n");
+    h.enter(&code, true).await;
+    // Resized while another cell is in Insert mode: the markdown cell is not rendered again.
+    let mut resized = rects.clone();
+    resized[0].height = 2;
+    h.layout(Some(&code), &resized).await;
+    assert_eq!(rendered(&h).await, "n", "a resize out of Normal mode waits");
+    // Opened while another cell is in Insert mode: rendered then, and again in Normal mode.
+    h.layout(Some(&code), &rects[1..]).await;
+    h.layout(Some(&code), &rects).await;
+    assert_eq!(rendered(&h).await, "i");
+    h.keys("<Esc>").await;
+    assert_eq!(rendered(&h).await, "n", "reopened in Normal mode");
+    assert!(h.state.lock().unwrap().errors.is_empty());
+}

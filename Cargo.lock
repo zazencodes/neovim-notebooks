@@ -1575,6 +1575,7 @@ dependencies = [
  "rmpv",
  "serde_json",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui_image::FontSize;
 use serde_json::Value;
+use unicode_width::UnicodeWidthChar;
 
 use crate::ansi;
 
@@ -76,6 +77,38 @@ fn dim() -> Style {
 fn text_block(text: &str, base: Style) -> Vec<Line<'static>> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     ansi::lines(text, base)
+}
+
+/// Wraps lines at `width` columns, as Neovim's `wrap` does without `linebreak`.
+fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
+    let mut out = vec![];
+    for line in lines {
+        if line.width() <= width {
+            out.push(line);
+            continue;
+        }
+        let mut row: Vec<Span<'static>> = vec![];
+        let mut col = 0;
+        for span in &line.spans {
+            let mut run = String::new();
+            for ch in span.content.chars() {
+                let w = ch.width().unwrap_or(0);
+                if col + w > width && col > 0 {
+                    row.push(Span::styled(std::mem::take(&mut run), span.style));
+                    out.push(Line::from(std::mem::take(&mut row)).style(line.style));
+                    col = 0;
+                }
+                run.push(ch);
+                col += w;
+            }
+            if !run.is_empty() {
+                row.push(Span::styled(run, span.style));
+            }
+        }
+        out.push(Line::from(row).style(line.style));
+    }
+    out
 }
 
 /// Image size in cells: natural size, shrunk to fit `max_cols` × `MAX_IMAGE_ROWS`.
@@ -143,16 +176,21 @@ pub fn build(cell: &Cell, width: u16, font: FontSize, images: &mut Images) -> Ou
             other => blocks.push(Block::Text(vec![Line::styled(format!("[unsupported output: {other}]"), dim())])),
         }
     }
+    for b in &mut blocks {
+        if let Block::Text(lines) = b {
+            *lines = wrap(std::mem::take(lines), width);
+        }
+    }
     cap_text(&mut blocks);
     // Why the last run could not happen: after the outputs, never elided.
     if let Some(e) = &cell.runtime.error {
-        blocks.push(Block::Text(text_block(e, Style::default().fg(Color::LightRed))));
+        blocks.push(Block::Text(wrap(text_block(e, Style::default().fg(Color::LightRed)), width)));
     }
     let height = blocks.iter().map(Block::height).sum();
     OutputView { blocks, height, width }
 }
 
-/// Keeps the last `MAX_TEXT_ROWS` text rows of a cell, eliding the head: for long-running
+/// Keeps the last `MAX_TEXT_ROWS` text (display) rows of a cell, eliding the head: for long-running
 /// output the latest lines matter most.
 fn cap_text(blocks: &mut [Block]) {
     let total: usize = blocks.iter().filter(|b| matches!(b, Block::Text(_))).map(Block::height).sum();
@@ -168,7 +206,7 @@ fn cap_text(blocks: &mut [Block]) {
             lines.drain(..n);
             drop -= n;
             if !marked {
-                lines.insert(0, Line::from(Span::styled(format!("⋯ {hidden} earlier lines"), dim())));
+                lines.insert(0, Line::from(Span::styled(format!("⋯ {hidden} earlier rows"), dim())));
                 marked = true;
             }
             if drop == 0 {
@@ -201,13 +239,23 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_wrap_at_the_width() {
+        let c = cell(json!([{"output_type": "stream", "name": "stdout", "text": ["abcdefghij\n", "xy\n"]}]));
+        let v = build(&c, 4, FontSize::new(10, 20), &mut Images::default());
+        let Block::Text(lines) = &v.blocks[0] else { panic!() };
+        let rows: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, ["abcd", "efgh", "ij", "xy"]);
+        assert_eq!(v.height, 4);
+    }
+
+    #[test]
     fn long_output_keeps_the_tail() {
         let text: Vec<String> = (0..100).map(|i| format!("{i}\n")).collect();
         let c = cell(json!([{"output_type": "stream", "name": "stdout", "text": text}]));
         let v = build(&c, 80, FontSize::new(10, 20), &mut Images::default());
         assert_eq!(v.height, MAX_TEXT_ROWS);
         let Block::Text(lines) = &v.blocks[0] else { panic!() };
-        assert!(lines[0].spans[0].content.contains("61 earlier lines"));
+        assert!(lines[0].spans[0].content.contains("61 earlier rows"));
         assert_eq!(lines.last().unwrap().spans[0].content, "99");
     }
 

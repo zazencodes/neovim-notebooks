@@ -53,6 +53,7 @@ left and its outputs underneath. nbv has two modes, shown in the header.
 | `j` `k` | Next / previous cell; counts work (`3j`) |
 | `gg` `G` `{n}G` | First / last / nth cell |
 | `<C-d>` `<C-u>` | Scroll half a page |
+| `zz` | Center the cell on screen |
 | `Enter` | Edit the cell |
 | `o` `O` | New code cell below / above, selected; repeat to add several |
 | `dd` `yy` `p` `P` | Delete / yank / paste below / paste above |
@@ -73,6 +74,9 @@ goes back to the cells. `gg` and `G` always stay on cells.
 **Edit mode** (`EDIT`) is Neovim, in a window that holds only that cell. Motions, search,
 undo and text objects stop at the cell's edges. Your config applies as in any buffer: code
 cells are buffers of the notebook's language, markdown cells are `markdown` buffers.
+Markdown plugins such as [render-markdown.nvim](https://github.com/MeanderingProgrammer/render-markdown.nvim)
+or [markview.nvim](https://github.com/OXY2DEV/markview.nvim) render markdown cells, in navigation
+mode as well; without one, markdown cells show their highlighted source.
 
 `<Esc>` or `<C-c>` in Normal mode leaves the cell (from Insert mode, `<Esc><Esc>` or
 `<C-c><C-c>`), and clears search highlighting. `Shift+Enter` runs the cell and moves to the next one; `Ctrl+Enter` runs it and
