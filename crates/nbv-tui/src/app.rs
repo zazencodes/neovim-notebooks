@@ -10,7 +10,7 @@ use std::io::{Stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyEvent};
 use crossterm::{cursor, event, execute, terminal};
 use futures::StreamExt;
 use jupyter_protocol::JupyterMessage;
@@ -66,6 +66,18 @@ enum Mode {
     Other,
 }
 
+/// The terminal cursor after a focus request. Until Neovim has moved focus and drawn its
+/// cursor there, the grid still has the cursor of the window left behind; showing it would
+/// flash it there, and terminals that animate cursor moves would start from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusCursor {
+    /// Hidden until Neovim confirms the focus change.
+    AwaitFocus,
+    /// Hidden until Neovim's next grid flush.
+    AwaitFlush,
+    Shown,
+}
+
 /// What can be selected in the header, above the first cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeaderItem {
@@ -114,6 +126,7 @@ struct App {
     mode: Mode,
     /// Sequence number of the latest focus change nbv asked for (§10.2).
     focus_seq: u64,
+    focus_cursor: FocusCursor,
     selected: usize,
     /// The header item selected in navigation mode, instead of a cell.
     header: Option<HeaderItem>,
@@ -151,7 +164,6 @@ impl Drop for TerminalGuard {
         let mut out = std::io::stdout();
         let _ = execute!(
             out,
-            event::DisableMouseCapture,
             event::DisableBracketedPaste,
             event::DisableFocusChange,
             cursor::SetCursorStyle::DefaultUserShape,
@@ -169,13 +181,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
     terminal::enable_raw_mode()?;
     let mut out = std::io::stdout();
-    execute!(
-        out,
-        terminal::EnterAlternateScreen,
-        event::EnableMouseCapture,
-        event::EnableBracketedPaste,
-        event::EnableFocusChange
-    )?;
+    execute!(out, terminal::EnterAlternateScreen, event::EnableBracketedPaste, event::EnableFocusChange)?;
     let _guard = TerminalGuard { tmux: tmux.is_some() };
     // The capability query reads stdin, so it must run before the event stream starts.
     let picker = term::picker(tmux.as_ref());
@@ -241,6 +247,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         quit: false,
         mode: Mode::Nav,
         focus_seq: 0,
+        focus_cursor: FocusCursor::Shown,
         selected: 0,
         header: None,
         scroll: 0,
@@ -426,7 +433,12 @@ impl App {
     async fn on_nvim(&mut self, ev: NvimEvent) {
         for e in self.editor.handle(&mut self.nb, ev) {
             match e {
-                EditorEvent::Flush => self.draw = true,
+                EditorEvent::Flush => {
+                    if self.focus_cursor == FocusCursor::AwaitFlush {
+                        self.focus_cursor = FocusCursor::Shown;
+                    }
+                    self.draw = true;
+                }
                 EditorEvent::Ready => {
                     self.nvim_ready = true;
                     self.offer_install();
@@ -454,6 +466,9 @@ impl App {
                 EditorEvent::Focus { seq, focus } => {
                     // Focus changes that predate nbv's latest request are superseded by it.
                     if seq >= self.focus_seq {
+                        if self.focus_cursor == FocusCursor::AwaitFocus {
+                            self.focus_cursor = FocusCursor::AwaitFlush;
+                        }
                         let mode = match focus {
                             Focus::Home => Mode::Nav,
                             Focus::Cell(k) => {
@@ -503,7 +518,7 @@ impl App {
     async fn on_terminal(&mut self, ev: Event) {
         match ev {
             Event::Key(k) => self.on_key(k).await,
-            Event::Mouse(m) => self.on_mouse(m),
+            Event::Mouse(_) => {}
             Event::Paste(text) => {
                 if self.mode != Mode::Nav || self.forwarding() {
                     self.editor.calls.request("nvim_paste", vec![text.into(), true.into(), (-1).into()]);
@@ -553,56 +568,6 @@ impl App {
                 Some(action) => self.on_action(action).await,
                 None => self.draw = true,
             },
-        }
-    }
-
-    fn on_mouse(&mut self, m: MouseEvent) {
-        let forward = |app: &App| {
-            if let Some((button, action, modifier, row, col)) = crate::keys::mouse(m) {
-                let args = vec![
-                    button.into(),
-                    action.into(),
-                    modifier.into(),
-                    0u64.into(),
-                    (row as u64).into(),
-                    (col as u64).into(),
-                ];
-                app.editor.calls.request("nvim_input_mouse", args);
-            }
-        };
-        let (Some(g), Some((layout, scroll))) = (self.geometry, self.shown.as_ref()) else { return forward(self) };
-        let scroll = *scroll;
-        let hit = layout.at_row(&g, scroll, m.row).map(|i| layout.blocks[i].key.clone());
-        let in_editor = hit.as_ref().is_some_and(|key| {
-            layout.editors(&g, scroll, None).iter().any(|r| {
-                &r.key == key
-                    && (r.row..r.row + r.height).contains(&m.row)
-                    && (r.col..r.col + r.width).contains(&m.column)
-            })
-        });
-        match (m.kind, &self.mode) {
-            (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, Mode::Nav) => {
-                let rows = if m.kind == MouseEventKind::ScrollDown { 3 } else { -3 };
-                self.scroll_by(rows);
-            }
-            (MouseEventKind::Down(MouseButton::Left), mode) if hit.is_some() => {
-                let key = hit.expect("checked");
-                let editing = mode == &Mode::Edit(key.clone());
-                if in_editor {
-                    if !editing {
-                        self.enter(key, false);
-                    }
-                    // Positions the cursor, now that the window has focus.
-                    forward(self);
-                } else {
-                    if matches!(self.mode, Mode::Edit(_)) {
-                        self.leave();
-                    }
-                    self.select(self.nb.index_of(&key).unwrap_or(self.selected));
-                }
-            }
-            (_, Mode::Nav) if hit.is_some() => {}
-            _ => forward(self),
         }
     }
 
@@ -749,19 +714,15 @@ impl App {
         self.relayout = true;
     }
 
-    /// Scrolls the view by `rows`, keeping the selection on screen.
+    /// Scrolls the view by `rows` and selects the cell at the middle of the view.
     fn scroll_by(&mut self, rows: isize) {
         let Some(g) = self.geometry else { return };
         let layout = self.layout(&g);
         let area = g.area_height();
         self.scroll = self.scroll.saturating_add_signed(rows).min(layout.max_scroll(area));
-        let visible = |b: &Block| b.top + b.box_height() > self.scroll && b.top < self.scroll + area;
-        if !layout.blocks.get(self.selected).is_some_and(visible) {
-            let pick =
-                if rows > 0 { layout.blocks.iter().position(visible) } else { layout.blocks.iter().rposition(visible) };
-            if let Some(i) = pick {
-                self.selected = i;
-            }
+        if let Some(i) = layout.middle(self.scroll, area) {
+            self.header = None;
+            self.selected = i;
         }
         self.relayout = true;
     }
@@ -782,6 +743,7 @@ impl App {
         self.header = None;
         self.selected = self.nb.index_of(&key).unwrap_or(self.selected);
         self.mode = Mode::Edit(key.clone());
+        self.focus_cursor = FocusCursor::AwaitFocus;
         self.relayout();
         self.editor.enter(self.focus_seq, &key, insert);
     }
@@ -789,6 +751,7 @@ impl App {
     fn leave(&mut self) {
         self.focus_seq += 1;
         self.mode = Mode::Nav;
+        self.focus_cursor = FocusCursor::AwaitFocus;
         self.editor.leave(self.focus_seq);
         self.relayout = true;
     }
@@ -809,7 +772,12 @@ impl App {
                 // The header sits above the first cell.
                 Action::Down(n) => self.select(n - 1),
                 // Selecting a cell leaves the header; the rest need no cell.
-                Action::First | Action::Last(_) | Action::Help | Action::Cmdline => {
+                Action::First
+                | Action::Last(_)
+                | Action::HalfPageDown
+                | Action::HalfPageUp
+                | Action::Help
+                | Action::Cmdline => {
                     return self.on_cell_action(action).await;
                 }
                 _ => {}
@@ -1214,7 +1182,16 @@ impl App {
 
     fn draw(&mut self) -> anyhow::Result<()> {
         self.draw = false;
-        if self.editor.grid.width == 0 {
+        // After a terminal resize, Neovim's grid and the viewport nbv draws around keep the old
+        // size until Neovim has resized: wait for the frame they fit.
+        let size = self.terminal.size()?;
+        let grid_fits =
+            (self.editor.grid.width, self.editor.grid.height) == (size.width as usize, size.height as usize);
+        let viewport_fits = self.geometry.is_none_or(|g| {
+            let v = g.viewport;
+            v.col + v.width <= size.width && v.row + v.height <= size.height
+        });
+        if self.editor.grid.width == 0 || !grid_fits || !viewport_fits {
             return Ok(());
         }
         // Views and image protocols for the outputs about to be shown.
@@ -1257,7 +1234,9 @@ impl App {
                 Style::default().fg(self.color("dim").unwrap_or(Color::Reset)),
             )
         });
-        let show_cursor = !grid.busy && (self.mode != Mode::Nav || grid.mode_name != "normal");
+        let show_cursor = !grid.busy
+            && self.focus_cursor == FocusCursor::Shown
+            && (self.mode != Mode::Nav || grid.mode_name != "normal");
         let cursor = show_cursor.then_some(grid.cursor);
         let (geometry, shown, views, protocols) = (self.geometry, &self.shown, &self.views, &self.protocols);
         self.terminal.draw(|f| {

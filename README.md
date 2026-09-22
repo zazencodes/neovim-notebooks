@@ -1,5 +1,7 @@
 # Neovim Notebooks (`nvb`)
 
+`nvb` is **[n]eo[v]im note[b]ook**.
+
 Jupyter notebooks in a real Neovim. `nvb` is a Rust/Ratatui application that owns the terminal,
 embeds `nvim --embed` as its editing engine, and runs cells on an unmodified Jupyter kernel.
 The notebook is a list of distinct cells with their outputs below them. Move between cells
@@ -52,7 +54,7 @@ left and its outputs underneath. nbv has two modes, shown in the header.
 |---|---|
 | `j` `k` | Next / previous cell; counts work (`3j`) |
 | `gg` `G` `{n}G` | First / last / nth cell |
-| `<C-d>` `<C-u>` | Scroll half a page |
+| `<C-d>` `<C-u>` | Scroll half a page and select the cell in the middle of the screen |
 | `zz` | Center the cell on screen |
 | `Enter` | Edit the cell |
 | `o` `O` | New code cell below / above, selected; repeat to add several |
@@ -86,8 +88,8 @@ keeps you editing. Both work from Normal and Insert mode.
 WezTerm and iTerm2 do; macOS Terminal does not, and there they act as plain `Enter`. `x` and
 `r` work in every terminal.
 
-Actions without a key are Ex commands: `:NbvRunAll`, `:NbvRunAbove`, `:NbvSplit` (split the
-edited cell at the cursor), and `:NbvClearOutput[!]`. They act on the cell being edited, or the
+Actions without a key are Ex commands: `:NvbRunAll`, `:NvbRunAbove`, `:NvbSplit` (split the
+edited cell at the cursor), and `:NvbClearOutput[!]`. They act on the cell being edited, or the
 selected one.
 
 **Saving.** `:w` from anywhere writes the `.ipynb` (and so do `:wq` and `:x`, as in any

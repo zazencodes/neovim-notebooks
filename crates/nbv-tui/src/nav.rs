@@ -65,7 +65,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("j k", "next / previous cell; counts work (3j)"),
             ("gg G {n}G", "first / last / nth cell"),
-            ("<C-d> <C-u>", "scroll half a page"),
+            ("<C-d> <C-u>", "scroll half a page, selecting the middle cell"),
             ("zz", "center the cell on screen"),
             ("<CR>", "edit the cell"),
             ("o O", "new code cell below / above"),
@@ -99,10 +99,10 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         "Commands",
         &[
             (":w :wq :q!", "save / save and quit / quit without saving"),
-            (":NbvRunAll", "run every code cell"),
-            (":NbvRunAbove", "run the code cells above this one"),
-            (":NbvSplit", "split the edited cell at the cursor"),
-            (":NbvClearOutput[!]", "clear this cell's outputs (! for every cell)"),
+            (":NvbRunAll", "run every code cell"),
+            (":NvbRunAbove", "run the code cells above this one"),
+            (":NvbSplit", "split the edited cell at the cursor"),
+            (":NvbClearOutput[!]", "clear this cell's outputs (! for every cell)"),
         ],
     ),
 ];

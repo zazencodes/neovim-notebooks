@@ -442,7 +442,11 @@ function M.enter(seq, key, insert)
     if window_key(w) == key then
       api.nvim_win_set_config(w, { focusable = true })
       set_active(w, true)
-      api.nvim_set_current_win(w)
+      if api.nvim_get_current_win() == w then
+        report_focus()
+      else
+        api.nvim_set_current_win(w)
+      end
       if insert then
         vim.cmd.startinsert()
       end
@@ -616,9 +620,9 @@ end
 
 -- Only actions without a navigation key have commands.
 local commands = {
-  { 'NbvRunAll', 'run_all' },
-  { 'NbvRunAbove', 'run_above' },
-  { 'NbvSplit', 'split' },
+  { 'NvbRunAll', 'run_all' },
+  { 'NvbRunAbove', 'run_above' },
+  { 'NvbSplit', 'split' },
 }
 
 --- The first read of the home buffer, at startup. Later reads are reloads (intercept_io).
@@ -693,7 +697,7 @@ local function post()
       M.act(c[2])
     end, {})
   end
-  api.nvim_create_user_command('NbvClearOutput', function(o)
+  api.nvim_create_user_command('NvbClearOutput', function(o)
     M.act('clear_output', { all = o.bang })
   end, { bang = true })
 
@@ -706,6 +710,9 @@ function M.pre(chan, home_name, transparent_sp)
   M.home_name = home_name
   M.transparent_sp = transparent_sp
   vim.g.nbv = true
+  -- Set before the user's config too, so plugins that read it at setup (lualine's
+  -- `globalstatus`) draw a global statusline.
+  vim.o.laststatus = 3
   local group = api.nvim_create_augroup('nbv', { clear = true })
   api.nvim_create_autocmd('BufReadCmd', {
     group = group,

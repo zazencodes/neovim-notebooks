@@ -97,22 +97,6 @@ pub trait NvimClient: Clone + Send + Sync + 'static {
         }
     }
 
-    fn input_mouse(
-        &self,
-        button: &str,
-        action: &str,
-        modifier: &str,
-        row: usize,
-        col: usize,
-    ) -> impl Future<Output = Result<(), NvimError>> + Send {
-        let args =
-            vec![button.into(), action.into(), modifier.into(), 0u64.into(), (row as u64).into(), (col as u64).into()];
-        async move {
-            self.request("nvim_input_mouse", args).await?;
-            Ok(())
-        }
-    }
-
     /// Subscribes to buffer updates. With `send_buffer`, the first event carries every line.
     fn attach_buffer(&self, buf: i64, send_buffer: bool) -> impl Future<Output = Result<(), NvimError>> + Send {
         async move {

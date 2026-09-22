@@ -126,6 +126,13 @@ impl Layout {
         Some(b.top.saturating_sub(above).min(self.max_scroll(area)))
     }
 
+    /// The block at the middle row of the area at `scroll`. Past the end of the notebook, the
+    /// last block.
+    pub fn middle(&self, scroll: usize, area: usize) -> Option<usize> {
+        let row = (scroll + area / 2).min(self.total.checked_sub(1)?);
+        self.blocks.iter().position(|b| (b.top..b.top + b.height()).contains(&row))
+    }
+
     /// The editor windows for the blocks visible at `scroll`: each window shows the visible
     /// rows of its cell, skipping the rows above. The active cell's window is left to scroll
     /// itself when it is clipped, so Neovim keeps its cursor in view.
@@ -224,6 +231,16 @@ mod tests {
         assert_eq!(l.center(10, 2), Some(12), "a block taller than the area shows its top");
         assert_eq!(l.center(20, 2), Some(4), "the last block stops at the largest offset");
         assert_eq!(l.center(10, 3), None);
+    }
+
+    #[test]
+    fn middle_is_the_block_mid_area() {
+        let l = layout();
+        assert_eq!(l.middle(0, 10), Some(1), "row 5 is in b (3..12)");
+        assert_eq!(l.middle(8, 10), Some(2), "row 13 is in c (12..24)");
+        assert_eq!(l.middle(0, 4), Some(0), "row 2 is in a (0..3)");
+        assert_eq!(l.middle(0, 60), Some(2), "past the end, the last block");
+        assert_eq!(Layout::default().middle(0, 10), None);
     }
 
     #[test]

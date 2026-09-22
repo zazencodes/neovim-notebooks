@@ -1,6 +1,6 @@
 //! Terminal input → Neovim input (§10.2).
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 fn mods(m: KeyModifiers, with_shift: bool) -> String {
     let mut s = String::new();
@@ -62,27 +62,6 @@ pub fn encode(key: KeyEvent) -> Option<String> {
         KeyCode::F(n) => named(&format!("F{n}")),
         _ => return None,
     })
-}
-
-/// A mouse event as `nvim_input_mouse` arguments: (button, action, modifier, row, col).
-pub fn mouse(ev: MouseEvent) -> Option<(&'static str, &'static str, String, usize, usize)> {
-    let button = |b: MouseButton| match b {
-        MouseButton::Left => "left",
-        MouseButton::Right => "right",
-        MouseButton::Middle => "middle",
-    };
-    let (b, action) = match ev.kind {
-        MouseEventKind::Down(b) => (button(b), "press"),
-        MouseEventKind::Up(b) => (button(b), "release"),
-        MouseEventKind::Drag(b) => (button(b), "drag"),
-        MouseEventKind::Moved => ("move", ""),
-        MouseEventKind::ScrollUp => ("wheel", "up"),
-        MouseEventKind::ScrollDown => ("wheel", "down"),
-        MouseEventKind::ScrollLeft => ("wheel", "left"),
-        MouseEventKind::ScrollRight => ("wheel", "right"),
-    };
-    let m = mods(ev.modifiers, true);
-    Some((b, action, m.trim_end_matches('-').replace('-', ""), ev.row as usize, ev.column as usize))
 }
 
 #[cfg(test)]

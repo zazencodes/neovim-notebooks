@@ -106,6 +106,18 @@ impl Session {
         }
     }
 
+    fn wait_for_gone(&self, text: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let s = self.screen();
+            if !s.contains(text) {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {text:?} to go\n{s}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn saved(&self) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(self.dir.path().join("t.ipynb")).unwrap()).unwrap()
     }
@@ -139,7 +151,7 @@ fn run_image_input_edit_and_save_inside_tmux() {
     let screen = s.wait_for("print(6 * 7)");
     assert!(screen.contains("╭") && screen.contains("│print(6 * 7)"), "each cell is a box\n{screen}");
 
-    s.keys(&[":NbvRunAll", "Enter"]);
+    s.keys(&[":NvbRunAll", "Enter"]);
     let screen = s.wait_for("42");
     assert!(screen.contains("[1]"), "{screen}");
     // The output sits below its cell's box, outside it.
@@ -343,4 +355,19 @@ fn shift_and_ctrl_enter_run_cells() {
     s.wait_for("[5]");
     let screen = s.wait_for(" EDIT");
     assert_eq!(screen.matches('╭').count(), 3, "{screen}");
+}
+
+#[test]
+fn survives_pane_splits_and_closes() {
+    let cells = ["a = 1", "b = 2", "c = 3", "d = 4", "e = 5", "f = 6"];
+    let Some(s) = Session::start(&cells) else { return };
+    s.wait_for("f = 6");
+    // Splitting shrinks nvb's pane before Neovim has resized; closing the new pane grows it back.
+    s.tmux(&["split-window", "-d", "-v", "-t", "t", "sleep 60"]);
+    s.tmux(&["split-window", "-d", "-h", "-t", "t", "sleep 60"]);
+    let screen = s.wait_for_gone("│f = 6");
+    assert!(screen.contains("│a = 1"), "{screen}");
+    s.tmux(&["kill-pane", "-a", "-t", "t"]);
+    let screen = s.wait_for("│f = 6");
+    assert_eq!(screen.matches('╭').count(), 6, "{screen}");
 }
