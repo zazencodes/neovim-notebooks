@@ -329,9 +329,10 @@ end
 
 local function create_buffer(key, spec)
   local buf = api.nvim_create_buf(false, false)
+  -- Before the name, which would otherwise open a swap file (and its directory).
+  vim.bo[buf].swapfile = false
   -- An ordinary buffer (buftype=""), so LSP attaches (§9.1). Nothing is ever written to its name.
   api.nvim_buf_set_name(buf, spec.name)
-  vim.bo[buf].swapfile = false
   vim.bo[buf].bufhidden = 'hide'
   set_initial_text(buf, spec.lines)
   vim.b[buf].nbv_key = key

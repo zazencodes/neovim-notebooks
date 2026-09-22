@@ -5,6 +5,11 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- Opening cells no longer fails with `E303` when Neovim cannot create its swap directory:
+  cell buffers never had swap files, but naming them briefly tried to make one.
+
 ## 0.1.0 - 2026-09-22
 
 First public release.

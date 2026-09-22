@@ -50,6 +50,19 @@ async fn each_cell_is_its_own_ordinary_buffer() {
 }
 
 #[tokio::test]
+async fn cell_buffers_never_open_swap_files() {
+    // A swap directory that cannot be created fails any swap file with E303, as when parallel
+    // Neovims race to create a fresh ~/.local/state/nvim/swap.
+    let blocked = tempfile::NamedTempFile::new().unwrap();
+    let init = format!("vim.o.directory = '{}//'", blocked.path().display());
+    let h = Harness::open("v4.5-outputs.ipynb", Options { init: Some(init), ..Default::default() }).await;
+    h.layout_all(None).await;
+    h.enter(&h.key(1), true).await;
+    h.keys("x = 2").await;
+    assert!(h.state.lock().unwrap().errors.is_empty());
+}
+
+#[tokio::test]
 async fn motions_and_edits_stay_inside_the_cell() {
     let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
     let code = h.key(1);
