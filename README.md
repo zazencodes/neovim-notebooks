@@ -1,8 +1,13 @@
 # Neovim Notebooks (`nvb`)
 
-`nvb` is **[n]eo[v]im note[b]ook**.
+Jupyter notebooks in a real Neovim.
 
-Jupyter notebooks in a real Neovim. `nvb` is a Rust/Ratatui application that owns the terminal,
+<p>
+  <a href="https://github.com/zazencodes/neovim-notebooks/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zazencodes/neovim-notebooks/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
+`nvb` is **[n]eo[v]im note[b]ook**: a Rust/Ratatui application that owns the terminal,
 embeds `nvim --embed` as its editing engine, and runs cells on an unmodified Jupyter kernel.
 The notebook is a list of distinct cells with their outputs below them. Move between cells
 with Vim keys, press `Enter` to edit one in your own Neovim (config, plugins, LSP, Treesitter),
@@ -13,9 +18,6 @@ nvb analysis.ipynb
 ```
 
 One notebook application. No notebook plugin stack. No nbv-specific configuration.
-
-The design lives in [`docs/specs/2026-09-20-nbv-v1-architecture.md`](docs/specs/2026-09-20-nbv-v1-architecture.md),
-as amended by [`docs/specs/2026-09-21-nbv-cell-editors.md`](docs/specs/2026-09-21-nbv-cell-editors.md).
 
 ## Requirements
 
@@ -31,7 +33,7 @@ as amended by [`docs/specs/2026-09-21-nbv-cell-editors.md`](docs/specs/2026-09-2
   and `python3` on `PATH`; choosing a
   kernelspec saves it in the notebook. nbv remembers your pick for each notebook
   (`~/.local/state/nbv/kernels.json`) and starts with it next time, ahead of the order above. Code cells are edited in the kernel's language. Non-Python kernels are
-  experimental (spec §4.3).
+  experimental.
 
   If the chosen Python lacks `ipykernel`, nbv offers to install it (with that Python's pip, or
   `uv pip install` for a virtualenv without pip) before starting the kernel.
@@ -40,8 +42,22 @@ as amended by [`docs/specs/2026-09-21-nbv-cell-editors.md`](docs/specs/2026-09-2
 ## Install
 
 ```
-cargo install --path crates/nbv-cli
+cargo install --git https://github.com/zazencodes/neovim-notebooks nbv-cli
 ```
+
+This installs the `nvb` binary. macOS and Linux are supported.
+
+<p align="center">
+  <a href="https://zazencodes.com/?utm_source=github&utm_medium=referral&utm_campaign=neovim-notebooks">
+    <img
+      src="docs/assets/zazencodes-banner.webp"
+      alt="ZazenCodes — Engineering for the Agentic Era"
+      width="100%"
+    >
+  </a>
+  <br>
+  Created by <a href="https://zazencodes.com/">ZazenCodes</a>
+</p>
 
 ## Use
 
@@ -126,7 +142,7 @@ nbv picks a graphics mechanism per terminal. Where none works, images fall back 
 
 **Verification status.** The automated suite checks placement and clipping with halfblocks
 inside tmux. Pixel-level behaviour on real terminals, including whether Neovim floats cover images
-correctly per protocol, is the manual Spike 6 matrix. It has not been run yet, so no terminal is
+correctly per protocol, is checked by hand. That has not been done yet, so no terminal is
 called first-class so far.
 
 ### tmux
@@ -175,3 +191,12 @@ ipykernel ruff`). CI runs everything on Linux and macOS.
 
 `tests/corpus/` holds deliberately ugly notebooks. Every one must survive open → save without
 losing information.
+
+## Design
+
+The design lives in [`docs/specs/2026-09-20-nbv-v1-architecture.md`](docs/specs/2026-09-20-nbv-v1-architecture.md),
+as amended by [`docs/specs/2026-09-21-nbv-cell-editors.md`](docs/specs/2026-09-21-nbv-cell-editors.md).
+
+## License
+
+[MIT](LICENSE)
