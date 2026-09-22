@@ -192,11 +192,6 @@ ipykernel ruff`). CI runs everything on Linux and macOS.
 `tests/corpus/` holds deliberately ugly notebooks. Every one must survive open → save without
 losing information.
 
-## Design
-
-The design lives in [`docs/specs/2026-09-20-nbv-v1-architecture.md`](docs/specs/2026-09-20-nbv-v1-architecture.md),
-as amended by [`docs/specs/2026-09-21-nbv-cell-editors.md`](docs/specs/2026-09-21-nbv-cell-editors.md).
-
 ## License
 
 [MIT](LICENSE)

@@ -2,3 +2,4 @@
 /.tools
 /.venv
 .DS_Store
+/.agents
