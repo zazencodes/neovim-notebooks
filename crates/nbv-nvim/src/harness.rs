@@ -28,6 +28,22 @@ pub fn repo_root() -> PathBuf {
 /// How long Neovim has to answer a request, or a wait to come true.
 const ANSWER: Duration = Duration::from_secs(10);
 
+/// A script in `dir` that runs the Neovim under test with its own state directory (log, swap
+/// files, ShaDa) in `dir`: parallel Neovims on a fresh machine otherwise race to create
+/// `~/.local/state/nvim`, and the losers stop at a prompt.
+fn isolated_nvim(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("nvim");
+    let body = format!(
+        "#!/bin/sh\nXDG_STATE_HOME='{}' exec '{}' \"$@\"\n",
+        dir.join("state").display(),
+        nvim_program().display()
+    );
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
 pub struct State {
     pub nb: Notebook,
     pub editor: Editor,
@@ -48,6 +64,7 @@ pub struct Harness {
     pub notebook: PathBuf,
     seq: Mutex<u64>,
     _dir: tempfile::TempDir,
+    _nvim_dir: tempfile::TempDir,
 }
 
 pub struct Options {
@@ -84,7 +101,9 @@ impl Harness {
             }
             None => true,
         };
-        let (client, mut rx) = editor::spawn(nvim_program(), clean, &extra, &notebook).await.unwrap();
+        let nvim_dir = tempfile::tempdir().unwrap();
+        let program = isolated_nvim(nvim_dir.path());
+        let (client, mut rx) = editor::spawn(program, clean, &extra, &notebook).await.unwrap();
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(State {
             nb,
@@ -139,7 +158,7 @@ impl Harness {
             .await
             .expect("Neovim did not answer the handshake")
             .unwrap();
-        let h = Harness { client, state, notebook, seq: Mutex::new(0), _dir: dir };
+        let h = Harness { client, state, notebook, seq: Mutex::new(0), _dir: dir, _nvim_dir: nvim_dir };
         h.wait("startup", |s| s.ready && s.viewport.is_some()).await;
         h.settle().await;
         h
