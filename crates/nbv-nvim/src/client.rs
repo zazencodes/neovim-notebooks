@@ -60,6 +60,8 @@ pub struct SpawnOptions {
     /// Launch without user configuration (`nbv --clean`, §10.5).
     pub clean: bool,
     pub args: Vec<String>,
+    /// Environment variables set for Neovim on top of nbv's own.
+    pub env: Vec<(String, PathBuf)>,
 }
 
 /// The minimal surface nbv needs from an embedded Neovim.
@@ -193,7 +195,7 @@ impl EmbeddedNvim {
         if opts.clean {
             cmd.arg("--clean");
         }
-        cmd.args(&opts.args).stderr(Stdio::null()).kill_on_drop(true);
+        cmd.args(&opts.args).envs(opts.env.iter().map(|(k, v)| (k, v))).stderr(Stdio::null()).kill_on_drop(true);
         let (nvim, io, mut child) = nvim_rs::create::tokio::new_child_cmd(&mut cmd, Forwarder { tx: tx.clone() })
             .await
             .map_err(|e| NvimError::Spawn(opts.program.display().to_string(), e))?;

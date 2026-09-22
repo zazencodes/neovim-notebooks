@@ -522,11 +522,12 @@ pub async fn spawn(
     program: PathBuf,
     clean: bool,
     extra: &[String],
+    env: Vec<(String, PathBuf)>,
     notebook: &Path,
 ) -> Result<(crate::client::EmbeddedNvim, mpsc::UnboundedReceiver<NvimEvent>), NvimError> {
     let mut args = extra.to_vec();
     args.extend(["--".into(), home_name(notebook)]);
-    crate::client::EmbeddedNvim::spawn(SpawnOptions { program, clean, args }).await
+    crate::client::EmbeddedNvim::spawn(SpawnOptions { program, clean, args, env }).await
 }
 
 /// Loads the companion before the user's config (pre-config, §10.3), then attaches the UI,

@@ -28,22 +28,6 @@ pub fn repo_root() -> PathBuf {
 /// How long Neovim has to answer a request, or a wait to come true.
 const ANSWER: Duration = Duration::from_secs(10);
 
-/// A script in `dir` that runs the Neovim under test with its own state directory (log, swap
-/// files, ShaDa) in `dir`: parallel Neovims on a fresh machine otherwise race to create
-/// `~/.local/state/nvim`, and the losers stop at a prompt.
-fn isolated_nvim(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let script = dir.join("nvim");
-    let body = format!(
-        "#!/bin/sh\nXDG_STATE_HOME='{}' exec '{}' \"$@\"\n",
-        dir.join("state").display(),
-        nvim_program().display()
-    );
-    std::fs::write(&script, body).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    script
-}
-
 pub struct State {
     pub nb: Notebook,
     pub editor: Editor,
@@ -101,9 +85,14 @@ impl Harness {
             }
             None => true,
         };
+        // Neovim's own directories, apart from the user's and other tests': parallel Neovims on a
+        // fresh machine otherwise race to create ~/.local/state/nvim and the like, and the
+        // losers stop at a prompt.
         let nvim_dir = tempfile::tempdir().unwrap();
-        let program = isolated_nvim(nvim_dir.path());
-        let (client, mut rx) = editor::spawn(program, clean, &extra, &notebook).await.unwrap();
+        let env = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]
+            .map(|var| (var.to_string(), nvim_dir.path().join(var)))
+            .to_vec();
+        let (client, mut rx) = editor::spawn(nvim_program(), clean, &extra, env, &notebook).await.unwrap();
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(State {
             nb,

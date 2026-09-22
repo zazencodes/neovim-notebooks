@@ -201,7 +201,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         Ok(cmd) => (Some(cmd), None),
         Err(e) => (None, Some(format!("{e} ({PICK_KERNEL})"))),
     };
-    let (client, mut nvim_rx) = editor::spawn(opts.nvim.clone(), opts.clean, &[], &notebook).await?;
+    let (client, mut nvim_rx) = editor::spawn(opts.nvim.clone(), opts.clean, &[], vec![], &notebook).await?;
     let (err_tx, mut err_rx) = mpsc::unbounded_channel::<NvimError>();
     let mut editor = Editor::new(client.clone(), err_tx.clone());
     editor.set_language(kernel_cmd.as_ref().map(|c| c.language.clone()));
