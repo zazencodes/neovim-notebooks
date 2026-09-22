@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-nbv-tui = { version = "0.1.0", path = "../nbv-tui" }
+nbv-tui.workspace = true
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
