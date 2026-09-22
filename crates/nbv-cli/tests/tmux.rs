@@ -66,7 +66,8 @@ impl Session {
         let s = Session { socket, dir };
         let conf_path = s.dir.path().join("tmux.conf");
         std::fs::write(&conf_path, conf).unwrap();
-        s.tmux(&["-f", &conf_path.to_string_lossy(), "new-session", "-d", "-s", "t", "-x", "120", "-y", "30", &cmd]);
+        // Wide enough that the header's hint fits beside a kernel named after a long venv path.
+        s.tmux(&["-f", &conf_path.to_string_lossy(), "new-session", "-d", "-s", "t", "-x", "200", "-y", "30", &cmd]);
         s.wait_for(" NAV");
         Some(s)
     }
@@ -268,7 +269,13 @@ fn clean_exit_leaves_no_processes() {
     let ps = Command::new("ps").args(["-eo", "command"]).output().unwrap();
     let ps = String::from_utf8_lossy(&ps.stdout);
     let dir = s.dir.path().to_string_lossy().into_owned();
-    assert!(!ps.lines().any(|l| l.contains(&dir) && !l.contains("tmux")), "processes left behind:\n{ps}");
+    // The pane's own shell names the directory too; bash, unlike zsh, outlives its last command.
+    let left = |l: &&str| l.contains(&dir) && !l.contains("tmux") && !l.contains("NVB-EXITED");
+    assert!(
+        !ps.lines().any(|l| left(&l)),
+        "processes left behind:\n{}",
+        ps.lines().filter(left).collect::<Vec<_>>().join("\n")
+    );
 }
 
 #[test]
