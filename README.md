@@ -42,7 +42,7 @@ https://github.com/user-attachments/assets/05df38a2-bb52-4fdd-b78e-aa6ffe8e3304
 ## Install
 
 ```
-cargo install --git https://github.com/zazencodes/neovim-notebooks --tag v0.1.0 nbv-cli
+cargo install --git https://github.com/zazencodes/neovim-notebooks --tag v0.1.1 nbv-cli
 ```
 
 This installs the `nvb` binary. macOS and Linux are supported.
