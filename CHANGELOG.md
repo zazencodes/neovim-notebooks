@@ -5,6 +5,8 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+## 0.1.2 - 2026-10-13
+
 ### Added
 
 - The notebook saves itself about a second after a change, whenever Neovim is in Normal mode.
