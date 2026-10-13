@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "nbv-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "jupyter-protocol",
  "jupyter-zmq-client",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "nbv-nvim"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "nbv-core",
@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "nbv-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "nvb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "nbv-tui",
