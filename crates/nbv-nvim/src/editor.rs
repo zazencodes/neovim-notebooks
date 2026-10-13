@@ -317,7 +317,7 @@ impl Editor {
         self.creating.retain(|k, _| nb.is_live(k));
     }
 
-    /// Wipes every cell buffer, e.g. after a reload.
+    /// Wipes every cell buffer, e.g. after a change of language or name.
     pub fn wipe_all(&mut self) {
         let all = self.buffers.keys().copied().collect();
         self.wipe(all);
@@ -504,12 +504,16 @@ impl Editor {
         }
     }
 
-    /// `nbv_reload` (§9.5): `:e!` reloads the notebook from disk.
+    /// `nbv_reload` (§9.5): `:e!`, or a change on disk (§9.6), reloads the notebook from disk.
+    /// Buffers of cells still there take the text from disk, so their windows stay open, the
+    /// edited cell's included; the rest are wiped.
     fn reload(&mut self, nb: &mut Notebook) -> (Value, Vec<EditorEvent>) {
         match nb.reload() {
             Ok(()) => {
-                // Queued: Neovim is inside the read request until the reply arrives.
-                self.wipe_all();
+                // Queued: Neovim is inside the read request until the reply arrives. The
+                // rewritten buffers match the disk, so nothing is left modified.
+                self.sync(nb);
+                self.calls.lua("require('nbv').set_unmodified()", vec![]);
                 (map(vec![]), vec![EditorEvent::Reloaded])
             }
             Err(e) => (map(vec![("error", e.to_string().into())]), vec![]),

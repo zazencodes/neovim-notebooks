@@ -258,17 +258,107 @@ async fn structural_changes_rewrite_or_wipe_buffers() {
     assert!(h.state.lock().unwrap().editor.buffer(&code).is_some());
 }
 
+/// The text of a cell's buffer and whether it is modified.
+async fn buffer_state(h: &Harness, key: &CellKey) -> (Vec<String>, bool) {
+    let buf = h.state.lock().unwrap().editor.buffer(key).unwrap();
+    let v =
+        h.lua(&format!("return {{ vim.api.nvim_buf_get_lines({buf}, 0, -1, false), vim.bo[{buf}].modified }}")).await;
+    let v = v.as_array().unwrap();
+    let lines = v[0].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
+    (lines, v[1].as_bool().unwrap())
+}
+
 #[tokio::test]
-async fn reload_rebuilds_from_disk() {
+async fn reload_rebuilds_from_disk_and_keeps_the_edited_cell() {
     let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
     let code = h.key(1);
     h.enter(&code, false).await;
-    h.keys("ddu").await;
     h.keys("dd").await;
     assert_eq!(h.source(1), "np.arange(3)");
     h.cmd("e!").await;
-    h.wait("reloaded", |s| s.nb.cell(&CellKey::new("a1b2c3d4")).unwrap().source().starts_with("import")).await;
-    h.wait("cell buffers wiped", |s| s.editor.buffer(&CellKey::new("a1b2c3d4")).is_none()).await;
+    h.wait("reloaded", |s| s.nb.cell(&code).unwrap().source().starts_with("import")).await;
+    h.settle().await;
+    assert_eq!(buffer_state(&h, &code).await, (vec!["import numpy as np".into(), "np.arange(3)".into()], false));
+    assert_eq!(h.source(1), "import numpy as np\nnp.arange(3)", "the mirror agrees");
+    assert_eq!(h.lua("return vim.b.nbv_key").await.as_str(), Some(code.as_str()), "still editing the cell");
+    assert_eq!(h.lua("return vim.bo[require('nbv').home_buf].modified").await.as_bool(), Some(false));
+}
+
+/// Writes the notebook as another program would: the first code cell's source becomes `source`.
+fn write_outside(h: &Harness, source: &str) {
+    let mut v = h.saved();
+    v["cells"][1]["source"] = json!(source);
+    std::fs::write(h.dir().join("v4.5-outputs.ipynb"), serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn a_change_on_disk_reloads_a_notebook_without_unsaved_changes() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    write_outside(&h, "y = 2");
+    h.lua("require('nbv').changed_on_disk('v4.5-outputs.ipynb')").await;
+    h.wait("reloaded", |s| s.nb.cell(&code).unwrap().source() == "y = 2").await;
+    h.settle().await;
+    assert_eq!(buffer_state(&h, &code).await, (vec!["y = 2".into()], false));
+    assert_eq!(h.lua("return vim.b.nbv_key").await.as_str(), Some(code.as_str()), "still editing the cell");
+}
+
+#[tokio::test]
+async fn a_change_on_disk_asks_before_discarding_unsaved_changes() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    h.keys("ccmine = 1<Esc>").await;
+    // Answers the prompt with the item at `CHOICE`, recording the prompt.
+    h.lua("vim.ui.select = function(items, opts, cb) _G.asked = opts.prompt; cb(items[_G.CHOICE]) end").await;
+
+    // Keeping yours overwrites the file.
+    write_outside(&h, "theirs = 1");
+    h.lua("_G.CHOICE = 2; require('nbv').changed_on_disk('v4.5-outputs.ipynb')").await;
+    h.wait("written", |s| s.written == 1).await;
+    let asked = h.lua("return _G.asked").await;
+    assert!(asked.as_str().unwrap().contains("unsaved changes"), "{asked}");
+    assert_eq!(h.saved()["cells"][1]["source"], json!(["mine = 1\n", "np.arange(3)"]));
+
+    // Loading it discards yours.
+    h.keys("ccmine = 2<Esc>").await;
+    write_outside(&h, "theirs = 2");
+    h.lua("_G.CHOICE = 1; require('nbv').changed_on_disk('v4.5-outputs.ipynb')").await;
+    h.wait("reloaded", |s| s.nb.cell(&code).unwrap().source() == "theirs = 2").await;
+    h.settle().await;
+    assert_eq!(buffer_state(&h, &code).await, (vec!["theirs = 2".into()], false));
+
+    // Dismissing it changes nothing.
+    h.keys("ccmine = 3<Esc>").await;
+    write_outside(&h, "theirs = 3");
+    h.lua("_G.CHOICE = 3; require('nbv').changed_on_disk('v4.5-outputs.ipynb')").await;
+    h.settle().await;
+    assert_eq!(h.source(1), "mine = 3");
+    assert_eq!(h.saved()["cells"][1]["source"], json!("theirs = 3"));
+}
+
+#[tokio::test]
+async fn autosave_and_changes_on_disk_wait_for_normal_mode() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let code = h.key(1);
+    h.enter(&code, false).await;
+    h.keys("ccmine = 1").await;
+    h.lua("require('nbv').autosave()").await;
+    write_outside(&h, "theirs = 1");
+    h.lua("require('nbv').changed_on_disk('v4.5-outputs.ipynb')").await;
+    h.settle().await;
+    assert_eq!(h.state.lock().unwrap().written, 0, "not written in Insert mode");
+    assert!(h.state.lock().unwrap().commands.iter().any(|(a, _)| a == "disk_deferred"));
+    assert_eq!(h.source(1), "mine = 1\nnp.arange(3)", "not reloaded in Insert mode");
+
+    h.keys("<Esc>").await;
+    h.cmd("e!").await;
+    h.keys("ccmine = 2<Esc>").await;
+    h.lua("require('nbv').autosave()").await;
+    h.wait("written", |s| s.written == 1).await;
+    assert_eq!(h.saved()["cells"][1]["source"], json!("mine = 2"));
+    assert!(!buffer_state(&h, &code).await.1, "nothing is left modified");
 }
 
 #[tokio::test]

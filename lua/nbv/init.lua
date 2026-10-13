@@ -250,22 +250,37 @@ local function write_event(event, bufs)
   end
 end
 
---- BufWriteCmd (§9.2): commit every cell buffer → canonical document → .ipynb. The write
---- events fire on the modified cell buffers, as for `:wall`, from whichever buffer `:w` ran in.
-local function on_write(ev)
-  local buf = ev.buf
-  local name = api.nvim_buf_get_name(buf)
-  if ev.match ~= name and vim.fn.fnamemodify(ev.match, ':p') ~= name then
-    fail('notebook buffers can only be written to their notebook (use :w)')
-  end
-  local force = vim.v.cmdbang == 1
-  local modified = {}
+--- Marks every notebook buffer unmodified: they show what is on disk.
+function M.set_unmodified()
   for _, b in ipairs(api.nvim_list_bufs()) do
-    if vim.b[b].nbv_key and vim.bo[b].modified then
-      modified[#modified + 1] = b
+    if b == M.home_buf or vim.b[b].nbv_key then
+      vim.bo[b].modified = false
     end
   end
-  write_event('BufWritePre', modified)
+end
+
+--- Whether the notebook has unsaved changes: in a cell buffer, or in the home buffer, which
+--- marks the changes no cell buffer shows (structure, outputs).
+local function modified()
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if (b == M.home_buf or vim.b[b].nbv_key) and vim.bo[b].modified then
+      return true
+    end
+  end
+  return false
+end
+
+--- Commits every cell buffer → canonical document → .ipynb (§9.2), overwriting a notebook
+--- changed on disk only with `force`. The write events fire on the modified cell buffers, as
+--- for `:wall`. Returns the message to show.
+local function write(force)
+  local changed = {}
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if vim.b[b].nbv_key and vim.bo[b].modified then
+      changed[#changed + 1] = b
+    end
+  end
+  write_event('BufWritePre', changed)
   local buffers = {}
   for _, b in ipairs(api.nvim_list_bufs()) do
     if vim.b[b].nbv_key then
@@ -276,24 +291,71 @@ local function on_write(ev)
   if res.error then
     fail(res.error)
   end
-  for _, b in ipairs(api.nvim_list_bufs()) do
-    if b == M.home_buf or vim.b[b].nbv_key then
-      vim.bo[b].modified = false
-    end
-  end
-  write_event('BufWritePost', modified)
-  api.nvim_echo({ { res.message } }, false, {})
+  M.set_unmodified()
+  write_event('BufWritePost', changed)
+  return res.message
 end
 
---- BufReadCmd (§9.5): `:e` / `:e!` on any notebook buffer reloads the .ipynb through Rust.
+--- BufWriteCmd (§9.2): `:w` from whichever notebook buffer it ran in.
+local function on_write(ev)
+  local name = api.nvim_buf_get_name(ev.buf)
+  if ev.match ~= name and vim.fn.fnamemodify(ev.match, ':p') ~= name then
+    fail('notebook buffers can only be written to their notebook (use :w)')
+  end
+  api.nvim_echo({ { write(vim.v.cmdbang == 1) } }, false, {})
+end
+
+--- BufReadCmd (§9.5): `:e` / `:e!` on any notebook buffer reloads the .ipynb through Rust,
+--- which then marks the notebook buffers unmodified.
 local function on_reload()
   local res = vim.rpcrequest(M.chan, 'nbv_reload')
   if res.error then
     fail(res.error)
   end
-  if M.home_buf and api.nvim_buf_is_valid(M.home_buf) then
-    vim.bo[M.home_buf].modified = false
+end
+
+--- Whether the user is idle in Normal mode: not mid-command, and not on the command line, in
+--- Insert mode or at a prompt. Only then does nbv write or reload on its own (§9.6).
+local function idle()
+  local m = api.nvim_get_mode()
+  return m.mode == 'n' and not m.blocking
+end
+
+--- Autosave (§9.6): writes unsaved changes while the user is idle. Never in Insert mode, where
+--- format-on-save would rewrite the text being typed.
+function M.autosave()
+  if idle() and modified() then
+    write(false)
   end
+end
+
+--- The notebook `name` changed on disk (§9.6). Without unsaved changes, it is reloaded, as
+--- with 'autoread'. With them, the user picks: load it, discarding them, or keep them,
+--- overwriting it. While the user is busy, Rust is told to ask again later.
+function M.changed_on_disk(name)
+  if not idle() then
+    notify('disk_deferred')
+    return
+  end
+  if not modified() then
+    on_reload()
+    api.nvim_echo({ { ('"%s" reloaded: it changed on disk'):format(name) } }, false, {})
+    return
+  end
+  local load, keep = 'Load it (discard your changes)', 'Keep yours (overwrite it)'
+  local prompt = ('"%s" changed on disk, and you have unsaved changes'):format(name)
+  vim.schedule(function()
+    vim.ui.select({ load, keep }, { prompt = prompt }, function(choice)
+      if choice == load then
+        on_reload()
+      elseif choice == keep then
+        api.nvim_echo({ { write(true) } }, false, {})
+      else
+        local msg = ('"%s" changed on disk: :e! loads it, :w! keeps yours'):format(name)
+        api.nvim_echo({ { msg, 'WarningMsg' } }, true, {})
+      end
+    end)
+  end)
 end
 
 local function intercept_io(buf)

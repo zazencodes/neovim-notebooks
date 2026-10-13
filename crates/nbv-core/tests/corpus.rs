@@ -143,6 +143,29 @@ fn refuses_to_overwrite_a_notebook_changed_on_disk() {
 }
 
 #[test]
+fn notices_changes_on_disk_but_not_its_own_writes() {
+    let (_dir, copy) = scratch_copy("v4.5-outputs.ipynb");
+    let mut nb = Notebook::open(&copy).unwrap();
+    assert_eq!(nb.disk_change().unwrap(), None);
+    let first = nb.order()[0].clone();
+    nb.set_source(&first, "#");
+    nb.commit(CommitOptions::default()).unwrap();
+    assert_eq!(nb.disk_change().unwrap(), None, "its own write is not a change");
+
+    let mut other = std::fs::read(&copy).unwrap();
+    other.extend_from_slice(b" ");
+    std::fs::write(&copy, &other).unwrap();
+    let change = nb.disk_change().unwrap();
+    assert!(change.is_some());
+    assert_eq!(nb.disk_change().unwrap(), change, "still changed until reloaded");
+    nb.reload().unwrap();
+    assert_eq!(nb.disk_change().unwrap(), None);
+
+    std::fs::remove_file(&copy).unwrap();
+    assert!(nb.disk_change().is_err(), "a missing file is an error");
+}
+
+#[test]
 fn writes_through_symlinks_and_preserves_permissions() {
     use std::os::unix::fs::PermissionsExt;
     let (dir, copy) = scratch_copy("v4.5-outputs.ipynb");

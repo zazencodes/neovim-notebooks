@@ -108,13 +108,19 @@ Actions without a key are Ex commands: `:NvbRunAll`, `:NvbRunAbove`, `:NvbSplit`
 edited cell at the cursor), and `:NvbClearOutput[!]`. They act on the cell being edited, or the
 selected one.
 
-**Saving.** `:w` from anywhere writes the `.ipynb` (and so do `:wq` and `:x`, as in any
+**Saving.** The notebook saves itself about a second after a change, cell outputs included,
+whenever Neovim is in Normal mode: never while you type in Insert mode or on the command line.
+`:w` from anywhere writes the `.ipynb` too (and so do `:wq` and `:x`, as in any
 Neovim buffer), and only the `.ipynb`: nothing is written under the cell buffers' names. Format-on-save works per cell,
-because `BufWritePre` and `BufWritePost` fire around the commit on every changed cell, from wherever you ran `:w`, but write hooks see buffers,
-not files. Running cells counts as a change, so `:q` asks you to save outputs (`:q!` discards
-them). A notebook changed on disk since it was loaded is not overwritten: `:w!` overwrites it,
-`:e!` reloads it. Opening and saving without edits loses nothing, and older (4.0–4.4)
+because `BufWritePre` and `BufWritePost` fire around the commit on every changed cell, on every save, but write hooks see buffers,
+not files. Opening and saving without edits loses nothing, and older (4.0–4.4)
 notebooks gain cell ids only once you change something.
+
+**Changes on disk.** When another program changes the `.ipynb`, nbv reloads it, as Neovim's
+`'autoread'` does, keeping the cell you are editing open. If you also have unsaved changes,
+nbv asks whether to load the file (discarding them) or keep yours (overwriting it). Either
+happens only in Normal mode, so a prompt never takes the keys you are typing. Dismissing the
+prompt keeps your changes unsaved: `:e!` loads the file, `:w!` overwrites it.
 
 **Errors.** When a cell cannot run (no kernel, the kernel failed to start, the kernel died),
 the reason appears in red under the cell, and the header marks the kernel failed. Nothing

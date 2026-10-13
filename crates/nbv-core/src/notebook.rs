@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -86,6 +87,9 @@ pub struct Notebook {
     /// Whether any source, structure, type, output or execution change has happened (§6.3).
     mutated: bool,
     disk_hash: Option<[u8; 32]>,
+    /// The `.ipynb`'s modification time and size when it last hashed as `disk_hash`, so an
+    /// unchanged file is not read again (`disk_change`).
+    disk_stamp: Option<(SystemTime, u64)>,
 }
 
 impl std::fmt::Debug for Notebook {
@@ -161,6 +165,7 @@ impl Notebook {
             redo: vec![],
             mutated: false,
             disk_hash: None,
+            disk_stamp: None,
         })
     }
 
@@ -432,7 +437,26 @@ impl Notebook {
             let _ = d.sync_all();
         }
         self.disk_hash = Some(Sha256::digest(&bytes).into());
+        self.disk_stamp = None;
         Ok(())
+    }
+
+    /// Whether the `.ipynb` changed on disk since it was loaded or last committed (§9.6): the
+    /// hash of what is there now if it differs, else `None`. The file is read only when its
+    /// modification time or size changed.
+    pub fn disk_change(&mut self) -> Result<Option<[u8; 32]>, std::io::Error> {
+        // Stamped before reading: a change made in between shows as a new stamp next time.
+        let meta = fs::metadata(&self.path)?;
+        let stamp = (meta.modified()?, meta.len());
+        if self.disk_stamp == Some(stamp) {
+            return Ok(None);
+        }
+        let hash: [u8; 32] = Sha256::digest(fs::read(&self.path)?).into();
+        if Some(hash) != self.disk_hash {
+            return Ok(Some(hash));
+        }
+        self.disk_stamp = Some(stamp);
+        Ok(None)
     }
 
     /// Renames the `.ipynb` on disk to `name`, in the same directory. The document, its unsaved

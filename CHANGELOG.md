@@ -5,6 +5,16 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+### Added
+
+- The notebook saves itself about a second after a change, whenever Neovim is in Normal mode.
+- Changes another program makes to the `.ipynb` load into nbv on their own. If you also have
+  unsaved changes, nbv asks whether to load the file or keep yours.
+
+### Changed
+
+- `:e!` keeps the cell you are editing open, with the text from disk, instead of closing it.
+
 ## 0.1.1 - 2026-10-12
 
 ### Fixed

@@ -151,6 +151,9 @@ struct App {
     draw: bool,
     /// Whether the home buffer has been marked modified since the last write.
     dirty: bool,
+    /// The content on disk Neovim was last told about, while the notebook differs from it
+    /// (§9.6), so the user is asked once about each change.
+    disk_notified: Option<[u8; 32]>,
 }
 
 /// Restores the terminal on drop, including on panic.
@@ -264,10 +267,13 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         relayout: false,
         draw: true,
         dirty: false,
+        disk_notified: None,
     };
     app.start_kernel();
 
     let mut events = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     while !app.quit {
         tokio::select! {
             ev = nvim_rx.recv() => match ev {
@@ -284,6 +290,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 app.message = Some(e.to_string());
                 app.draw = true;
             }
+            _ = tick.tick() => app.tick(),
         }
         // Coalesce whatever else is already waiting before drawing.
         while let Ok(ev) = nvim_rx.try_recv() {
@@ -453,8 +460,8 @@ impl App {
                 }
                 EditorEvent::Rows => self.relayout = true,
                 EditorEvent::Reloaded => {
+                    // A cell whose window closed reports the focus change.
                     self.views.clear();
-                    self.mode = Mode::Nav;
                     self.dirty = false;
                     self.last_sent = None;
                     self.relayout = true;
@@ -601,6 +608,32 @@ impl App {
             ExecEvent::Status(_) => self.draw = true,
             ExecEvent::InputRequested { prompt, password, .. } => {
                 self.editor.calls.lua("require('nbv').input(...)", vec![prompt.into(), password.into()]);
+            }
+        }
+    }
+
+    /// Once a second (§9.6): a notebook changed on disk is reloaded, or the user is asked about
+    /// it; otherwise unsaved changes are written. Neovim does either only while the user is idle.
+    fn tick(&mut self) {
+        if !self.nvim_ready {
+            return;
+        }
+        match self.nb.disk_change() {
+            Err(e) => {
+                self.message = Some(format!("cannot check {} on disk: {e}", self.file_name()));
+                self.draw = true;
+            }
+            Ok(None) => {
+                self.disk_notified = None;
+                if self.dirty {
+                    self.editor.calls.lua("require('nbv').autosave()", vec![]);
+                }
+            }
+            Ok(Some(hash)) => {
+                if self.disk_notified != Some(hash) {
+                    self.disk_notified = Some(hash);
+                    self.editor.calls.lua("require('nbv').changed_on_disk(...)", vec![self.file_name().into()]);
+                }
             }
         }
     }
@@ -1009,6 +1042,7 @@ impl App {
                 let yes = field(args, "install").and_then(Value::as_bool).expect("the prompt sends an answer");
                 self.install_answered(generation, yes);
             }
+            "disk_deferred" => self.disk_notified = None,
             "input" => {
                 let value = field(args, "value").and_then(Value::as_str).unwrap_or("").to_string();
                 if let (Some(req), Some(k)) = (self.input_request.take(), self.kernel.as_mut())

@@ -119,6 +119,25 @@ impl Session {
     fn saved(&self) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(self.dir.path().join("t.ipynb")).unwrap()).unwrap()
     }
+
+    /// Waits until the notebook on disk satisfies `done`.
+    fn wait_saved(&self, what: &str, done: impl Fn(&serde_json::Value) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done(&self.saved()) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}\n{}\n{}", self.saved(), self.screen());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Replaces cell `i`'s source on disk, as another program would: written aside, then
+    /// renamed over the notebook.
+    fn write_outside(&self, i: usize, source: &str) {
+        let mut nb = self.saved();
+        nb["cells"][i]["source"] = serde_json::json!(source);
+        let aside = self.dir.path().join("t.ipynb.tmp");
+        std::fs::write(&aside, serde_json::to_vec_pretty(&nb).unwrap()).unwrap();
+        std::fs::rename(aside, self.dir.path().join("t.ipynb")).unwrap();
+    }
 }
 
 impl Drop for Session {
@@ -254,9 +273,6 @@ fn clean_exit_leaves_no_processes() {
     // r runs the cell and stays on it.
     s.keys(&["r"]);
     s.wait_for("[1]");
-    // Outputs are unsaved changes: :q refuses, :q! quits.
-    s.keys(&[":q", "Enter"]);
-    s.wait_for("E37");
     s.keys(&[":q!", "Enter"]);
     s.wait_for("NVB-EXITED-0");
     let ps = Command::new("ps").args(["-eo", "command"]).output().unwrap();
@@ -269,6 +285,40 @@ fn clean_exit_leaves_no_processes() {
         "processes left behind:\n{}",
         ps.lines().filter(left).collect::<Vec<_>>().join("\n")
     );
+}
+
+#[test]
+fn autosaves_and_follows_changes_on_disk() {
+    let Some(s) = Session::start(&["x = 1", "y = 2"]) else { return };
+    // Leaving Insert mode is enough: the notebook saves itself.
+    s.keys(&["Enter"]);
+    s.wait_for(" EDIT");
+    s.keys(&["cc", "z = 3", "Escape"]);
+    s.wait_saved("the edit saved", |nb| nb["cells"][0]["source"] == serde_json::json!("z = 3"));
+
+    // Without unsaved changes, a change on disk shows at once, in the cell being edited too.
+    s.write_outside(0, "w = 4");
+    s.wait_until("w = 4 loaded, still editing", |s| s.contains("│w = 4") && s.contains(" EDIT"));
+
+    // With unsaved changes, nbv asks once Insert mode is left. Loading discards them.
+    s.keys(&["A", " + 1"]);
+    s.write_outside(1, "v = 5");
+    s.keys(&["Escape"]);
+    s.wait_for("changed on disk, and you have unsaved changes");
+    s.keys(&["1", "Enter"]);
+    s.wait_until("theirs loaded", |s| s.contains("│w = 4 ") && !s.contains("w = 4 + 1") && s.contains("│v = 5"));
+
+    // Keeping yours overwrites the file.
+    s.keys(&["A", " # mine"]);
+    s.write_outside(1, "u = 6");
+    s.keys(&["Escape"]);
+    s.wait_for("changed on disk, and you have unsaved changes");
+    s.keys(&["2", "Enter"]);
+    s.wait_saved("yours kept", |nb| {
+        nb["cells"][0]["source"] == serde_json::json!("w = 4 # mine")
+            && nb["cells"][1]["source"] == serde_json::json!("v = 5")
+    });
+    s.wait_for("│v = 5");
 }
 
 #[test]
