@@ -82,6 +82,7 @@ left and its outputs underneath. nbv has two modes, shown in the header.
 | `x` `Shift+Enter` | Run and select the next cell (past the end, add one and edit it) |
 | `r` `Ctrl+Enter` | Run and stay on the cell |
 | `ii` `00` | Interrupt / restart the kernel |
+| `/` `n` `N` | Search the whole notebook; next / previous cell with a match |
 | `:` | Neovim's command line: `:w`, `:wq`, `:q!`, `:Telescope`, anything |
 | `?` | List every key (`q` closes it) |
 
@@ -107,6 +108,11 @@ WezTerm and iTerm2 do; macOS Terminal does not, and there they act as plain `Ent
 Actions without a key are Ex commands: `:NvbRunAll`, `:NvbRunAbove`, `:NvbSplit` (split the
 edited cell at the cursor), and `:NvbClearOutput[!]`. They act on the cell being edited, or the
 selected one.
+
+**Search.** `/` in navigation mode is Neovim's search prompt, over every cell: `Enter` selects
+the next cell with a match, and `n` `N` go on to the next or previous one, wrapping around.
+`'ignorecase'`, `'smartcase'` and `'wrapscan'` apply as in any buffer. Matches are highlighted
+in every cell, and inside a cell `n` moves between them as usual.
 
 **Saving.** The notebook saves itself about a second after a change, cell outputs included,
 whenever Neovim is in Normal mode: never while you type in Insert mode or on the command line.

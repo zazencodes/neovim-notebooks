@@ -40,6 +40,12 @@ pub enum Action {
     Restart,
     /// Neovim's command line.
     Cmdline,
+    /// Search the notebook: Neovim's `/` prompt.
+    Search,
+    /// The next cell with a match for the last search, or the previous one.
+    NextMatch {
+        backward: bool,
+    },
     /// The previous / next item in the header.
     Left,
     Right,
@@ -78,6 +84,8 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("x <S-CR>", "run and select the next cell"),
             ("r <C-CR>", "run and stay on the cell"),
             ("ii 00", "interrupt / restart the kernel"),
+            ("/", "search the notebook"),
+            ("n N", "next / previous cell with a match"),
             (":", "Neovim's command line"),
             ("?", "this list"),
         ],
@@ -165,6 +173,9 @@ impl Nav {
             (Some("i"), "i") => Interrupt,
             (Some("0"), "0") => Restart,
             (None, ":") => Cmdline,
+            (None, "/") => Search,
+            (None, "n") => NextMatch { backward: false },
+            (None, "N") => NextMatch { backward: true },
             (None, "h") => Left,
             (None, "l") => Right,
             (None, "?") => Help,
@@ -194,6 +205,10 @@ mod tests {
         assert_eq!(feed(&["g", "g", "G", "2", "G"]), [Action::First, Action::Last(None), Action::Last(Some(2))]);
         assert_eq!(feed(&["h", "l", "?"]), [Action::Left, Action::Right, Action::Help]);
         assert_eq!(feed(&["<S-CR>", "<C-CR>"]), [Action::RunAdvance, Action::Run]);
+        assert_eq!(
+            feed(&["/", "n", "N"]),
+            [Action::Search, Action::NextMatch { backward: false }, Action::NextMatch { backward: true }]
+        );
     }
 
     #[test]

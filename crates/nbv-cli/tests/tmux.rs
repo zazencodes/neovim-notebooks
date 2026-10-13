@@ -322,6 +322,21 @@ fn autosaves_and_follows_changes_on_disk() {
 }
 
 #[test]
+fn slash_searches_the_whole_notebook() {
+    let Some(s) = Session::start(&["alpha = 1", "beta = 2", "alpha2 = 3"]) else { return };
+    // From the last cell, / wraps around to the first match; dd deletes the cell found.
+    s.keys(&["G", "/", "alpha", "Enter"]);
+    s.wait_for("search hit BOTTOM, continuing at TOP");
+    s.keys(&["dd"]);
+    s.wait_until("alpha = 1 deleted", |s| !s.contains("alpha = 1") && s.contains("│beta = 2"));
+    // n goes on to the next cell with a match.
+    s.keys(&["n"]);
+    s.wait_for("/alpha");
+    s.keys(&["dd"]);
+    s.wait_until("alpha2 deleted", |s| !s.contains("alpha2") && s.contains("│beta = 2"));
+}
+
+#[test]
 fn help_and_the_header() {
     let Some(s) = Session::start(&["x = 1", "x + 1"]) else { return };
     // This tmux reports no modified keys, and nbv says so.

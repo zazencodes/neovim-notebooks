@@ -681,6 +681,76 @@ function M.input(prompt, password)
   end)
 end
 
+--- Selects the next cell with a match, as `n` does (§10.4). `pattern` becomes the last search
+--- pattern, as with `/`; an empty one repeats the last, in its direction, as `/<CR>` does
+--- (`backward` reverses it, as `N` does). `cells` is every cell's `{ key, lines }`, in order. The search
+--- starts after cell `from` (counted from 1; 0 is the header, before the first cell), or before
+--- it going backward. The cells are searched as one text with `search()`, so 'ignorecase',
+--- 'smartcase', 'magic' and 'wrapscan' apply as in any buffer. Rust is told the cell found.
+function M.search(pattern, from, backward, cells)
+  if pattern ~= '' then
+    vim.fn.setreg('/', pattern)
+    vim.fn.histadd('search', pattern)
+    vim.v.searchforward = 1
+  end
+  pattern = vim.fn.getreg('/')
+  if pattern == '' then
+    api.nvim_echo({ { 'E35: No previous regular expression', 'ErrorMsg' } }, true, {})
+    return
+  end
+  -- Matches show in every cell window, and `n` inside a cell goes on from here.
+  vim.v.hlsearch = 1
+  backward = (vim.v.searchforward == 0) ~= backward
+  local lines, starts = {}, {}
+  for i, c in ipairs(cells) do
+    starts[i] = #lines + 1
+    vim.list_extend(lines, c[2])
+  end
+  local line = 0
+  if #cells > 0 then
+    local buf = api.nvim_create_buf(false, true)
+    api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    local ok, res = pcall(api.nvim_buf_call, buf, function()
+      local flags = 'b'
+      if backward then
+        api.nvim_win_set_cursor(0, { starts[math.max(from, 1)], 0 })
+      elseif from == 0 then
+        -- A match at the very start counts: the cursor is before it.
+        flags = 'c'
+      else
+        local last = (starts[from + 1] or #lines + 1) - 1
+        api.nvim_win_set_cursor(0, { last, #lines[last] })
+        flags = ''
+      end
+      return vim.fn.search(pattern, flags)
+    end)
+    api.nvim_buf_delete(buf, { force = true })
+    if not ok then
+      error(res, 0)
+    end
+    line = res
+  end
+  if line == 0 then
+    local msg = 'E486: Pattern not found: '
+    if not vim.o.wrapscan then
+      msg = backward and 'E384: Search hit TOP without match for: ' or 'E385: Search hit BOTTOM without match for: '
+    end
+    api.nvim_echo({ { msg .. pattern, 'ErrorMsg' } }, true, {})
+    return
+  end
+  local i = #starts
+  while starts[i] > line do
+    i = i - 1
+  end
+  local wrapped = backward and (from == 0 or i >= from) or (not backward and from > 0 and i <= from)
+  local msg = { (backward and '?' or '/') .. pattern }
+  if wrapped and not vim.o.shortmess:find('s', 1, true) then
+    msg = { backward and 'search hit TOP, continuing at BOTTOM' or 'search hit BOTTOM, continuing at TOP', 'WarningMsg' }
+  end
+  api.nvim_echo({ msg }, false, {})
+  notify('found', { key = cells[i][1] })
+end
+
 -- Only actions without a navigation key have commands.
 local commands = {
   { 'NvbRunAll', 'run_all' },
@@ -746,6 +816,19 @@ local function post()
           end
         end
       end
+    end,
+  })
+  -- `/` in the home window searches the notebook (§10.4). The home buffer has no text, so the
+  -- search itself is aborted, and the pattern goes to Rust, which has every cell's source.
+  api.nvim_create_autocmd('CmdlineLeave', {
+    group = group,
+    pattern = '/',
+    callback = function()
+      if vim.v.event.abort or api.nvim_get_current_win() ~= M.home_win then
+        return
+      end
+      notify('search', { pattern = vim.fn.getcmdline() })
+      vim.cmd('let v:event.abort = v:true')
     end,
   })
   api.nvim_create_autocmd({ 'WinResized', 'VimResized' }, {

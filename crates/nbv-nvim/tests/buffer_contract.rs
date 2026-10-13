@@ -361,6 +361,66 @@ async fn autosave_and_changes_on_disk_wait_for_normal_mode() {
     assert!(!buffer_state(&h, &code).await.1, "nothing is left modified");
 }
 
+/// Runs a notebook search from Neovim as nbv does, returning the cell found, if any, and the
+/// message line.
+async fn search(h: &Harness, pattern: &str, from: usize, backward: bool) -> (Option<String>, String) {
+    let cells: Vec<Value> = {
+        let st = h.state.lock().unwrap();
+        st.nb
+            .order()
+            .iter()
+            .map(|k| json!([k.as_str(), st.nb.cell(k).unwrap().source().split('\n').collect::<Vec<_>>()]))
+            .collect()
+    };
+    let before = h.state.lock().unwrap().commands.len();
+    let call = format!(
+        "require('nbv').search([==[{pattern}]==], {from}, {backward}, vim.json.decode([==[{}]==]))",
+        serde_json::to_string(&cells).unwrap(),
+    );
+    h.lua(&call).await;
+    h.settle().await;
+    let found = h.state.lock().unwrap().commands[before..]
+        .iter()
+        .find(|(a, _)| a == "found")
+        .map(|(_, args)| args.as_map().unwrap()[0].1.as_str().unwrap().to_string());
+    let message = h.screen().lines().last().unwrap().trim().to_string();
+    (found, message)
+}
+
+#[tokio::test]
+async fn search_finds_the_next_cell_with_a_match() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    let (md, code, plot) = (h.key(0).to_string(), h.key(1).to_string(), h.key(2).to_string());
+    // From the header, a match at the very start counts.
+    assert_eq!(search(&h, "##", 0, false).await.0, Some(md.clone()));
+    // Searching starts after the selected cell, and wraps around.
+    assert_eq!(search(&h, "p", 2, false).await.0, Some(plot.clone()));
+    assert_eq!(search(&h, "", 3, false).await, (Some(code.clone()), "search hit BOTTOM, continuing at TOP".into()));
+    assert_eq!(search(&h, "", 3, true).await.0, Some(code.clone()), "N goes back");
+    assert_eq!(search(&h, "", 2, true).await, (Some(plot.clone()), "search hit TOP, continuing at BOTTOM".into()));
+    // 'ignorecase' and 'smartcase' apply as in any search.
+    h.cmd("set ignorecase smartcase").await;
+    assert_eq!(search(&h, "NP", 0, false).await.0, None);
+    assert_eq!(search(&h, "results", 1, false).await.0, Some(md));
+    assert_eq!(h.lua("return vim.fn.getreg('/')").await.as_str(), Some("results"), "@/ is the pattern");
+    let (found, message) = search(&h, "nowhere", 1, false).await;
+    assert_eq!((found, message.as_str()), (None, "E486: Pattern not found: nowhere"));
+    h.cmd("set nowrapscan").await;
+    assert_eq!(search(&h, "plot", 3, false).await.1, "E385: Search hit BOTTOM without match for: plot");
+}
+
+#[tokio::test]
+async fn slash_in_the_home_window_searches_the_notebook() {
+    let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+    h.keys("/arange<CR>").await;
+    let commands = h.state.lock().unwrap().commands.clone();
+    let search = commands.iter().find(|(a, _)| a == "search").expect("the pattern goes to nbv");
+    assert_eq!(search.1.as_map().unwrap()[0].1.as_str(), Some("arange"));
+    assert_eq!(h.lua("return vim.fn.mode()").await.as_str(), Some("n"));
+    let messages = h.lua("return vim.fn.execute('messages')").await;
+    assert!(!messages.as_str().unwrap().contains("E486"), "the home buffer is not searched: {messages}");
+}
+
 #[tokio::test]
 async fn the_home_window_is_transparent_and_cells_are_not() {
     let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;

@@ -10,6 +10,8 @@ before 1.0, a breaking change bumps the minor version.
 - The notebook saves itself about a second after a change, whenever Neovim is in Normal mode.
 - Changes another program makes to the `.ipynb` load into nbv on their own. If you also have
   unsaved changes, nbv asks whether to load the file or keep yours.
+- `/` in navigation mode searches the whole notebook, and `n` `N` go to the next or previous
+  cell with a match.
 
 ### Changed
 

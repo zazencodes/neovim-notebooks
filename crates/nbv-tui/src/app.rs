@@ -810,7 +810,9 @@ impl App {
                 | Action::HalfPageDown
                 | Action::HalfPageUp
                 | Action::Help
-                | Action::Cmdline => {
+                | Action::Cmdline
+                | Action::Search
+                | Action::NextMatch { .. } => {
                     return self.on_cell_action(action).await;
                 }
                 _ => {}
@@ -914,6 +916,11 @@ impl App {
                 self.forward_since = Some(self.editor.grid.mode_changes);
                 self.editor.calls.input(":");
             }
+            Action::Search => {
+                self.forward_since = Some(self.editor.grid.mode_changes);
+                self.editor.calls.input("/");
+            }
+            Action::NextMatch { backward } => self.search("", backward),
             Action::Help => {
                 let setup: &[(&str, &[(&str, &str)])] = if self.tmux_keys_missing { &[nav::TMUX_SETUP] } else { &[] };
                 let sections = setup
@@ -929,6 +936,26 @@ impl App {
             // Only the header has items side by side.
             Action::Left | Action::Right => {}
         }
+    }
+
+    /// Asks Neovim for the next cell with a match for `pattern`, or for the last search pattern
+    /// when it is empty (§10.4), from the selected cell or the header. The answer comes back
+    /// as `found`.
+    fn search(&mut self, pattern: &str, backward: bool) {
+        let from = if self.header.is_some() { 0 } else { self.selected + 1 };
+        let cells = self
+            .nb
+            .order()
+            .iter()
+            .filter_map(|k| {
+                let lines = self.nb.cell(k)?.source().split('\n').map(Value::from).collect();
+                Some(Value::Array(vec![k.as_str().into(), Value::Array(lines)]))
+            })
+            .collect();
+        self.editor.calls.lua(
+            "require('nbv').search(...)",
+            vec![pattern.into(), (from as u64).into(), backward.into(), Value::Array(cells)],
+        );
     }
 
     fn file_name(&self) -> String {
@@ -1041,6 +1068,15 @@ impl App {
                     field(args, "generation").and_then(Value::as_u64).expect("the prompt sends a generation");
                 let yes = field(args, "install").and_then(Value::as_bool).expect("the prompt sends an answer");
                 self.install_answered(generation, yes);
+            }
+            "search" => {
+                let pattern = field(args, "pattern").and_then(Value::as_str).expect("the prompt sends a pattern");
+                self.search(pattern, false);
+            }
+            "found" => {
+                if let Some(i) = key.and_then(|k| self.nb.index_of(&k)) {
+                    self.select(i);
+                }
             }
             "disk_deferred" => self.disk_notified = None,
             "input" => {
