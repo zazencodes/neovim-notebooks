@@ -133,6 +133,13 @@ impl Layout {
         self.blocks.iter().position(|b| (b.top..b.top + b.height()).contains(&row))
     }
 
+    /// Block `i`, or the visible block nearest it when it is out of view at `scroll`.
+    pub fn nearest_visible(&self, scroll: usize, area: usize, i: usize) -> Option<usize> {
+        let first = self.blocks.iter().position(|b| b.top + b.height() > scroll)?;
+        let last = self.blocks.iter().rposition(|b| b.top < scroll + area)?;
+        Some(i.max(first).min(last))
+    }
+
     /// The editor windows for the blocks visible at `scroll`: each window shows the visible
     /// rows of its cell, skipping the rows above. The active cell's window is left to scroll
     /// itself when it is clipped, so Neovim keeps its cursor in view.
@@ -241,6 +248,17 @@ mod tests {
         assert_eq!(l.middle(0, 4), Some(0), "row 2 is in a (0..3)");
         assert_eq!(l.middle(0, 60), Some(2), "past the end, the last block");
         assert_eq!(Layout::default().middle(0, 10), None);
+    }
+
+    #[test]
+    fn nearest_visible_block() {
+        let l = layout();
+        assert_eq!(l.nearest_visible(0, 10, 0), Some(0));
+        assert_eq!(l.nearest_visible(2, 10, 0), Some(0), "a's last row still shows");
+        assert_eq!(l.nearest_visible(3, 10, 0), Some(1), "a scrolled off the top");
+        assert_eq!(l.nearest_visible(3, 10, 2), Some(2), "c's first row shows");
+        assert_eq!(l.nearest_visible(0, 10, 2), Some(1), "c below the area");
+        assert_eq!(Layout::default().nearest_visible(0, 10, 0), None);
     }
 
     #[test]

@@ -337,6 +337,38 @@ fn slash_searches_the_whole_notebook() {
 }
 
 #[test]
+fn ctrl_e_and_ctrl_y_pan_line_by_line() {
+    let cells: Vec<String> = (0..20).map(|i| format!("v{i} = {i}")).collect();
+    let Some(s) = Session::start(&cells.iter().map(String::as_str).collect::<Vec<_>>()) else { return };
+    s.wait_for("│v0 = 0");
+    // One row down: v0's top border goes, its text stays, and so does the selection.
+    s.keys(&["C-e"]);
+    s.wait_until("one row panned", |s| s.lines().nth(1).is_some_and(|l| l.contains("│v0 = 0")));
+    // Two more and v0 is gone: the selection moves to v1, the nearest cell in view.
+    s.keys(&["2", "C-e"]);
+    s.wait_until("v0 scrolled off", |s| !s.contains("v0 = 0") && s.contains("│v1 = 1"));
+    s.keys(&["dd"]);
+    s.wait_saved("v1 deleted", |nb| {
+        let sources: Vec<&str> = nb["cells"].as_array().unwrap().iter().filter_map(|c| c["source"].as_str()).collect();
+        sources.len() == 19 && sources[0] == "v0 = 0" && sources[1] == "v2 = 2"
+    });
+    s.keys(&["3", "C-y"]);
+    s.wait_for("│v0 = 0");
+}
+
+#[test]
+fn the_mouse_wheel_pans() {
+    let cells: Vec<String> = (0..20).map(|i| format!("v{i} = {i}")).collect();
+    let Some(s) = Session::start(&cells.iter().map(String::as_str).collect::<Vec<_>>()) else { return };
+    s.wait_for("│v0 = 0");
+    // A wheel notch down, as the terminal reports it (SGR mouse): three rows, past v0.
+    s.keys(&["-l", "\x1b[<65;20;10M"]);
+    s.wait_until("v0 scrolled off", |s| !s.contains("v0 = 0") && s.contains("│v1 = 1"));
+    s.keys(&["-l", "\x1b[<64;20;10M"]);
+    s.wait_for("│v0 = 0");
+}
+
+#[test]
 fn help_and_the_header() {
     let Some(s) = Session::start(&["x = 1", "x + 1"]) else { return };
     // This tmux reports no modified keys, and nbv says so.

@@ -12,6 +12,10 @@ before 1.0, a breaking change bumps the minor version.
   unsaved changes, nbv asks whether to load the file or keep yours.
 - `/` in navigation mode searches the whole notebook, and `n` `N` go to the next or previous
   cell with a match.
+- `<C-e>` and `<C-y>` in navigation mode scroll the notebook a line at a time, as in Vim, and
+  the mouse wheel scrolls it three lines per notch. The selected cell stays selected until it
+  scrolls out of view. Because nbv now takes mouse input, selecting text with the mouse
+  needs your terminal's modifier, usually Shift (Option in iTerm2).
 
 ### Changed
 

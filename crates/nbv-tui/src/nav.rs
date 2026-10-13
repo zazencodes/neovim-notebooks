@@ -12,6 +12,8 @@ pub enum Action {
     Last(Option<usize>),
     HalfPageDown,
     HalfPageUp,
+    /// Scroll the view by this many rows (up when negative), keeping the selection in view.
+    Pan(isize),
     /// Scroll the selected cell to the middle of the view.
     Center,
     /// Edit the selected cell.
@@ -72,6 +74,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("j k", "next / previous cell; counts work (3j)"),
             ("gg G {n}G", "first / last / nth cell"),
             ("<C-d> <C-u>", "scroll half a page, selecting the middle cell"),
+            ("<C-e> <C-y>", "scroll a line down / up; counts work (5<C-e>)"),
             ("zz", "center the cell on screen"),
             ("<CR>", "edit the cell"),
             ("o O", "new code cell below / above"),
@@ -152,6 +155,8 @@ impl Nav {
             (None, "G") => Last(count),
             (None, "<C-d>") => HalfPageDown,
             (None, "<C-u>") => HalfPageUp,
+            (None, "<C-e>") => Pan(n as isize),
+            (None, "<C-y>") => Pan(-(n as isize)),
             (Some("z"), "z") => Center,
             (None, "<CR>") => Edit,
             (None, "o") => Open { above: false },
@@ -205,6 +210,7 @@ mod tests {
         assert_eq!(feed(&["g", "g", "G", "2", "G"]), [Action::First, Action::Last(None), Action::Last(Some(2))]);
         assert_eq!(feed(&["h", "l", "?"]), [Action::Left, Action::Right, Action::Help]);
         assert_eq!(feed(&["<S-CR>", "<C-CR>"]), [Action::RunAdvance, Action::Run]);
+        assert_eq!(feed(&["<C-e>", "5", "<C-y>"]), [Action::Pan(1), Action::Pan(-5)]);
         assert_eq!(
             feed(&["/", "n", "N"]),
             [Action::Search, Action::NextMatch { backward: false }, Action::NextMatch { backward: true }]

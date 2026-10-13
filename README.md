@@ -71,6 +71,7 @@ left and its outputs underneath. nbv has two modes, shown in the header.
 | `j` `k` | Next / previous cell; counts work (`3j`) |
 | `gg` `G` `{n}G` | First / last / nth cell |
 | `<C-d>` `<C-u>` | Scroll half a page and select the cell in the middle of the screen |
+| `<C-e>` `<C-y>` | Scroll a line down / up, as in Vim; counts work (`5<C-e>`). The mouse wheel scrolls three lines |
 | `zz` | Center the cell on screen |
 | `Enter` | Edit the cell |
 | `o` `O` | New code cell below / above, selected; repeat to add several |

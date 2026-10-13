@@ -10,7 +10,7 @@ use std::io::{Stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent};
+use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind};
 use crossterm::{cursor, event, execute, terminal};
 use futures::StreamExt;
 use jupyter_protocol::JupyterMessage;
@@ -47,6 +47,8 @@ pub struct Options {
 
 /// Where a failed or missing kernel's message points.
 const PICK_KERNEL: &str = "pick one in the header: gg k l <CR>";
+/// Rows one notch of the mouse wheel scrolls.
+const WHEEL_ROWS: isize = 3;
 
 enum KernelStart {
     Ready(u64, Box<Result<Kernel, KernelError>>),
@@ -169,6 +171,7 @@ impl Drop for TerminalGuard {
             out,
             event::DisableBracketedPaste,
             event::DisableFocusChange,
+            event::DisableMouseCapture,
             cursor::SetCursorStyle::DefaultUserShape,
             cursor::Show,
             terminal::LeaveAlternateScreen
@@ -184,7 +187,13 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
     terminal::enable_raw_mode()?;
     let mut out = std::io::stdout();
-    execute!(out, terminal::EnterAlternateScreen, event::EnableBracketedPaste, event::EnableFocusChange)?;
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        event::EnableBracketedPaste,
+        event::EnableFocusChange,
+        event::EnableMouseCapture
+    )?;
     let _guard = TerminalGuard { tmux: tmux.is_some() };
     // The capability query reads stdin, so it must run before the event stream starts.
     let picker = term::picker(tmux.as_ref());
@@ -525,7 +534,7 @@ impl App {
     async fn on_terminal(&mut self, ev: Event) {
         match ev {
             Event::Key(k) => self.on_key(k).await,
-            Event::Mouse(_) => {}
+            Event::Mouse(m) => self.on_mouse(m).await,
             Event::Paste(text) => {
                 if self.mode != Mode::Nav || self.forwarding() {
                     self.editor.calls.request("nvim_paste", vec![text.into(), true.into(), (-1).into()]);
@@ -575,6 +584,18 @@ impl App {
                 Some(action) => self.on_action(action).await,
                 None => self.draw = true,
             },
+        }
+    }
+
+    /// The wheel pans the notebook in navigation mode, as `<C-e>` `<C-y>` do.
+    async fn on_mouse(&mut self, m: MouseEvent) {
+        let rows = match m.kind {
+            MouseEventKind::ScrollDown => WHEEL_ROWS,
+            MouseEventKind::ScrollUp => -WHEEL_ROWS,
+            _ => return,
+        };
+        if self.mode == Mode::Nav && !self.forwarding() {
+            self.on_action(Action::Pan(rows)).await;
         }
     }
 
@@ -760,6 +781,19 @@ impl App {
         self.relayout = true;
     }
 
+    /// Scrolls the view by `rows`, as Vim's `<C-e>` `<C-y>`: the selection stays unless its
+    /// cell leaves the view, when the nearest visible cell takes it.
+    fn pan(&mut self, rows: isize) {
+        let Some(g) = self.geometry else { return };
+        let layout = self.layout(&g);
+        let area = g.area_height();
+        self.scroll = self.scroll.saturating_add_signed(rows).min(layout.max_scroll(area));
+        if let Some(i) = layout.nearest_visible(self.scroll, area, self.selected) {
+            self.selected = i;
+        }
+        self.relayout = true;
+    }
+
     /// Scrolls the selected cell to the middle of the view.
     fn center(&mut self) {
         let Some(g) = self.geometry else { return };
@@ -809,6 +843,7 @@ impl App {
                 | Action::Last(_)
                 | Action::HalfPageDown
                 | Action::HalfPageUp
+                | Action::Pan(_)
                 | Action::Help
                 | Action::Cmdline
                 | Action::Search
@@ -839,6 +874,7 @@ impl App {
             Action::Last(Some(n)) => self.select(n.saturating_sub(1)),
             Action::HalfPageDown => self.scroll_by(area / 2),
             Action::HalfPageUp => self.scroll_by(-area / 2),
+            Action::Pan(rows) => self.pan(rows),
             Action::Center => self.center(),
             Action::Edit => match key {
                 Some(k) => self.enter(k, false),
