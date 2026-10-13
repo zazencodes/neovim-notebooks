@@ -12,7 +12,7 @@ Neovim Notebooks (`nvb`): a Rust/Ratatui TUI that edits Jupyter notebooks with a
 - `crates/nbv-nvim`: embedded Neovim client and cell buffer adapter.
 - `crates/nbv-tui`: event loop, layout, drawing.
 - `crates/nbv-cli`: the `nvb` binary.
-- `lua/nbv/init.lua`: Lua companion loaded into the embedded Neovim.
+- `crates/nbv-nvim/lua/nbv/init.lua`: Lua companion loaded into the embedded Neovim.
 - `.agents/docs/specs/`: design specs, local and git-ignored. Code comments cite their sections (`§7.6`): the v1 architecture spec, as amended by the cell-editors spec.
 
 ## Validation
@@ -30,16 +30,16 @@ Neovim Notebooks (`nvb`): a Rust/Ratatui TUI that edits Jupyter notebooks with a
 
 ## Releases
 
-The agent does the whole release. A release is a `vX.Y.Z` tag on `main`; pushing it runs `.github/workflows/release.yml`, which checks the tag against `Cargo.toml` and the README install command, then creates the GitHub release with the tag's `CHANGELOG.md` section (`scripts/release-notes.sh`) as its notes. Never create a release by hand.
+The agent does the whole release. A release is a `vX.Y.Z` tag on `main`; pushing it runs `.github/workflows/release.yml`, which checks the tag against `Cargo.toml`, then creates the GitHub release with the tag's `CHANGELOG.md` section (`scripts/release-notes.sh`) as its notes. Never create a release by hand.
 
 1. Start from a clean, up-to-date `main` with green CI, and run the full validation above.
 2. Pick the version from `## Unreleased` (SemVer; before 1.0 a breaking change bumps the minor, anything else the patch).
 3. In one commit, `Release vX.Y.Z`:
    - rename `## Unreleased` to `## X.Y.Z - YYYY-MM-DD` and add a new empty `## Unreleased` above it;
-   - set `version` in the root `Cargo.toml` and run `cargo check` so `Cargo.lock` follows;
-   - change the README install command to `--tag vX.Y.Z`.
+   - set `version` in the root `Cargo.toml`, including the `version` of the three `nbv-*` entries in `[workspace.dependencies]`, and run `cargo check` so `Cargo.lock` follows.
 4. Check the notes with `scripts/release-notes.sh X.Y.Z`.
 5. `git tag -a vX.Y.Z -m vX.Y.Z`, then `git push origin main vX.Y.Z`.
-6. Watch the workflow (`gh run watch`), then check with `gh release view vX.Y.Z` that the release exists, is not a draft or prerelease, and carries the changelog section.
+6. Publish to crates.io: `cargo publish --workspace` (publishes `nbv-core`, `nbv-nvim`, `nbv-tui`, `nvb` in dependency order).
+7. Watch the workflow (`gh run watch`), then check with `gh release view vX.Y.Z` that the release exists, is not a draft or prerelease, and carries the changelog section.
 
 If the workflow fails, fix the cause on `main`, delete the tag locally and on `origin`, and tag again. Fix notes on a published release in `CHANGELOG.md` and with `gh release edit vX.Y.Z --notes-file`, keeping both the same.

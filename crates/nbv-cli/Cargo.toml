@@ -1,13 +1,13 @@
 [package]
-name = "nbv-cli"
+name = "nvb"
+description = "Edit Jupyter notebooks in the terminal with an embedded Neovim"
+readme = "../../README.md"
+keywords = ["jupyter", "notebook", "neovim", "tui"]
+categories = ["command-line-utilities", "text-editors"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
-
-[[bin]]
-name = "nvb"
-path = "src/main.rs"
+repository.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

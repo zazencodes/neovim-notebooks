@@ -14,16 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Tag matches Cargo.toml and README
+      - name: Tag matches Cargo.toml
         run: |
           version="${GITHUB_REF_NAME#v}"
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nbv-cli") | .version')"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nvb") | .version')"
           if [ "$version" != "$cargo_version" ]; then
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
-            exit 1
-          fi
-          if ! grep -qF -- "--tag $GITHUB_REF_NAME nbv-cli" README.md; then
-            echo "README.md install command does not pin $GITHUB_REF_NAME" >&2
             exit 1
           fi
       - name: Release notes

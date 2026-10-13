@@ -16,7 +16,7 @@ use crate::client::{NvimClient, NvimError, NvimEvent, SpawnOptions, strings};
 use crate::grid::Grid;
 
 /// The companion (R6), embedded in the binary and loaded pre-config.
-pub const COMPANION: &str = include_str!("../../../lua/nbv/init.lua");
+pub const COMPANION: &str = include_str!("../lua/nbv/init.lua");
 
 /// The home buffer's name: the notebook's path under the `nbv://` scheme (§9.1).
 pub fn home_name(notebook: &Path) -> String {

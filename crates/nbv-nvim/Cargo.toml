@@ -4,7 +4,7 @@ description = "Neovim Notebooks: NvimClient boundary, grid model and cell buffer
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
 
 [features]
 # The integration harness (§16.6), for this crate's tests and the frontend's.

@@ -1,9 +1,10 @@
 [package]
 name = "nbv-tui"
+description = "Neovim Notebooks: event loop, layout, navigation mode and drawing for the nvb terminal UI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
 
 [dependencies]
 anyhow = "1"

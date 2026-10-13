@@ -9,9 +9,9 @@ license = "MIT"
 repository = "https://github.com/zazencodes/neovim-notebooks"
 
 [workspace.dependencies]
-nbv-core = { path = "crates/nbv-core" }
-nbv-nvim = { path = "crates/nbv-nvim" }
-nbv-tui = { path = "crates/nbv-tui" }
+nbv-core = { version = "0.1.2", path = "crates/nbv-core" }
+nbv-nvim = { version = "0.1.2", path = "crates/nbv-nvim" }
+nbv-tui = { version = "0.1.2", path = "crates/nbv-tui" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

@@ -42,7 +42,7 @@ https://github.com/user-attachments/assets/05df38a2-bb52-4fdd-b78e-aa6ffe8e3304
 ## Install
 
 ```
-cargo install --git https://github.com/zazencodes/neovim-notebooks --tag v0.1.2 nbv-cli
+cargo install nvb
 ```
 
 This installs the `nvb` binary. macOS and Linux are supported.
@@ -199,8 +199,8 @@ ipykernel ruff`). CI runs everything on Linux and macOS.
 | `nbv-core` | Lossless document, cell identity, structural changes with undo, persistence, kernel state machine and transport. Depends on neither Neovim nor Ratatui (`scripts/check-core-deps.sh`). |
 | `nbv-nvim` | `NvimClient` boundary, redraw stream and grid model, cell buffer adapter, and the integration harness (`harness` feature). |
 | `nbv-tui` | Event loop, notebook layout, navigation mode, compositor, output layer, image backend, terminal and tmux detection. |
-| `nbv-cli` | The `nvb` binary, and the tmux end-to-end harness. |
-| `lua/nbv` | The Lua companion loaded into the embedded Neovim. It holds no notebook state. |
+| `nvb` (`crates/nbv-cli`) | The `nvb` binary, and the tmux end-to-end harness. |
+| `crates/nbv-nvim/lua/nbv` | The Lua companion loaded into the embedded Neovim. It holds no notebook state. |
 
 `tests/corpus/` holds deliberately ugly notebooks. Every one must survive open → save without
 losing information.

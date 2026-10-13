@@ -5,6 +5,11 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+### Changed
+
+- nbv is published on crates.io. Install it with `cargo install nvb`; no `--git` or `--tag` is needed,
+  and the package is now named `nvb`, after the binary.
+
 ## 0.1.2 - 2026-10-13
 
 ### Added
