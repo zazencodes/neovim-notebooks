@@ -5,6 +5,8 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+## 0.1.4 - 2026-10-25
+
 ### Added
 
 - `zt` and `zb` in navigation mode scroll the selected cell to the top or bottom of the screen,
