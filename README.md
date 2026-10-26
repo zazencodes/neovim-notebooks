@@ -137,6 +137,13 @@ where it would be.
 
 **Language servers.** Each cell is its own buffer, so a language server sees each cell as a
 separate file. Names defined in one cell show as undefined in the next. This is a known gap.
+Cell buffers are named `<notebook>.ipynb.<cell>.py`, so a linter can skip these checks for
+them. For ruff, in its configuration:
+
+```toml
+[lint.per-file-ignores]
+"*.ipynb.*.py" = ["F401", "F821"]
+```
 
 **Troubleshooting.** `nvb --clean` starts Neovim without your configuration. If a problem goes
 away with `--clean`, its source is in your config or plugins.
