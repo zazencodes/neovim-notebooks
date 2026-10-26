@@ -794,10 +794,10 @@ impl App {
         self.relayout = true;
     }
 
-    /// Scrolls the selected cell to the middle of the view.
-    fn center(&mut self) {
+    /// Scrolls the selected cell to where `place` (`Layout::top`, `center` or `bottom`) puts it.
+    fn align(&mut self, place: fn(&Layout, usize, usize) -> Option<usize>) {
         let Some(g) = self.geometry else { return };
-        if let Some(scroll) = self.layout(&g).center(g.area_height(), self.selected) {
+        if let Some(scroll) = place(&self.layout(&g), g.area_height(), self.selected) {
             self.scroll = scroll;
             self.relayout = true;
         }
@@ -875,7 +875,9 @@ impl App {
             Action::HalfPageDown => self.scroll_by(area / 2),
             Action::HalfPageUp => self.scroll_by(-area / 2),
             Action::Pan(rows) => self.pan(rows),
-            Action::Center => self.center(),
+            Action::Top => self.align(Layout::top),
+            Action::Center => self.align(Layout::center),
+            Action::Bottom => self.align(Layout::bottom),
             Action::Edit => match key {
                 Some(k) => self.enter(k, false),
                 None => {

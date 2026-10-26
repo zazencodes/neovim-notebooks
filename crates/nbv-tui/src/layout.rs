@@ -118,6 +118,19 @@ impl Layout {
         scroll.min(self.max_scroll(area))
     }
 
+    /// The scroll offset that puts block `i` at the top of the area.
+    pub fn top(&self, area: usize, i: usize) -> Option<usize> {
+        let b = self.blocks.get(i)?;
+        Some(b.top.min(self.max_scroll(area)))
+    }
+
+    /// The scroll offset that puts the last row of block `i` (its last output row, not the
+    /// blank row after it) at the bottom of the area. A block taller than the area shows its end.
+    pub fn bottom(&self, area: usize, i: usize) -> Option<usize> {
+        let b = self.blocks.get(i)?;
+        Some((b.top + b.box_height() + b.outputs).saturating_sub(area))
+    }
+
     /// The scroll offset that puts block `i` in the middle of the area. A block taller than
     /// the area shows its top.
     pub fn center(&self, area: usize, i: usize) -> Option<usize> {
@@ -238,6 +251,24 @@ mod tests {
         assert_eq!(l.center(10, 2), Some(12), "a block taller than the area shows its top");
         assert_eq!(l.center(20, 2), Some(4), "the last block stops at the largest offset");
         assert_eq!(l.center(10, 3), None);
+    }
+
+    #[test]
+    fn top_puts_the_block_at_the_top() {
+        let l = layout();
+        assert_eq!(l.top(10, 1), Some(3));
+        assert_eq!(l.top(10, 2), Some(12), "a block taller than the area shows its top");
+        assert_eq!(l.top(20, 2), Some(4), "the last block stops at the largest offset");
+        assert_eq!(l.top(10, 3), None);
+    }
+
+    #[test]
+    fn bottom_puts_the_block_end_at_the_bottom() {
+        let l = layout();
+        assert_eq!(l.bottom(10, 1), Some(1), "b's last output row is 10, before the blank row");
+        assert_eq!(l.bottom(10, 0), Some(0), "the first block cannot go lower");
+        assert_eq!(l.bottom(10, 2), Some(14), "a block taller than the area shows its end");
+        assert_eq!(l.bottom(10, 3), None);
     }
 
     #[test]

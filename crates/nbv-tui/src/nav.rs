@@ -14,8 +14,12 @@ pub enum Action {
     HalfPageUp,
     /// Scroll the view by this many rows (up when negative), keeping the selection in view.
     Pan(isize),
+    /// Scroll the selected cell to the top of the view.
+    Top,
     /// Scroll the selected cell to the middle of the view.
     Center,
+    /// Scroll the end of the selected cell's outputs to the bottom of the view.
+    Bottom,
     /// Edit the selected cell.
     Edit,
     /// A new code cell below (or above), edited in insert mode.
@@ -75,7 +79,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("gg G {n}G", "first / last / nth cell"),
             ("<C-d> <C-u>", "scroll half a page, selecting the middle cell"),
             ("<C-e> <C-y>", "scroll a line down / up; counts work (5<C-e>)"),
-            ("zz", "center the cell on screen"),
+            ("zt zz zb", "cell to the top / center / bottom (its outputs' end)"),
             ("<CR>", "edit the cell"),
             ("o O", "new code cell below / above"),
             ("dd yy", "delete / yank the cell"),
@@ -157,7 +161,9 @@ impl Nav {
             (None, "<C-u>") => HalfPageUp,
             (None, "<C-e>") => Pan(n as isize),
             (None, "<C-y>") => Pan(-(n as isize)),
+            (Some("z"), "t") => Top,
             (Some("z"), "z") => Center,
+            (Some("z"), "b") => Bottom,
             (None, "<CR>") => Edit,
             (None, "o") => Open { above: false },
             (None, "O") => Open { above: true },
@@ -220,7 +226,7 @@ mod tests {
     #[test]
     fn chords() {
         assert_eq!(
-            feed(&["d", "d", "y", "y", "t", "m", "i", "i", "0", "0", "]", "e", "[", "e", "z", "z"]),
+            feed(&["d", "d", "y", "y", "t", "m", "i", "i", "0", "0", "]", "e", "[", "e", "z", "t", "z", "z", "z", "b"]),
             [
                 Action::Delete,
                 Action::Yank,
@@ -229,7 +235,9 @@ mod tests {
                 Action::Restart,
                 Action::MoveDown,
                 Action::MoveUp,
+                Action::Top,
                 Action::Center,
+                Action::Bottom,
             ]
         );
     }

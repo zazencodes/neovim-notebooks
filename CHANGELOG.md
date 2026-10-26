@@ -5,6 +5,12 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+### Added
+
+- `zt` and `zb` in navigation mode scroll the selected cell to the top or bottom of the screen,
+  alongside `zz`. `zb` puts the end of the cell's outputs on the bottom line, so a long output
+  ends at the bottom of the screen.
+
 ## 0.1.3 - 2026-10-13
 
 ### Changed
