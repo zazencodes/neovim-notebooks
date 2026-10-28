@@ -5,6 +5,11 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- A cell's output no longer goes missing when the kernel reports the cell finished before the
+  output arrives. Large outputs such as images were often dropped.
+
 ## 0.1.4 - 2026-10-25
 
 ### Added

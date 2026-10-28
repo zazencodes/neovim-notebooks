@@ -38,8 +38,11 @@ pub enum ExecEvent {
 
 #[derive(Default, Debug)]
 pub struct Executor {
-    /// execute_request `msg_id` → cell.
+    /// execute_request `msg_id` → cell, until both its execute_reply and its iopub idle have
+    /// arrived: they come on different channels, so outputs can still follow the reply.
     requests: HashMap<String, CellKey>,
+    /// Requests that have one of the two.
+    half_done: HashSet<String>,
     started: HashMap<CellKey, Instant>,
     /// Cells whose outputs clear on the next output (`clear_output(wait=True)`).
     clear_pending: HashSet<CellKey>,
@@ -106,6 +109,7 @@ impl Executor {
     /// Marks a cell as unable to run, with the reason shown under it.
     pub fn fail(&mut self, nb: &mut Notebook, key: &CellKey, reason: &str) -> ExecEvent {
         self.requests.retain(|_, k| k != key);
+        self.half_done.retain(|id| self.requests.contains_key(id));
         if let Some(rt) = nb.runtime_mut(key) {
             rt.exec = ExecState::Error;
             rt.error = Some(reason.to_string());
@@ -117,6 +121,7 @@ impl Executor {
     /// with `reason`.
     pub fn fail_all(&mut self, nb: &mut Notebook, reason: &str) -> Vec<ExecEvent> {
         let keys: Vec<CellKey> = self.requests.values().cloned().collect();
+        self.half_done.clear();
         let mut events: Vec<ExecEvent> = keys.iter().map(|k| self.fail(nb, k, reason)).collect();
         self.started.clear();
         self.clear_pending.clear();
@@ -134,6 +139,7 @@ impl Executor {
             }
             events.push(ExecEvent::Cell(key));
         }
+        self.half_done.clear();
         self.started.clear();
         self.clear_pending.clear();
         self.status = status;
@@ -170,6 +176,9 @@ impl Executor {
                     // Jupyter clears previous outputs when execution starts.
                     self.clear_outputs_for_run(nb, k);
                     events.push(ExecEvent::Cell(k.clone()));
+                }
+                if let (Some(p), Some(_), KernelStatus::Idle) = (parent, &key, status) {
+                    self.done_half(p);
                 }
             }
             JupyterMessageContent::ExecuteInput(input) => {
@@ -253,10 +262,10 @@ impl Executor {
             }
             JupyterMessageContent::ExecuteReply(r) => {
                 if let Some(p) = parent
-                    && let Some(k) = self.requests.remove(p)
+                    && let Some(k) = self.requests.get(p).cloned()
                 {
+                    self.done_half(p);
                     let started = self.started.remove(&k);
-                    self.clear_pending.remove(&k);
                     if let Some(cell) = nb.cell_mut(&k) {
                         cell.runtime.exec = match r.status {
                             ReplyStatus::Ok => ExecState::Ok,
@@ -277,6 +286,17 @@ impl Executor {
             _ => {}
         }
         events
+    }
+
+    /// Records a request's execute_reply or iopub idle; on the second, the request is over.
+    fn done_half(&mut self, msg_id: &str) {
+        if self.half_done.remove(msg_id) {
+            if let Some(k) = self.requests.remove(msg_id) {
+                self.clear_pending.remove(&k);
+            }
+        } else {
+            self.half_done.insert(msg_id.to_string());
+        }
     }
 
     fn clear_outputs_for_run(&mut self, nb: &mut Notebook, key: &CellKey) {
@@ -419,6 +439,7 @@ mod tests {
         ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout("2\n"), Some(&req)));
         ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stderr("warn\n"), Some(&req)));
         ex.handle(&mut nb, &reply(&req, ReplyStatus::Ok, 7));
+        ex.handle(&mut nb, &JupyterMessage::new(Status::idle(), Some(&req)));
         let cell = nb.cell(&key).unwrap();
         assert_eq!(cell.runtime.exec, ExecState::Ok);
         assert_eq!(cell.execution_count(), Some(7));
@@ -431,6 +452,32 @@ mod tests {
             ])
         );
         assert!(!cell.is_stale());
+        assert_eq!(ex.in_flight().count(), 0);
+    }
+
+    #[test]
+    fn outputs_after_the_reply_are_kept() {
+        let (mut nb, mut ex, req, key) = setup();
+        ex.handle(&mut nb, &JupyterMessage::new(Status::busy(), Some(&req)));
+        ex.handle(&mut nb, &reply(&req, ReplyStatus::Ok, 1));
+        assert_eq!(ex.in_flight().count(), 1, "iopub may still carry outputs");
+        ex.handle(
+            &mut nb,
+            &JupyterMessage::new(DisplayData::new(Media::new(vec![MediaType::Plain("img".into())])), Some(&req)),
+        );
+        ex.handle(&mut nb, &JupyterMessage::new(Status::idle(), Some(&req)));
+        assert_eq!(nb.cell(&key).unwrap().outputs().len(), 1);
+        assert_eq!(ex.in_flight().count(), 0);
+    }
+
+    #[test]
+    fn a_reply_after_idle_still_finishes() {
+        let (mut nb, mut ex, req, key) = setup();
+        ex.handle(&mut nb, &JupyterMessage::new(Status::busy(), Some(&req)));
+        ex.handle(&mut nb, &JupyterMessage::new(Status::idle(), Some(&req)));
+        ex.handle(&mut nb, &reply(&req, ReplyStatus::Ok, 2));
+        assert_eq!(nb.cell(&key).unwrap().runtime.exec, ExecState::Ok);
+        assert_eq!(nb.cell(&key).unwrap().execution_count(), Some(2));
         assert_eq!(ex.in_flight().count(), 0);
     }
 
