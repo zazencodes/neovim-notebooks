@@ -5,6 +5,8 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+## 0.1.5 - 2026-10-27
+
 ### Fixed
 
 - A cell's output no longer goes missing when the kernel reports the cell finished before the
