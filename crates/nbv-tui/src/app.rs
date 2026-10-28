@@ -548,11 +548,15 @@ impl App {
             }
             Event::FocusGained => {
                 self.editor.calls.request("nvim_ui_set_focus", vec![true.into()]);
-                if self.tmux.is_some() {
-                    // A reattached client may be a different terminal: resend image data.
-                    self.protocols.clear();
-                    let _ = self.terminal.clear();
-                    self.draw = true;
+                // Focus moves between panes and apps all the time; the terminal keeps the
+                // images. Only a different client needs them sent again.
+                if let Some(t) = &mut self.tmux {
+                    let client = term::tmux_client();
+                    if client != t.client {
+                        t.client = client;
+                        self.protocols.clear();
+                        self.draw = true;
+                    }
                 }
             }
             Event::FocusLost => self.editor.calls.request("nvim_ui_set_focus", vec![false.into()]),

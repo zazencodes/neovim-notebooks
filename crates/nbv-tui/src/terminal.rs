@@ -25,6 +25,8 @@ pub struct Tmux {
     /// tmux gets modified keys (`<S-CR>`) from the outer terminal and passes them on in the
     /// CSI u form nbv reads (§10.2).
     pub extended_keys: bool,
+    /// The tmux client last seen drawing nbv's pane: Kitty images live in its terminal.
+    pub client: String,
 }
 
 fn classify(name: &str) -> Term {
@@ -64,6 +66,12 @@ fn tmux(args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The tmux client now drawing nbv's pane, by process: a reattach is a new client even on the
+/// same terminal, whose screen no longer holds nbv's images.
+pub fn tmux_client() -> String {
+    tmux(&["display-message", "-p", "#{client_pid}"]).unwrap_or_default()
+}
+
 /// Queries the tmux server for what image support depends on, and the outer terminal. The
 /// outer terminal is identified through tmux: capability replies inside tmux describe tmux.
 /// Passthrough is turned on for nbv's own pane, so Kitty graphics reach the outer terminal.
@@ -91,6 +99,7 @@ pub fn probe_tmux() -> Tmux {
             && server("extended-keys-format") == "csi-u"
             // Without it, tmux never asks the outer terminal to report modifiers.
             && features.split(',').any(|f| f == "extkeys"),
+        client: tmux_client(),
     }
 }
 

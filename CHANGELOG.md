@@ -5,6 +5,12 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- Inside tmux, switching panes, windows or apps no longer blanks nbv and sends every visible
+  image to the terminal again (several megabytes each time, kept in the terminal's memory).
+  Images are sent again only when a different tmux client shows the pane.
+
 ## 0.1.5 - 2026-10-27
 
 ### Fixed
