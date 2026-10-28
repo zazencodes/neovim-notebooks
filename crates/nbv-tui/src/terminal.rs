@@ -66,8 +66,12 @@ fn tmux(args: &[&str]) -> Option<String> {
 
 /// Queries the tmux server for what image support depends on, and the outer terminal. The
 /// outer terminal is identified through tmux: capability replies inside tmux describe tmux.
+/// Passthrough is turned on for nbv's own pane, so Kitty graphics reach the outer terminal.
 pub fn probe_tmux() -> Tmux {
-    let opt = |name: &str| tmux(&["show-options", "-gv", name]).unwrap_or_default();
+    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    let passthrough =
+        matches!(tmux(&["show-options", "-pvA", "-t", &pane, "allow-passthrough"]).as_deref(), Some("on" | "all"))
+            || tmux(&["set-option", "-p", "-t", &pane, "allow-passthrough", "on"]).is_some();
     let server = |name: &str| tmux(&["show-options", "-sv", name]).unwrap_or_default();
     let client = tmux(&["display-message", "-p", "#{client_termname}\t#{client_termtype}\t#{client_termfeatures}"])
         .unwrap_or_default();
@@ -80,7 +84,7 @@ pub fn probe_tmux() -> Tmux {
         t => t,
     };
     Tmux {
-        passthrough: matches!(opt("allow-passthrough").as_str(), "on" | "all"),
+        passthrough,
         sixel: features.split(',').any(|f| f == "sixel"),
         outer: Some(outer),
         extended_keys: matches!(server("extended-keys").as_str(), "on" | "always")

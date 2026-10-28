@@ -164,7 +164,7 @@ fn run_image_input_edit_and_save_inside_tmux() {
         eprintln!("skipped: needs tmux, Neovim 0.12 and .venv");
         return;
     };
-    // tmux here has no allow-passthrough, so images fall back to halfblocks.
+    // The outer terminal here is neither Kitty nor Ghostty, so images fall back to halfblocks.
     // Each cell is a box.
     s.wait_until("boxed cells", |s| s.contains('╭') && s.contains("│print(6 * 7)"));
 

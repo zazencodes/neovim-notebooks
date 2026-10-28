@@ -155,8 +155,8 @@ nbv picks a graphics mechanism per terminal. Where none works, images fall back 
 
 | Terminal | Direct | Inside tmux |
 |---|---|---|
-| Kitty | Kitty protocol | Kitty Unicode placeholders (needs `allow-passthrough`) |
-| Ghostty | Kitty protocol | Kitty Unicode placeholders (needs `allow-passthrough`) |
+| Kitty | Kitty protocol | Kitty Unicode placeholders |
+| Ghostty | Kitty protocol | Kitty Unicode placeholders |
 | WezTerm | iTerm2 protocol | tmux-native Sixel if tmux has Sixel, else halfblocks |
 | Others | Sixel if detected, else halfblocks | tmux-native Sixel if available, else halfblocks |
 
@@ -180,15 +180,9 @@ set -as terminal-features 'xterm*:extkeys'
 `extended-keys on` (not `always`) changes nothing for programs that don't ask for modified
 keys, such as your shell. The third line makes tmux ask your terminal for them.
 
-Images need no tmux configuration: they are drawn as coloured text (halfblocks) inside tmux
-by default. For sharp images in Kitty or Ghostty, enable passthrough:
-
-```tmux
-set -g allow-passthrough on
-```
-
-Passthrough lets any program in a pane send escape sequences straight to your terminal,
-bypassing tmux. Leave it off if you don't want that.
+Images need no tmux configuration. In Kitty or Ghostty, nbv turns on `allow-passthrough` for
+its own pane, so images reach your terminal at full resolution. Passthrough lets programs in
+that pane send escape sequences straight to your terminal, bypassing tmux.
 
 ## Development
 

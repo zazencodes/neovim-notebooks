@@ -9,6 +9,8 @@ before 1.0, a breaking change bumps the minor version.
 
 - A cell's output no longer goes missing when the kernel reports the cell finished before the
   output arrives. Large outputs such as images were often dropped.
+- Images inside tmux in Kitty or Ghostty are drawn at full resolution instead of halfblocks.
+  nbv turns on `allow-passthrough` for its own pane; no tmux configuration is needed.
 
 ## 0.1.4 - 2026-10-25
 
