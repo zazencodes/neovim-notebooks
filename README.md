@@ -256,22 +256,29 @@ CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=2 scripts/bench-stream.sh 68a896
 
 Use your isolated build-cache path for `CARGO_TARGET_DIR` when working alongside other
 checkouts. The script leaves the checkout alone, removes its temporary baseline snapshot,
-and uses the supplied build directory for both builds. It measures kernel-message handling
+and uses the supplied build directory for both builds. Before each build it cleans only the
+four workspace packages' release artifacts, keeping third-party dependencies while forcing
+path-dependent code and embedded harness paths to rebuild. It measures kernel-message handling
 alone and handling plus rebuilding the inline view after every 62-byte ANSI/UTF-8 stream
 chunk, at width 80. Each run verifies that every output line remains in the document.
-Compilation and notebook setup are outside the timed region.
+This is a component benchmark of `Executor::handle` and `outputs::build_cached`; application
+layout, image preparation and terminal drawing are outside its scope. Compilation and
+notebook setup are outside the timed region.
 
 Measured on an Apple Silicon Mac on 2026-11-09 (milliseconds, one run, concurrent development
 workloads; compare scaling rather than treating the timings as fixed thresholds):
 
 | Chunks | Baseline append | Incremental append | Baseline append + view | Incremental append + view |
 |---:|---:|---:|---:|---:|
-| 1,000 | 62.883 | 0.256 | 240.303 | 10.072 |
-| 4,000 | 1,017.980 | 0.981 | 3,910.209 | 41.007 |
-| 16,000 | 17,506.601 | 4.053 | 65,015.608 | 165.891 |
+| 1,000 | 63.164 | 0.273 | 232.794 | 11.605 |
+| 4,000 | 1,008.576 | 1.045 | 3,954.077 | 60.665 |
+| 16,000 | 17,778.293 | 5.910 | 96,169.023 | 559.641 |
 
-The 16× input increase takes about 16.5× as long with incremental rendering, compared with
-270.6× for the baseline. At 16,000 chunks, handling plus rendering is about 392× faster.
+These measurements were repeated with workspace release artifacts cleaned before each
+build, and supersede the initial shared-cache measurements. At 16,000 chunks, this
+component's handling plus rendering is about 172× faster. Concurrent load affects elapsed
+scaling; the parsed-byte regression independently verifies that later-line rewrites do not
+reparse earlier history. These figures do not measure whole-application throughput.
 Width changes, reloads and explicit display replacements rebuild derived text from the full
 saved output. Appends reuse the bounded rendered tail, including across stdout/stderr
 boundaries and within a long unterminated line.

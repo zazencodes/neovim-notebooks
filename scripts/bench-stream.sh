@@ -21,7 +21,15 @@ pub fn build_cached(cell: &Cell, width: u16, font: FontSize, images: &mut Images
     build(cell, width, font, images)
 }
 RUST
+# Path-dependent workspace artifacts embed source and harness paths. Rebuild all
+# workspace crates at each boundary while retaining third-party dependency artifacts.
+clean_workspace() {
+    CARGO_TARGET_DIR="$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo clean --release --manifest-path "$1" \
+        -p nbv-core -p nbv-nvim -p nbv-tui -p nvb
+}
 printf 'baseline %s\n' "$baseline"
+clean_workspace "$snapshot/Cargo.toml"
 CARGO_TARGET_DIR="$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo run --quiet --release --manifest-path "$snapshot/Cargo.toml" -p nbv-tui --example stream-scaling
 printf 'working tree\n'
+clean_workspace "$root/Cargo.toml"
 CARGO_TARGET_DIR="$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo run --quiet --release --manifest-path "$root/Cargo.toml" -p nbv-tui --example stream-scaling
