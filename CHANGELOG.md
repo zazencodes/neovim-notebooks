@@ -5,6 +5,8 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-09
+
 ### Added
 
 - `nvb --create path.ipynb` creates an empty Python notebook, refusing existing paths.
@@ -16,7 +18,6 @@ before 1.0, a breaking change bumps the minor version.
   in your Neovim config: diagnostics, completion and auto-imports, definitions, references and
   rename see code cells together, including unsaved edits. Cell buffers keep their own text,
   plugins and editing behavior; ordinary files keep their configured LSP attachment.
-
 - Unsaved notebook sources, structure and outputs receive durable crash recovery snapshots
   about once a second, including during Insert mode. Reopening offers recovery or discard
   for that file; recovery preserves protection against external changes. Snapshots follow
@@ -31,18 +32,14 @@ before 1.0, a breaking change bumps the minor version.
   preserving external-change protection.
 - Redrawing an unchanged executed cell reuses its edited-state check, keeping giant cell
   sources out of redraw and output-only updates.
-
 - Recently viewed plots reuse their cached images when scrolling back within the cache budget.
   Replaced, cleared, and evicted Kitty images release their terminal image data explicitly.
-
 - Continuous redraws also yield to kernel startup, install results, and RPC errors.
-
 - Scrolling and selecting cells reuse the notebook layout until cell heights or width change,
   keeping navigation responsive in notebooks with many offscreen cells.
-
 - Plot images decode only when visible. Decoded images and terminal image encodings now have
-  byte budgets and release obsolete plots when outputs are replaced, cleared, or scrolled away.
-
+  byte budgets and release obsolete plots when outputs are replaced, cleared, or evicted from
+  the offscreen cache.
 - Large notebooks keep rendering work within the visible cells and rows, and sustained kernel
   or Neovim output yields between batches so input and drawing keep progressing.
 - Kernel transport and send failures now fail queued and running cells with a restart action.
@@ -52,7 +49,6 @@ before 1.0, a breaking change bumps the minor version.
   status and RPC error. Local lifecycle logs are bounded and exclude notebook contents.
 - Long-running text output stays responsive as it grows, while the notebook keeps the full
   output and the inline view shows its latest rows.
-
 - Late responses to canceled language-server requests no longer overwrite current cell
   diagnostics, including empty Pyright diagnostic reports returned after cancellation.
 - Scrolling a notebook no longer rebuilds or sends its full language-server document on
