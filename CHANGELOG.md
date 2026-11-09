@@ -5,6 +5,10 @@ before 1.0, a breaking change bumps the minor version.
 
 ## Unreleased
 
+### Added
+
+- `nvb --create path.ipynb` creates an empty Python notebook, refusing existing paths.
+
 ### Fixed
 
 - Inside tmux, switching panes, windows or apps no longer blanks nbv and sends every visible

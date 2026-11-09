@@ -1,5 +1,6 @@
 //! Neovim Notebooks core. Depends on neither Neovim nor Ratatui (R5).
 
+pub mod create;
 pub mod document;
 pub mod exec;
 pub mod kernel;

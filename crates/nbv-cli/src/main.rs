@@ -11,6 +11,9 @@ use clap::Parser;
 struct Cli {
     /// The notebook to open.
     notebook: PathBuf,
+    /// Create an empty Python notebook and exit; refuses existing paths.
+    #[arg(long, conflicts_with_all = ["clean", "nvim"])]
+    create: bool,
     /// Start Neovim without your configuration, to tell nvb bugs from plugin conflicts.
     #[arg(long)]
     clean: bool,
@@ -39,6 +42,18 @@ fn nvim_version(program: &PathBuf) -> Result<(u32, u32), String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.create {
+        return match nbv_core::create::create(&cli.notebook) {
+            Ok(()) => {
+                println!("created {}", cli.notebook.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("nvb: cannot create {}: {e}", cli.notebook.display());
+                ExitCode::FAILURE
+            }
+        };
+    }
     let nvim = cli.nvim.or_else(|| std::env::var_os("NBV_NVIM").map(PathBuf::from)).unwrap_or_else(|| "nvim".into());
     match nvim_version(&nvim) {
         Ok(v) if v >= MIN_NVIM => {}

@@ -12,6 +12,7 @@ repository.workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 nbv-tui.workspace = true
+nbv-core.workspace = true
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]

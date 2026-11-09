@@ -1701,6 +1701,7 @@ name = "nvb"
 version = "0.1.5"
 dependencies = [
  "clap",
+ "nbv-core",
  "nbv-tui",
  "serde_json",
  "tempfile",

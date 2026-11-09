@@ -61,6 +61,10 @@ This installs the `nvb` binary. macOS and Linux are supported.
 
 ## Use
 
+`nvb --create <notebook.ipynb>` creates an empty Python 3 notebook and exits. The parent
+directory must exist; an existing path is always refused. Open it normally, then use the
+header kernel picker to select another kernel.
+
 `nvb <notebook.ipynb>` opens the notebook. Each cell is a box with its execution count on the
 left and its outputs underneath. nbv has two modes, shown in the header.
 
