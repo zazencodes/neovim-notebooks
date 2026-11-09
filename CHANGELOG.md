@@ -15,6 +15,8 @@ before 1.0, a breaking change bumps the minor version.
 
 ### Fixed
 
+- Continuous redraws also yield to kernel startup, install results, and RPC errors.
+
 - Scrolling and selecting cells reuse the notebook layout until cell heights or width change,
   keeping navigation responsive in notebooks with many offscreen cells.
 

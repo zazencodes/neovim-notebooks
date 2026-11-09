@@ -313,13 +313,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 app.draw = true;
             }
         }
-        // Coalesce whatever else is already waiting before drawing.
-        for ev in ready_batch(&mut nvim_rx) {
-            app.on_nvim(ev).await;
-        }
-        for msg in ready_batch(&mut kernel_rx) {
-            app.on_kernel(msg).await;
-        }
+        app.service_ready(&mut nvim_rx, &mut kernel_rx, &mut start_rx, &mut err_rx).await;
         if app.relayout {
             app.relayout();
         }
@@ -350,6 +344,30 @@ fn rgb(c: Option<u32>) -> Option<Color> {
 
 impl App {
     /// Starts the chosen kernel. Without one, `kernel_error` already says why.
+    /// Every background channel gets a bounded service slot per turn, even when the
+    /// input/tick-prioritized select repeatedly chooses a ready Neovim stream.
+    async fn service_ready(
+        &mut self,
+        nvim: &mut mpsc::UnboundedReceiver<NvimEvent>,
+        kernel: &mut mpsc::UnboundedReceiver<KernelMessage>,
+        starts: &mut mpsc::UnboundedReceiver<KernelStart>,
+        errors: &mut mpsc::UnboundedReceiver<NvimError>,
+    ) {
+        for ev in ready_batch(nvim) {
+            self.on_nvim(ev).await;
+        }
+        for msg in ready_batch(kernel) {
+            self.on_kernel(msg).await;
+        }
+        for start in ready_batch(starts) {
+            self.on_kernel_start(start).await;
+        }
+        for error in ready_batch(errors) {
+            self.message = Some(error.to_string());
+            self.draw = true;
+        }
+    }
+
     fn start_kernel(&mut self) {
         self.generation += 1;
         let Some(cmd) = self.kernel_cmd.clone() else {
@@ -1943,6 +1961,29 @@ mod tests {
         );
         trim_protocols(&mut protocols, &[id], font, 1);
         assert!(protocols.is_empty(), "oversized encodings are transient");
+    }
+
+    #[tokio::test]
+    async fn redraw_flood_cannot_starve_kernel_start_install_results_or_rpc_errors() {
+        let (_h, mut app) = fixture_app().await;
+        app.nvim_ready = false;
+        let (ntx, mut nvim) = mpsc::unbounded_channel();
+        let (ktx, mut kernel) = mpsc::unbounded_channel();
+        let (stx, mut starts) = mpsc::unbounded_channel();
+        let (etx, mut errors) = mpsc::unbounded_channel();
+        for _ in 0..EVENT_BATCH * 10 {
+            ntx.send(NvimEvent::Redraw(vec![])).unwrap();
+            ktx.send(KernelMessage::Died { generation: u64::MAX, stderr: String::new() }).unwrap();
+        }
+        stx.send(KernelStart::Ready(0, Box::new(Err(KernelError::Connection("startup sentinel".into()))))).unwrap();
+        stx.send(KernelStart::MissingIpykernel(0, vec!["install sentinel".into()])).unwrap();
+        etx.send(NvimError::Rpc("rpc sentinel".into())).unwrap();
+        app.service_ready(&mut nvim, &mut kernel, &mut starts, &mut errors).await;
+        assert_eq!(nvim.len(), EVENT_BATCH * 9, "redraw producer remains flooded");
+        assert_eq!(kernel.len(), EVENT_BATCH * 9, "kernel producer remains flooded");
+        assert!(app.kernel_error.as_deref().unwrap().contains("startup sentinel"));
+        assert_eq!(app.install, Some((0, vec!["install sentinel".into()])));
+        assert_eq!(app.message.as_deref(), Some("rpc sentinel"));
     }
 
     #[test]
