@@ -394,7 +394,8 @@ fn help_and_the_header() {
     // The kernel item opens a list moved through with motions; q cancels it.
     s.keys(&["k", "l", "Enter"]);
     // The active virtualenv is offered.
-    s.wait_until("the kernel list", |s| s.contains("<CR> picks · q cancels") && s.contains("neovim-notebooks/.venv"));
+    let venv = root().join(".venv");
+    s.wait_until("the kernel list", |s| s.contains("<CR> picks · q cancels") && s.contains(venv.to_str().unwrap()));
     s.keys(&["j", "k", "q"]);
     s.wait_until("the kernel list closed", |s| s.contains(" NAV") && !s.contains("<CR> picks"));
     // <CR> picks the kernel under the cursor, and nbv restarts onto it.
