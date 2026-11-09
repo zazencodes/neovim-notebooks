@@ -5,7 +5,7 @@
 //! (command line, pickers, completion) on top. Keys go to nbv's navigation mode while the
 //! home window has focus, and to Neovim while a cell (or anything else) does.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -119,6 +119,8 @@ struct App {
     views: HashMap<CellKey, OutputView>,
     images: Images,
     source_rows: HashMap<CellKey, usize>,
+    collapsed_outputs: HashSet<CellKey>,
+    artifacts: crate::inspect::Artifacts,
     protocols: HashMap<(u64, u16, u16), SlicedProtocol>,
     picker: Picker,
     tmux: Option<Tmux>,
@@ -253,6 +255,8 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         views: HashMap::new(),
         images: Images::default(),
         source_rows: HashMap::new(),
+        collapsed_outputs: HashSet::new(),
+        artifacts: crate::inspect::Artifacts::new()?,
         protocols: HashMap::new(),
         picker,
         tmux,
@@ -965,6 +969,16 @@ impl App {
                     self.advance(&k);
                 }
             }
+            Action::ToggleOutput => {
+                if let Some(k) = key {
+                    if !self.collapsed_outputs.remove(&k) {
+                        self.collapsed_outputs.insert(k.clone());
+                    }
+                    self.views.remove(&k);
+                    self.relayout = true;
+                    self.draw = true;
+                }
+            }
             Action::Interrupt => self.interrupt().await,
             Action::Restart => self.restart().await,
             Action::Cmdline => {
@@ -1074,6 +1088,36 @@ impl App {
                     }
                 }
             }
+            "inspect_output" => {
+                if let Some(k) = key {
+                    let mime = field(args, "mime").and_then(Value::as_str).filter(|s| !s.is_empty());
+                    match crate::inspect::lines(self.nb.cell(&k).expect("live cell"), mime) {
+                        Ok(lines) => {
+                            let lines = Value::Array(lines.into_iter().map(Value::from).collect());
+                            self.editor.calls.lua("require('nbv').output_view(...)", vec![lines, k.as_str().into()]);
+                        }
+                        Err(e) => {
+                            self.message = Some(format!("{e:#}"));
+                            self.draw = true;
+                        }
+                    }
+                }
+            }
+            "open_output" => {
+                if let Some(k) = key {
+                    let index = field(args, "index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let mime = field(args, "mime").and_then(Value::as_str).unwrap_or("");
+                    let result = self.artifacts.extract(self.nb.cell(&k).expect("live cell"), index, mime);
+                    self.message = Some(match result {
+                        Ok(path) => match self.artifacts.open(&path).await {
+                            Ok(()) => format!("opened {mime} output {index}: {}", path.display()),
+                            Err(e) => format!("{e:#}"),
+                        },
+                        Err(e) => format!("{e:#}"),
+                    });
+                    self.draw = true;
+                }
+            }
             "clear_output" => {
                 let all = field(args, "all").and_then(Value::as_bool).unwrap_or(false);
                 let keys = if all { self.code_cells() } else { key.into_iter().collect() };
@@ -1150,7 +1194,10 @@ impl App {
         let font = self.picker.font_size();
         if self.views.get(key).is_none_or(|v| v.width != width) {
             let cell = self.nb.cell(key)?;
-            let view = outputs::build(cell, width, font, &mut self.images);
+            let mut view = outputs::build(cell, width, font, &mut self.images);
+            if self.collapsed_outputs.contains(key) {
+                view.collapse();
+            }
             self.views.insert(key.clone(), view);
         }
         self.views.get(key)
@@ -1575,6 +1622,8 @@ mod tests {
             views: HashMap::new(),
             images: Images::default(),
             source_rows: HashMap::new(),
+            collapsed_outputs: HashSet::new(),
+            artifacts: crate::inspect::Artifacts::new().unwrap(),
             protocols: HashMap::new(),
             picker: Picker::halfblocks(),
             tmux: None,

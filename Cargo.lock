@@ -1563,6 +1563,7 @@ dependencies = [
  "ratatui-image",
  "rmpv",
  "serde_json",
+ "tempfile",
  "tokio",
  "unicode-width",
 ]

@@ -76,6 +76,7 @@ left and its outputs underneath. nbv has two modes, shown in the header.
 | `gg` `G` `{n}G` | First / last / nth cell |
 | `<C-d>` `<C-u>` | Scroll half a page and select the cell in the middle of the screen |
 | `<C-e>` `<C-y>` | Scroll a line down / up, as in Vim; counts work (`5<C-e>`). The mouse wheel scrolls three lines |
+| `za` | Collapse / expand the selected cell's outputs |
 | `zt` `zz` `zb` | Scroll the cell to the top / center / bottom of the screen, as in Vim. `zb` puts the end of the cell's outputs on the bottom line |
 | `Enter` | Edit the cell |
 | `o` `O` | New code cell below / above, selected; repeat to add several |
@@ -118,6 +119,28 @@ selected one.
 the next cell with a match, and `n` `N` go on to the next or previous one, wrapping around.
 `'ignorecase'`, `'smartcase'` and `'wrapscan'` apply as in any buffer. Matches are highlighted
 in every cell, and inside a cell `n` moves between them as usual.
+
+**Inspecting outputs.** Inline output shows the last 40 text rows. `:NvbOutput` opens a
+read-only Neovim scratch buffer containing every output from the current cell, at full length.
+Use `/`, `n`, Visual selection, `y` or `yy` as usual; `q` or `Esc` in Normal mode closes it.
+This is a snapshot; close and reopen it to see new output. ANSI colors are removed for text
+inspection. Rich output prefers `text/plain` (including the kernel's formatted tables), then
+`application/vnd.dataresource+json` as tab-separated rows, then formatted `application/json`.
+Other MIME types are listed explicitly. `:NvbOutput text/html` requests that MIME's source
+for rich outputs; a missing representation reports an error. Source search in navigation
+mode continues to search cell source. `za` toggles inline output collapse per cell for this
+session; it preserves the output in the notebook and in the full viewer.
+
+`:NvbOpenOutput <output-number> <mime>` deliberately opens one rich representation externally,
+using `open` on macOS or `xdg-open` on Linux. Numbers in the full viewer start at 1. For example,
+`:NvbOpenOutput 2 text/html` opens the second output's HTML, and
+`:NvbOpenOutput 1 image/svg+xml` opens SVG. Supported MIME types are `text/html`, `image/svg+xml`,
+`text/plain`, `text/csv`, `application/json`, `image/png`, `image/jpeg` and `image/gif`.
+The command requires an explicit MIME and reports missing or unsupported data and opener
+failures. HTML and SVG run in your external application's security context and may load
+remote resources or active content: open only trusted output. Nothing opens automatically.
+Extracted files live in a private temporary directory until nbv exits; save a copy in the
+external application to keep one. The notebook retains every original MIME representation.
 
 **Saving.** The notebook saves itself about a second after a change, cell outputs included,
 whenever Neovim is in Normal mode: never while you type in Insert mode or on the command line.

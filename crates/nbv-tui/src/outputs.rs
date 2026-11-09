@@ -46,6 +46,16 @@ pub struct OutputView {
     pub width: u16,
 }
 
+impl OutputView {
+    /// Collapse only the display; the notebook retains all output data.
+    pub fn collapse(&mut self) {
+        if self.height > 0 {
+            self.blocks = vec![Block::Text(vec![Line::styled("[outputs collapsed · za expands]", dim())])];
+            self.height = 1;
+        }
+    }
+}
+
 /// Decoded images by content hash, so re-rendering does not re-decode.
 #[derive(Default)]
 pub struct Images {

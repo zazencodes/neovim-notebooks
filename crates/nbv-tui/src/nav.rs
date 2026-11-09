@@ -42,6 +42,7 @@ pub enum Action {
     Run,
     /// Run the cell and select the next (past the end, add one and edit it).
     RunAdvance,
+    ToggleOutput,
     Interrupt,
     Restart,
     /// Neovim's command line.
@@ -79,6 +80,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("gg G {n}G", "first / last / nth cell"),
             ("<C-d> <C-u>", "scroll half a page, selecting the middle cell"),
             ("<C-e> <C-y>", "scroll a line down / up; counts work (5<C-e>)"),
+            ("za", "collapse / expand this cell's outputs"),
             ("zt zz zb", "cell to the top / center / bottom (its outputs' end)"),
             ("<CR>", "edit the cell"),
             ("o O", "new code cell below / above"),
@@ -117,6 +119,8 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             (":NvbRunAll", "run every code cell"),
             (":NvbRunAbove", "run the code cells above this one"),
             (":NvbSplit", "split the edited cell at the cursor"),
+            (":NvbOutput [mime]", "inspect full output; native search and yank"),
+            (":NvbOpenOutput <number> <mime>", "open an artifact externally for this session"),
             (":NvbClearOutput[!]", "clear this cell's outputs (! for every cell)"),
         ],
     ),
@@ -164,6 +168,7 @@ impl Nav {
             (Some("z"), "t") => Top,
             (Some("z"), "z") => Center,
             (Some("z"), "b") => Bottom,
+            (Some("z"), "a") => ToggleOutput,
             (None, "<CR>") => Edit,
             (None, "o") => Open { above: false },
             (None, "O") => Open { above: true },
@@ -225,6 +230,7 @@ mod tests {
 
     #[test]
     fn chords() {
+        assert_eq!(feed(&["z", "a"]), [Action::ToggleOutput]);
         assert_eq!(
             feed(&["d", "d", "y", "y", "t", "m", "i", "i", "0", "0", "]", "e", "[", "e", "z", "t", "z", "z", "z", "b"]),
             [

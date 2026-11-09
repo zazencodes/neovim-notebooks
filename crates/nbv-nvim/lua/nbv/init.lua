@@ -375,7 +375,7 @@ end
 function M.act(action, extra)
   local args = extra or {}
   local win = api.nvim_get_current_win()
-  args.key = window_key(win)
+  args.key = window_key(win) or vim.w[win].nbv_output_key
   args.line = api.nvim_win_get_cursor(win)[1] - 1
   notify(action, args)
 end
@@ -582,6 +582,23 @@ local function open_list(lines, title)
   return buf, win, function()
     api.nvim_win_close(win, true)
     M.leave()
+  end
+end
+
+--- A full, immutable output snapshot. Native search, Visual selection and yank apply.
+function M.output_view(lines, key)
+  local previous = {}
+  for _, win in ipairs(api.nvim_list_wins()) do
+    if vim.w[win].nbv_output_key then previous[#previous + 1] = win end
+  end
+  local buf, win, close = open_list(lines, ' Output · / searches · y yanks · q closes ')
+  api.nvim_buf_set_var(buf, 'nbv_output_key', key)
+  -- Preserve the cell target for output commands issued from this viewer.
+  api.nvim_win_set_var(win, 'nbv_output_key', key)
+  for _, old in ipairs(previous) do api.nvim_win_close(old, true) end
+  set_local(win, 'wrap', false)
+  for _, k in ipairs({ 'q', '<Esc>' }) do
+    vim.keymap.set('n', k, close, { buffer = buf, nowait = true, silent = true })
   end
 end
 
@@ -846,6 +863,16 @@ local function post()
   api.nvim_create_user_command('NvbClearOutput', function(o)
     M.act('clear_output', { all = o.bang })
   end, { bang = true })
+
+  api.nvim_create_user_command('NvbOutput', function(o)
+    M.act('inspect_output', { mime = o.args })
+  end, { nargs = '?' })
+  api.nvim_create_user_command('NvbOpenOutput', function(o)
+    if #o.fargs ~= 2 or not o.fargs[1]:match('^%d+$') then
+      error('usage: NvbOpenOutput <output-number> <mime>')
+    end
+    M.act('open_output', { index = tonumber(o.fargs[1]), mime = o.fargs[2] })
+  end, { nargs = '+' })
 
   notify('ready', { home = M.home_buf, viewport = viewport(), theme = theme() })
 end

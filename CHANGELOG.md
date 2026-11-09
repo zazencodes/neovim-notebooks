@@ -8,6 +8,10 @@ before 1.0, a breaking change bumps the minor version.
 ### Added
 
 - `nvb --create path.ipynb` creates an empty Python notebook, refusing existing paths.
+- `:NvbOutput [mime]` inspects complete cell output in Neovim, with native search, selection
+  and yank, including text tables and JSON. `za` collapses or expands inline output per cell.
+- `:NvbOpenOutput <output-number> <mime>` explicitly opens HTML, SVG, images or text artifacts
+  externally; extracted files are private and removed when the session ends.
 
 ### Fixed
 
