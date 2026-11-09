@@ -11,6 +11,9 @@ before 1.0, a breaking change bumps the minor version.
 
 ### Fixed
 
+- Large notebooks keep rendering work within the visible cells and rows, and sustained kernel
+  or Neovim output yields between batches so input and drawing keep progressing.
+
 - Inside tmux, switching panes, windows or apps no longer blanks nbv and sends every visible
   image to the terminal again (several megabytes each time, kept in the terminal's memory).
   Images are sent again only when a different tmux client shows the pane.

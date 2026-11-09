@@ -461,3 +461,31 @@ fn survives_pane_splits_and_closes() {
     s.tmux(&["kill-pane", "-a", "-t", "t"]);
     s.wait_until("all six cells", |s| s.contains("│f = 6") && s.matches('╭').count() == 6);
 }
+
+#[test]
+fn terminal_input_and_drawing_progress_during_a_kernel_flood() {
+    let source =
+        "import time\nend = time.monotonic() + 15\nwhile time.monotonic() < end:\n    print('flood-row', flush=True)";
+    let Some(s) = Session::start(&[source, "target = 1"]) else { return };
+    s.keys(&["r"]);
+    s.wait_for("flood-row");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    s.keys(&["j", "Enter", "i", "serviced_", "Escape"]);
+    loop {
+        let screen = s.screen();
+        if screen.contains("serviced_target = 1") && screen.contains(" EDIT") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "terminal input/drawing starved during kernel flood\n{screen}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Saving is a synchronous ordered RPC; it must also complete during the flood.
+    s.keys(&[":", "w", "Enter"]);
+    loop {
+        if s.saved()["cells"][1]["source"].as_str().is_some_and(|text| text.contains("serviced_target")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "save RPC starved during kernel flood\n{}", s.screen());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

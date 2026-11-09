@@ -91,6 +91,13 @@ impl Layout {
         Layout { blocks, total: top }
     }
 
+    /// The contiguous visible block range, found without visiting offscreen cells.
+    pub fn visible(&self, scroll: usize, area: usize) -> std::ops::Range<usize> {
+        let first = self.blocks.partition_point(|b| b.top + b.height() <= scroll);
+        let end = self.blocks.partition_point(|b| b.top < scroll.saturating_add(area));
+        first..end.max(first)
+    }
+
     pub fn index_of(&self, key: &CellKey) -> Option<usize> {
         self.blocks.iter().position(|b| &b.key == key)
     }
@@ -160,7 +167,7 @@ impl Layout {
         let area = g.area_height();
         let (col, width) = g.inner_x();
         let mut out = vec![];
-        for b in &self.blocks {
+        for b in &self.blocks[self.visible(scroll, area)] {
             let body = b.top + 1;
             let (from, to) = (body.max(scroll), (body + b.rows).min(scroll + area));
             if from >= to {
@@ -205,6 +212,42 @@ mod tests {
             (CellKey::new("b"), CellKind::Code, 3, 3),
             (CellKey::new("c"), CellKind::Markdown, 10, 0),
         ])
+    }
+
+    /// Repeatable release scenario; times only block traversal, excluding construction.
+    #[test]
+    #[ignore = "release performance scenario: cargo test -p nbv-tui --release render_traversal_scenario -- --ignored --nocapture"]
+    fn render_traversal_scenario() {
+        use std::{hint::black_box, time::Instant};
+        let l = Layout::new((0..100_000).map(|i| (CellKey::new(i.to_string()), CellKind::Code, 1_000_000, 0)));
+        let scroll = l.blocks[90_000].top + 500_000;
+        let start = Instant::now();
+        for _ in 0..2_000 {
+            let count =
+                black_box(&l).blocks.iter().filter(|b| b.top + b.height() > scroll && b.top < scroll + 30).count();
+            assert_eq!(black_box(count), 1);
+        }
+        let reference = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..2_000 {
+            assert_eq!(black_box(&l).visible(black_box(scroll), 30).len(), 1);
+        }
+        eprintln!(
+            "100000 giant cells, 2000 viewport queries: prior full scan={reference:?}, visible range={:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn visible_range_skips_many_offscreen_and_giant_cells() {
+        let l = Layout::new((0..100_000).map(|i| (CellKey::new(i.to_string()), CellKind::Code, 1_000_000, 0)));
+        let scroll = l.blocks[90_000].top + 500_000;
+        assert_eq!(l.visible(scroll, 30), 90_000..90_001);
+        let eds = l.editors(&geometry(31), scroll, None);
+        assert_eq!(eds.len(), 1);
+        assert_eq!((eds[0].height, eds[0].skip), (30, Some(499_999)));
+        assert!(l.visible(l.total, 30).is_empty());
+        assert!(l.visible(0, 0).is_empty());
     }
 
     #[test]

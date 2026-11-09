@@ -118,6 +118,7 @@ struct App {
     memory: KernelMemory,
     views: HashMap<CellKey, OutputView>,
     images: Images,
+    source_rows: HashMap<CellKey, usize>,
     protocols: HashMap<(u64, u16, u16), SlicedProtocol>,
     picker: Picker,
     tmux: Option<Tmux>,
@@ -251,6 +252,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         memory,
         views: HashMap::new(),
         images: Images::default(),
+        source_rows: HashMap::new(),
         protocols: HashMap::new(),
         picker,
         tmux,
@@ -285,13 +287,15 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     while !app.quit {
         tokio::select! {
-            ev = nvim_rx.recv() => match ev {
-                Some(ev) => app.on_nvim(ev).await,
-                None => app.quit = true,
-            },
+            biased;
+            _ = tick.tick() => app.tick(),
             ev = events.next() => match ev {
                 Some(Ok(ev)) => app.on_terminal(ev).await,
                 _ => app.quit = true,
+            },
+            ev = nvim_rx.recv() => match ev {
+                Some(ev) => app.on_nvim(ev).await,
+                None => app.quit = true,
             },
             Some(msg) = kernel_rx.recv() => app.on_kernel(msg).await,
             Some(start) = start_rx.recv() => app.on_kernel_start(start).await,
@@ -299,13 +303,12 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 app.message = Some(e.to_string());
                 app.draw = true;
             }
-            _ = tick.tick() => app.tick(),
         }
         // Coalesce whatever else is already waiting before drawing.
-        while let Ok(ev) = nvim_rx.try_recv() {
+        for ev in ready_batch(&mut nvim_rx) {
             app.on_nvim(ev).await;
         }
-        while let Ok(msg) = kernel_rx.try_recv() {
+        for msg in ready_batch(&mut kernel_rx) {
             app.on_kernel(msg).await;
         }
         if app.relayout {
@@ -321,6 +324,12 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     }
     let _ = tokio::time::timeout(Duration::from_millis(500), app.client.quit()).await;
     Ok(())
+}
+
+const EVENT_BATCH: usize = 64;
+
+fn ready_batch<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Vec<T> {
+    (0..EVENT_BATCH).map_while(|_| rx.try_recv().ok()).collect()
 }
 
 fn rgb(c: Option<u32>) -> Option<Color> {
@@ -460,7 +469,8 @@ impl App {
                     self.offer_install();
                     self.relayout = true;
                 }
-                EditorEvent::SourceChanged(_) => {
+                EditorEvent::SourceChanged(key) => {
+                    self.source_rows.remove(&key);
                     // So `:x` in the home window writes it, as for any changed buffer.
                     self.mark_dirty();
                     // A cell's line count may have changed, and its staleness.
@@ -471,6 +481,7 @@ impl App {
                 EditorEvent::Reloaded => {
                     // A cell whose window closed reports the focus change.
                     self.views.clear();
+                    self.source_rows.clear();
                     self.dirty = false;
                     self.last_sent = None;
                     self.relayout = true;
@@ -755,6 +766,8 @@ impl App {
 
     /// Brings the buffers, the selection and the screen up to date after a structural change.
     fn structure_changed(&mut self, focus: Option<usize>) {
+        self.source_rows.clear();
+        self.views.clear();
         self.editor.sync(&self.nb);
         if let Some(i) = focus {
             self.selected = i;
@@ -815,7 +828,7 @@ impl App {
         self.selected = self.nb.index_of(&key).unwrap_or(self.selected);
         self.mode = Mode::Edit(key.clone());
         self.focus_cursor = FocusCursor::AwaitFocus;
-        self.relayout();
+        self.place_editors();
         self.editor.enter(self.focus_seq, &key, insert);
     }
 
@@ -1154,7 +1167,9 @@ impl App {
             .iter()
             .filter_map(|k| {
                 let c = self.nb.cell(k)?;
-                let rows = self.editor.rows(k, width).unwrap_or_else(|| c.source().split('\n').count());
+                let rows = self.editor.rows(k, width).unwrap_or_else(|| {
+                    *self.source_rows.entry(k.clone()).or_insert_with(|| c.source().split('\n').count())
+                });
                 Some((k.clone(), c.kind(), rows))
             })
             .collect();
@@ -1168,6 +1183,17 @@ impl App {
 
     /// Lays out the notebook and sends Neovim the editor windows' places, if they changed.
     fn relayout(&mut self) {
+        // Keep one placement in flight. State changes are coalesced into the next layout;
+        // requests and redraw deltas themselves remain ordered and are never discarded.
+        if !self.sent.is_empty() {
+            return;
+        }
+        self.place_editors();
+    }
+
+    /// Focus requests use this directly: their prerequisite placement must be queued even
+    /// while an older layout is in flight. The Calls queue preserves layout → enter order.
+    fn place_editors(&mut self) {
         self.relayout = false;
         let Some(g) = self.geometry else { return };
         let layout = self.layout(&g);
@@ -1308,10 +1334,9 @@ impl App {
         }
         // Views and image protocols for the outputs about to be shown.
         let visible: Vec<CellKey> = match (self.geometry, &self.shown) {
-            (Some(g), Some((layout, scroll))) => layout
-                .blocks
+            (Some(g), Some((layout, scroll))) => layout.blocks[layout.visible(*scroll, g.area_height())]
                 .iter()
-                .filter(|b| b.outputs > 0 && b.top + b.height() > *scroll && b.top < scroll + g.area_height())
+                .filter(|b| b.outputs > 0)
                 .map(|b| b.key.clone())
                 .collect(),
             _ => vec![],
@@ -1337,7 +1362,9 @@ impl App {
         let header = self.header();
         let hint = self.hint();
         let decorations: Vec<Decoration> = match &self.shown {
-            Some((layout, _)) => layout.blocks.iter().map(|b| self.decoration(b)).collect(),
+            Some((layout, scroll)) => self.geometry.map_or_else(Vec::new, |g| {
+                layout.blocks[layout.visible(*scroll, g.area_height())].iter().map(|b| self.decoration(b)).collect()
+            }),
             None => vec![],
         };
         let empty_hint = self.nb.order().is_empty().then(|| {
@@ -1365,7 +1392,7 @@ impl App {
                     buf.set_line(g.inner_x().0, g.area_top(), hint, g.inner_x().1);
                 }
                 if let Some((layout, scroll)) = shown {
-                    for (b, d) in layout.blocks.iter().zip(&decorations) {
+                    for (b, d) in layout.blocks[layout.visible(*scroll, g.area_height())].iter().zip(&decorations) {
                         draw_block(buf, &g, b, *scroll, d, views.get(&b.key), base, protocols);
                     }
                 }
@@ -1459,7 +1486,8 @@ fn draw_block(
             buf.set_string(x, y, text, color.map_or(dim, |c| base.fg(c)));
         }
     }
-    for row in 0..b.rows {
+    let body = b.top + 1;
+    for row in scroll.saturating_sub(body)..b.rows.min((scroll + area).saturating_sub(body)) {
         if let Some(y) = screen(b.top + 1 + row) {
             buf.set_string(bx, y, "│", border);
             buf.set_string(bx + bw - 1, y, "│", border);
@@ -1513,7 +1541,126 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::text::Line;
 
-    use super::draw_header;
+    use super::*;
+
+    #[tokio::test]
+    async fn entering_and_adding_cells_queue_layout_before_focus_with_a_layout_in_flight() {
+        use nbv_nvim::harness::{Harness, Options};
+        let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
+        let (errors, _rx) = mpsc::unbounded_channel();
+        let terminal = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions { viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)) },
+        )
+        .unwrap();
+        let mut app = App {
+            nb: Notebook::open(&h.notebook).unwrap(),
+            editor: Editor::new(h.client.clone(), errors),
+            client: h.client.clone(),
+            exec: Executor::default(),
+            kernel: None,
+            kernel_cmd: None,
+            kernel_error: None,
+            kernel_choices: vec![],
+            install: None,
+            nvim_ready: true,
+            generation: 0,
+            kernel_tx: mpsc::unbounded_channel().0,
+            start_tx: mpsc::unbounded_channel().0,
+            pending: vec![],
+            input_request: None,
+            message: None,
+            tmux_keys_missing: false,
+            memory: KernelMemory::at(h.notebook.with_extension("kernels.json")).unwrap(),
+            views: HashMap::new(),
+            images: Images::default(),
+            source_rows: HashMap::new(),
+            protocols: HashMap::new(),
+            picker: Picker::halfblocks(),
+            tmux: None,
+            terminal,
+            cursor_shape: None,
+            quit: false,
+            mode: Mode::Nav,
+            focus_seq: 0,
+            focus_cursor: FocusCursor::Shown,
+            selected: 0,
+            header: None,
+            scroll: 0,
+            geometry: Some(Geometry { viewport: h.state.lock().unwrap().viewport.unwrap() }),
+            theme: Theme::new(),
+            nav: Nav::default(),
+            register: None,
+            forward_since: None,
+            reveal: false,
+            layout_seq: 0,
+            last_sent: None,
+            sent: VecDeque::new(),
+            shown: None,
+            relayout: true,
+            draw: false,
+            dirty: false,
+            disk_notified: None,
+        };
+        let key = app.nb.order().last().unwrap().clone();
+        {
+            let mut st = h.state.lock().unwrap();
+            // Use the harness's event-owning Editor for requests too; its buffer-created
+            // notifications must match the same creating map when the lock is released.
+            std::mem::swap(&mut app.editor, &mut st.editor);
+            app.relayout();
+            assert_eq!(app.sent.len(), 1);
+            app.select(app.nb.order().len() - 1);
+            app.enter(key.clone(), false);
+            assert_eq!(app.sent.len(), 2);
+            std::mem::swap(&mut app.editor, &mut st.editor);
+        }
+        h.wait("rapid enter focus", |st| st.focus.as_ref() == Some(&(app.focus_seq, Focus::Cell(key.clone())))).await;
+        let added;
+        {
+            let mut st = h.state.lock().unwrap();
+            std::mem::swap(&mut app.editor, &mut st.editor);
+            added = app.add(app.nb.order().len());
+            st.nb = Notebook::from_bytes(&h.notebook, &app.nb.to_bytes(), Default::default()).unwrap();
+            app.enter(added.clone(), true);
+            assert_eq!(app.sent.len(), 3);
+            std::mem::swap(&mut app.editor, &mut st.editor);
+        }
+        h.wait("new cell focus", |st| st.focus.as_ref() == Some(&(app.focus_seq, Focus::Cell(added.clone())))).await;
+        assert!(h.state.lock().unwrap().errors.is_empty());
+    }
+
+    #[test]
+    fn ready_batches_are_bounded_and_preserve_every_event_in_order() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for i in 0..EVENT_BATCH * 3 + 1 {
+            tx.send(i).unwrap();
+        }
+        let mut seen = vec![];
+        while !rx.is_empty() {
+            let batch = ready_batch(&mut rx);
+            assert!(batch.len() <= EVENT_BATCH);
+            // Simulate a producer that keeps the queue ready during draining.
+            if seen.is_empty() {
+                tx.send(EVENT_BATCH * 3 + 1).unwrap();
+            }
+            seen.extend(batch);
+        }
+        assert_eq!(seen, (0..EVENT_BATCH * 3 + 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn giant_cell_border_draws_only_the_visible_slice() {
+        let g = Geometry { viewport: nbv_nvim::Viewport { row: 0, col: 0, width: 40, height: 10 } };
+        let b = Block { key: CellKey::new("giant"), kind: CellKind::Code, top: 0, rows: usize::MAX / 4, outputs: 0 };
+        let d = Decoration { border: None, bold: false, gutter: "[1]".into(), status: None, label: None, dim: None };
+        let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 40, 10));
+        draw_block(&mut buf, &g, &b, 1_000_000, &d, None, Style::default(), &HashMap::new());
+        for y in 1..10 {
+            assert_eq!(buf[(g.box_x().0, y)].symbol(), "│");
+            assert_eq!(buf[(g.box_x().0 + g.box_x().1 - 1, y)].symbol(), "│");
+        }
+    }
 
     fn buffer_row_to_string(buf: &Buffer, row: u16, width: u16) -> String {
         (0..width).map(|x| buf[(x, row)].symbol()).collect()
