@@ -161,6 +161,13 @@ impl Images {
         Ok(MeasuredImage { hash: h.finish(), data: bytes.into(), dimensions })
     }
 
+    pub fn touch(&mut self, hash: u64) {
+        self.clock += 1;
+        if let Some((_, used)) = self.decoded.get_mut(&hash) {
+            *used = self.clock;
+        }
+    }
+
     pub fn decode(&mut self, hash: u64, data: &[u8]) -> Result<Arc<DynamicImage>, String> {
         self.decode_with_budget(hash, data, DECODED_BYTES)
     }
@@ -173,6 +180,9 @@ impl Images {
         }
         let image = Arc::new(image::load_from_memory(data).map_err(|e| e.to_string())?);
         let bytes = image.as_bytes().len();
+        if bytes > budget {
+            return Ok(image);
+        }
         while self.bytes.saturating_add(bytes) > budget && !self.decoded.is_empty() {
             let oldest = *self.decoded.iter().min_by_key(|(_, (_, used))| used).expect("nonempty cache").0;
             let (old, _) = self.decoded.remove(&oldest).expect("cached image");
@@ -654,7 +664,7 @@ mod tests {
         let oversized = images.decode_with_budget(101, &png_data(64, 101), budget).unwrap();
         assert_eq!(oversized.width(), 64);
         assert!(!images.decoded.contains_key(&101));
-        assert_eq!(images.bytes, 0);
+        assert_eq!(images.bytes, budget, "an oversized transient must preserve existing cached plots");
     }
 
     #[test]

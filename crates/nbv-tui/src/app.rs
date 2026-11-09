@@ -25,7 +25,6 @@ use nbv_nvim::{EmbeddedNvim, NvimClient, NvimError, NvimEvent};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Size;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui_image::picker::Picker;
@@ -35,6 +34,7 @@ use serde_json::Map;
 use tokio::sync::mpsc;
 
 use crate::compose::{self, Region};
+use crate::image_cache::{PROTOCOL_BYTES, Protocols};
 use crate::layout::{Block, Geometry, Layout};
 use crate::nav::{self, Action, Nav};
 use crate::outputs::{self, Images, OutputView};
@@ -119,12 +119,14 @@ struct App {
     memory: KernelMemory,
     views: HashMap<CellKey, OutputView>,
     images: Images,
+    image_users: HashMap<u64, usize>,
+    image_owners: HashMap<CellKey, Vec<u64>>,
     source_rows: HashMap<CellKey, usize>,
     collapsed_outputs: HashSet<CellKey>,
     artifacts: crate::inspect::Artifacts,
     cached_layout: Option<(u16, Arc<Layout>)>,
     text_tails: HashMap<CellKey, outputs::TextCache>,
-    protocols: HashMap<(u64, u16, u16), SlicedProtocol>,
+    protocols: Protocols,
     picker: Picker,
     tmux: Option<Tmux>,
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -258,12 +260,14 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         memory,
         views: HashMap::new(),
         images: Images::default(),
+        image_users: HashMap::new(),
+        image_owners: HashMap::new(),
         source_rows: HashMap::new(),
         collapsed_outputs: HashSet::new(),
         artifacts: crate::inspect::Artifacts::new()?,
         cached_layout: None,
         text_tails: HashMap::new(),
-        protocols: HashMap::new(),
+        protocols: Protocols::default(),
         picker,
         tmux,
         terminal,
@@ -324,6 +328,8 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         }
     }
 
+    app.protocols.clear();
+    app.protocols.flush_deletions(&mut std::io::stdout(), app.picker.tmux_detected())?;
     if let Some(k) = app.kernel.take() {
         let _ = tokio::time::timeout(Duration::from_secs(3), k.shutdown()).await;
     }
@@ -514,7 +520,7 @@ impl App {
                 EditorEvent::Rows => self.invalidate_layout(),
                 EditorEvent::Reloaded => {
                     // A cell whose window closed reports the focus change.
-                    self.views.clear();
+                    self.clear_views();
                     self.source_rows.clear();
                     self.invalidate_layout();
                     self.text_tails.clear();
@@ -592,9 +598,7 @@ impl App {
             }
             Event::Resize(w, h) => {
                 self.editor.calls.request("nvim_ui_try_resize", vec![(w as u64).into(), (h as u64).into()]);
-                self.views.clear();
-                self.text_tails.clear();
-                self.protocols.clear();
+                self.clear_views();
                 self.invalidate_layout();
             }
             Event::FocusGained => {
@@ -682,7 +686,7 @@ impl App {
     fn on_exec_event(&mut self, ev: ExecEvent) {
         match ev {
             ExecEvent::Cell(k) => {
-                self.views.remove(&k);
+                self.invalidate_view(&k);
                 self.mark_dirty();
                 self.invalidate_layout();
                 self.draw = true;
@@ -760,7 +764,7 @@ impl App {
                 continue;
             }
             let Some(msg) = self.exec.request(&mut self.nb, &key) else { continue };
-            self.views.remove(&key);
+            self.invalidate_view(&key);
             self.invalidate_layout();
             match self.kernel.as_mut() {
                 Some(k) => {
@@ -823,7 +827,7 @@ impl App {
     /// Brings the buffers, the selection and the screen up to date after a structural change.
     fn structure_changed(&mut self, focus: Option<usize>) {
         self.source_rows.clear();
-        self.views.clear();
+        self.clear_views();
         self.invalidate_layout();
         self.editor.sync(&self.nb);
         if let Some(i) = focus {
@@ -1027,7 +1031,7 @@ impl App {
                     if !self.collapsed_outputs.remove(&k) {
                         self.collapsed_outputs.insert(k.clone());
                     }
-                    self.views.remove(&k);
+                    self.invalidate_view(&k);
                     self.invalidate_layout();
                     self.draw = true;
                 }
@@ -1176,7 +1180,7 @@ impl App {
                 let keys = if all { self.code_cells() } else { key.into_iter().collect() };
                 for k in keys {
                     self.exec.clear_outputs(&mut self.nb, &k);
-                    self.views.remove(&k);
+                    self.discard_view(&k);
                 }
                 self.mark_dirty();
                 self.invalidate_layout();
@@ -1251,14 +1255,64 @@ impl App {
         }
     }
 
+    /// Invalidate only outputs that changed. Other live plots, including offscreen plots,
+    /// retain their rasters/encodings until LRU byte pressure evicts them.
+    fn invalidate_view(&mut self, key: &CellKey) {
+        self.views.remove(key);
+        // Keep image ownership until the replacement view is built. Incrementing its
+        // owners before retiring the old ones preserves images across stream/status updates.
+    }
+
+    fn release_images(&mut self, hashes: Vec<u64>) {
+        for hash in hashes {
+            let users = self.image_users.get_mut(&hash).expect("cached image owner");
+            *users -= 1;
+            if *users == 0 {
+                self.image_users.remove(&hash);
+                self.images.retain(|cached| cached != hash);
+                self.protocols.remove_hash(hash);
+            }
+        }
+    }
+
+    fn discard_view(&mut self, key: &CellKey) {
+        self.views.remove(key);
+        self.text_tails.remove(key);
+        if let Some(hashes) = self.image_owners.remove(key) {
+            self.release_images(hashes);
+        }
+    }
+
+    fn clear_views(&mut self) {
+        self.views.clear();
+        self.text_tails.clear();
+        self.image_users.clear();
+        self.image_owners.clear();
+        self.images.retain(|_| false);
+        self.protocols.clear();
+    }
+
     fn view(&mut self, key: &CellKey, width: u16) -> Option<&OutputView> {
         let font = self.picker.font_size();
         if self.views.get(key).is_none_or(|v| v.width != width) {
+            self.invalidate_view(key);
             let cell = self.nb.cell(key)?;
             let cache = self.text_tails.entry(key.clone()).or_default();
             let mut view = outputs::build_cached(cell, width, font, &mut self.images, cache);
             if self.collapsed_outputs.contains(key) {
                 view.collapse();
+            }
+
+            let hashes: Vec<_> = view
+                .blocks
+                .iter()
+                .filter_map(|block| if let outputs::Block::Image { hash, .. } = block { Some(*hash) } else { None })
+                .collect();
+            for hash in &hashes {
+                *self.image_users.entry(*hash).or_default() += 1;
+            }
+            if let Some(old) = self.image_owners.insert(key.clone(), hashes) {
+                self.release_images(old);
             }
             self.views.insert(key.clone(), view);
         }
@@ -1483,23 +1537,17 @@ impl App {
                 row = end;
             }
         }
-        let live: HashSet<_> = needed.iter().map(|(_, _, id, _)| *id).collect();
-        // Views own compressed data only. Removing obsolete rasters really releases their
-        // pixels, rather than leaving hidden Arc owners in offscreen output views.
-        self.images.retain(|hash| live.iter().any(|id| id.0 == hash));
-        self.protocols.retain(|id, _| live.contains(id));
+        self.protocols.flush_deletions(&mut std::io::stdout(), self.picker.tmux_detected())?;
+        self.protocols.begin_frame();
         for (key, index, id, data) in &needed {
-            if self.protocols.contains_key(id) {
+            self.images.touch(id.0);
+            if self.protocols.touch(id) {
                 continue;
             }
-            let result = self.images.decode(id.0, data).and_then(|image| {
-                SlicedProtocol::new(&self.picker, (*image).clone(), Some(Size::new(id.1, id.2)))
-                    .map_err(|e| e.to_string())
-            });
+            let result =
+                self.images.decode(id.0, data).and_then(|image| self.protocols.insert(*id, &image, &self.picker));
             match result {
-                Ok(protocol) => {
-                    self.protocols.insert(*id, protocol);
-                }
+                Ok(()) => {}
                 Err(error) => {
                     // Keep the measured height until the next layout, so clipping and the
                     // confirmed editor rectangles remain in agreement even on decode failure.
@@ -1509,6 +1557,18 @@ impl App {
                             format!("image could not be rendered: {error}"),
                             Style::default().fg(Color::LightRed),
                         );
+                        // A failed view still owns this compressed image for lifecycle
+                        // accounting; retire it before replacing the block with error rows.
+                        let owners = self.image_owners.get_mut(key).expect("view image owner");
+                        let owner_index = owners.iter().position(|hash| *hash == id.0).expect("image owner");
+                        owners.swap_remove(owner_index);
+                        let users = self.image_users.get_mut(&id.0).expect("image owner");
+                        *users -= 1;
+                        if *users == 0 {
+                            self.image_users.remove(&id.0);
+                            self.images.retain(|hash| hash != id.0);
+                            self.protocols.remove_hash(id.0);
+                        }
                         view.blocks[*index] = outputs::Block::Text(lines);
                     }
                 }
@@ -1535,7 +1595,7 @@ impl App {
             && self.focus_cursor == FocusCursor::Shown
             && (self.mode != Mode::Nav || grid.mode_name != "normal");
         let cursor = show_cursor.then_some(grid.cursor);
-        let (geometry, shown, views, protocols) = (self.geometry, &self.shown, &self.views, &self.protocols);
+        let (geometry, shown, views, protocols) = (self.geometry, &self.shown, &self.views, self.protocols.entries());
         self.terminal.draw(|f| {
             let area = f.area();
             let buf = f.buffer_mut();
@@ -1560,15 +1620,9 @@ impl App {
                 f.set_cursor_position((col as u16, row as u16));
             }
         })?;
-        // Protocol internals are opaque upstream. Charge a conservative byte ceiling based
-        // on the resized pixels and terminal cells (covers raw/encoded data and row buffers).
-        // Oversized visible frames render transiently, then release entries over the budget.
-        trim_protocols(
-            &mut self.protocols,
-            &needed.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>(),
-            self.picker.font_size(),
-            PROTOCOL_BYTES,
-        );
+        // Pin the viewport's active protocols; use the byte-bounded LRU for offscreen plots.
+        self.protocols.trim(self.picker.font_size(), PROTOCOL_BYTES);
+        self.protocols.flush_deletions(&mut std::io::stdout(), self.picker.tmux_detected())?;
         let mode = grid.modes.get(grid.mode).map(|m| (m.shape.clone(), m.percentage));
         if mode != self.cursor_shape {
             let style = match mode.as_ref().map(|m| &m.0) {
@@ -1605,41 +1659,6 @@ impl App {
         };
         Decoration { border, bold: active || selected, gutter, status, label, dim }
     }
-}
-
-/// Retained protocol budget, separate from the decoded raster budget.
-const PROTOCOL_BYTES: usize = 64 * 1024 * 1024;
-
-fn protocol_bytes(id: (u64, u16, u16), font: ratatui_image::FontSize) -> usize {
-    let cells = usize::from(id.1) * usize::from(id.2);
-    // 128 bytes/pixel covers sixel worst-case runs, PNG/base64 plus transmission
-    // strings; 1024 bytes/cell covers halfblock buffers and sliced row overhead.
-    cells
-        .saturating_mul(usize::from(font.width.max(1)))
-        .saturating_mul(usize::from(font.height.max(1)))
-        .saturating_mul(128)
-        .saturating_add(cells.saturating_mul(1024))
-}
-
-fn trim_protocols(
-    protocols: &mut HashMap<(u64, u16, u16), SlicedProtocol>,
-    visible: &[(u64, u16, u16)],
-    font: ratatui_image::FontSize,
-    budget: usize,
-) {
-    let mut retained = HashSet::new();
-    let mut bytes = 0usize;
-    for id in visible {
-        if retained.contains(id) || !protocols.contains_key(id) {
-            continue;
-        }
-        let charge = protocol_bytes(*id, font);
-        if bytes.saturating_add(charge) <= budget {
-            bytes += charge;
-            retained.insert(*id);
-        }
-    }
-    protocols.retain(|id, _| retained.contains(id));
 }
 
 /// How one block is drawn, beyond its geometry.
@@ -1776,11 +1795,13 @@ mod tests {
             views: HashMap::new(),
             images: Images::default(),
             text_tails: HashMap::new(),
+            image_users: HashMap::new(),
+            image_owners: HashMap::new(),
             source_rows: HashMap::new(),
             collapsed_outputs: HashSet::new(),
             artifacts: crate::inspect::Artifacts::new().unwrap(),
             cached_layout: None,
-            protocols: HashMap::new(),
+            protocols: Protocols::default(),
             picker: Picker::halfblocks(),
             tmux: None,
             terminal,
@@ -1876,6 +1897,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacing_shared_plot_outputs_evicts_only_after_the_last_view_owner() {
+        use base64::Engine;
+        let (_h, mut app) = fixture_app().await;
+        let mut png = std::io::Cursor::new(vec![]);
+        image::DynamicImage::new_rgba8(40, 40).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        let keys: Vec<_> = app
+            .nb
+            .order()
+            .iter()
+            .filter(|k| app.nb.cell(k).unwrap().kind() == CellKind::Code)
+            .take(2)
+            .cloned()
+            .collect();
+        assert_eq!(keys.len(), 2);
+        for key in &keys {
+            app.nb.cell_mut(key).unwrap().raw.insert(
+                "outputs".into(),
+                serde_json::json!([{
+                    "output_type":"display_data", "data":{"image/png":b64}, "metadata":{},
+                }]),
+            );
+            app.view(key, 60).unwrap();
+        }
+        let outputs::Block::Image { hash, data, cols, rows } = app.views[&keys[0]].blocks[0].clone() else {
+            panic!("image")
+        };
+        let image = app.images.decode(hash, &data).unwrap();
+        let weak = Arc::downgrade(&image);
+        app.protocols.insert((hash, cols, rows), &image, &app.picker).unwrap();
+        drop(image);
+        assert_eq!(app.image_users[&hash], 2);
+        app.on_exec_event(ExecEvent::Cell(keys[0].clone()));
+        app.view(&keys[0], 60).unwrap();
+        assert_eq!(app.image_users[&hash], 2, "unchanged plots survive text/status view rebuilds");
+        assert_eq!(app.nb.cell(&keys[0]).unwrap().outputs()[0]["data"]["image/png"], b64);
+        assert_eq!(app.protocols.entries().len(), 1);
+        app.exec.clear_outputs(&mut app.nb, &keys[0]);
+        app.on_exec_event(ExecEvent::Cell(keys[0].clone()));
+        app.view(&keys[0], 60).unwrap();
+        assert_eq!(app.image_users[&hash], 1);
+        assert_eq!(app.protocols.entries().len(), 1);
+        assert!(weak.upgrade().is_some());
+        app.exec.clear_outputs(&mut app.nb, &keys[1]);
+        app.discard_view(&keys[1]);
+        assert!(!app.image_users.contains_key(&hash));
+        assert!(app.protocols.entries().is_empty());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
     async fn scrolling_selection_and_alignment_reuse_layout_until_heights_change() {
         let (_h, mut app) = fixture_app().await;
         let g = app.geometry.unwrap();
@@ -1940,33 +2012,6 @@ mod tests {
         }
         h.wait("new cell focus", |st| st.focus.as_ref() == Some(&(app.focus_seq, Focus::Cell(added.clone())))).await;
         assert!(h.state.lock().unwrap().errors.is_empty());
-    }
-
-    #[test]
-    fn protocol_cache_plateaus_by_bytes_and_discards_obsolete_plots() {
-        let picker = Picker::halfblocks();
-        let font = picker.font_size();
-        let mut protocols = HashMap::new();
-        let budget = protocol_bytes((0, 2, 2), font) * 2;
-        for hash in 0..100 {
-            let id = (hash, 2, 2);
-            let protocol =
-                SlicedProtocol::new(&picker, image::DynamicImage::new_rgb8(4, 4), Some(Size::new(2, 2))).unwrap();
-            protocols.insert(id, protocol);
-            trim_protocols(&mut protocols, &[id], font, budget);
-            assert_eq!(protocols.len(), 1);
-            assert!(protocols.contains_key(&id));
-            assert!(protocols.keys().map(|id| protocol_bytes(*id, font)).sum::<usize>() <= budget);
-        }
-        trim_protocols(&mut protocols, &[], font, budget);
-        assert!(protocols.is_empty(), "cleared/replaced outputs release their encodings");
-        let id = (100, 2, 2);
-        protocols.insert(
-            id,
-            SlicedProtocol::new(&picker, image::DynamicImage::new_rgb8(4, 4), Some(Size::new(2, 2))).unwrap(),
-        );
-        trim_protocols(&mut protocols, &[id], font, 1);
-        assert!(protocols.is_empty(), "oversized encodings are transient");
     }
 
     #[tokio::test]

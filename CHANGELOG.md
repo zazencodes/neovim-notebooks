@@ -15,6 +15,9 @@ before 1.0, a breaking change bumps the minor version.
 
 ### Fixed
 
+- Recently viewed plots reuse their cached images when scrolling back within the cache budget.
+  Replaced, cleared, and evicted Kitty images release their terminal image data explicitly.
+
 - Continuous redraws also yield to kernel startup, install results, and RPC errors.
 
 - Scrolling and selecting cells reuse the notebook layout until cell heights or width change,

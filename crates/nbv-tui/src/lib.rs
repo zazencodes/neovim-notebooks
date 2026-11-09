@@ -4,6 +4,7 @@
 pub mod ansi;
 pub mod app;
 pub mod compose;
+mod image_cache;
 pub mod inspect;
 pub mod keys;
 pub mod layout;
