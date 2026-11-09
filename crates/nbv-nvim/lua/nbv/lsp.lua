@@ -239,6 +239,7 @@ local function transport(config)
     local initialized, warned_unversioned = false, false
     local encoding = 'utf-16'
     local known = {}
+    local pending = {}
     local function refresh()
       if not document then return nil end
       local next_snapshot = snapshot()
@@ -322,6 +323,10 @@ local function transport(config)
         { cwd = config.cmd_cwd, env = config.cmd_env, detached = config.detached })
     local proxy = vim.tbl_extend('force', rpc, {})
     proxy.notify = function(method, params)
+      if method == '$/cancelRequest' and params then
+        local request = pending[params.id]
+        if request then request.cancelled = true end
+      end
       if method == 'initialized' then
         local sent = rpc.notify(method, params)
         initialized = true
@@ -365,7 +370,11 @@ local function transport(config)
       end
       if not s and document and initialized and method ~= 'shutdown' then s = refresh() end
       if s and method == 'textDocument/completion' then s.completion_position = vim.deepcopy(p.position) end
-      return rpc.request(method, p, function(err, result, id)
+      local request = { cancelled = false, completed = false }
+      local success, request_id = rpc.request(method, p, function(err, result, id)
+        -- Servers may acknowledge cancellation with a successful partial/empty response.
+        -- Keep that response out of cell handlers while still completing RPC bookkeeping.
+        if request.cancelled then return end
         if stale_completion then
           err, result = { code = -32801, message = 'Notebook changed since this completion was requested' }, nil
         end
@@ -410,7 +419,13 @@ local function transport(config)
           end
         end
         callback(err, result, id)
-      end, notify_reply)
+      end, function(id)
+        request.completed = true
+        pending[id] = nil
+        if notify_reply then notify_reply(id) end
+      end)
+      if success and request_id and not request.completed then pending[request_id] = request end
+      return success, request_id
     end
     sessions[#sessions + 1] = { refresh = refresh, rpc = rpc }
     return proxy

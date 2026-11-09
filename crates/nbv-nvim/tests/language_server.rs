@@ -16,7 +16,23 @@ async fn until(h: &Harness, code: &str) -> Value {
         if v != Value::Null && v != false {
             return v;
         }
-        assert!(Instant::now() < deadline, "LSP timeout: {code}\n{}", h.screen());
+        if Instant::now() >= deadline {
+            let evidence = value(
+                h,
+                r#"
+              local clients = {}
+              for _,c in ipairs(vim.lsp.get_clients()) do
+                clients[#clients+1] = {name=c.name,id=c.id,initialized=c.initialized,
+                  root=c.root_dir or vim.NIL,encoding=c.offset_encoding,
+                  pull=c:supports_method('textDocument/diagnostic'),attached=c.attached_buffers}
+              end
+              return {clients=clients,wire=_G.wire or vim.NIL,trace=_G.protocol_trace or {},
+                diagnostics=vim.diagnostic.get(),messages=vim.fn.execute('messages')}
+            "#,
+            )
+            .await;
+            panic!("LSP timeout: {code}\nevidence: {evidence}\n{}", h.screen());
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -54,13 +70,46 @@ async fn open(encoding: &str) -> Option<Harness> {
         r#"
         local base_command = {}
         local command = function(d, config)
+          local function record(kind, method, value)
+            if config.name ~= 'test_pyright-nbv' then return end
+            _G.protocol_trace = _G.protocol_trace or {{}}
+            table.insert(protocol_trace, {{kind=kind,method=method,value=value}})
+            if #protocol_trace > 128 then table.remove(protocol_trace,1) end
+          end
+          local original_dispatchers = d
+          d = vim.tbl_extend('force', d, {{
+            notification = function(method, params)
+              record('notification',method,params)
+              return original_dispatchers.notification(method,params)
+            end,
+            server_request = function(method, params)
+              record('server_request',method,params)
+              return original_dispatchers.server_request(method,params)
+            end,
+          }})
           local rpc = type(base_command) == 'function' and base_command(d, config)
             or vim.lsp.rpc.start(base_command, d)
           if config.name == 'test_pyright-nbv' then
             _G.notebook_dispatchers = d
             _G.wire = {{ opened = {{}} }}
-            local request = rpc.request
+            local raw_request = rpc.request
+            local request = function(method, params, callback, notify_reply)
+              record('request',method,{{uri=params and params.textDocument and params.textDocument.uri,
+                previousResultId=params and params.previousResultId, rootUri=params and params.rootUri}})
+              return raw_request(method,params,function(err,result,id)
+                local evidence = {{err=err or vim.NIL}}
+                if method == 'textDocument/diagnostic' then evidence.result = result
+                elseif method == 'initialize' then evidence.capabilities = result and result.capabilities end
+                record('response',method,evidence)
+                callback(err,result,id)
+              end,notify_reply)
+            end
             rpc.request = function(method, params, callback, notify_reply)
+              if method == 'textDocument/diagnostic' and _G.delayed_cancel_probe then
+                _G.delayed_cancel_probe = false
+                _G.delayed_diagnostic = {{callback=callback,reply=notify_reply,id=500000}}
+                return true,500000
+              end
               if method == 'textDocument/completion' and _G.native_completion_probe then
                 return request(method, params, function(err,result,id)
                   -- Pyright may cache eager import edits after earlier completion requests.
@@ -113,6 +162,7 @@ async fn open(encoding: &str) -> Option<Harness> {
             end
             local notify = rpc.notify
             rpc.notify = function(method, params)
+              record('notify',method,params)
               if method == 'textDocument/didOpen' then
                 wire.uri = params.textDocument.uri
                 wire.version = params.textDocument.version
@@ -181,6 +231,26 @@ async fn exercise_pyright(encoding: &str) {
         until(&h, "local d = vim.diagnostic.get(bufs.second); if #d > 0 then return d end return false").await;
     assert!(diagnostics.as_array().unwrap().iter().any(|d| d["message"].as_str().unwrap().contains("missing_name")));
     assert!(!diagnostics.to_string().contains("shared_value\" is not defined"));
+    // Pyright can finish a cancelled pull with a normal empty full report. Delay that
+    // response until the current diagnostics exist: it must not clear the newer result.
+    h.lua(
+        r#"
+      _G.delayed_cancel_probe = true
+      local ok,id = client:request('textDocument/diagnostic', {
+        textDocument={uri=vim.uri_from_bufnr(bufs.second)},identifier='Pyright'}, nil, bufs.second)
+      assert(ok and id == delayed_diagnostic.id)
+      assert(client:cancel_request(id))
+      if delayed_diagnostic.reply then delayed_diagnostic.reply(id) end
+      assert(client.requests[id] == nil, 'cancelled request bookkeeping was not completed')
+      delayed_diagnostic.callback(nil,{kind='full',resultId='cancelled-probe',items={}},id)
+      _G.delayed_diagnostic = nil
+    "#,
+    )
+    .await;
+    assert!(
+        value(&h, "return vim.diagnostic.get(bufs.second)").await.to_string().contains("missing_name"),
+        "a cancelled empty report erased current diagnostics"
+    );
     let definition =
         value(&h, "return request('textDocument/definition', {position={line=0,character=12}}, bufs.second)").await;
     assert!(definition[0]["uri"].as_str().unwrap().contains("first.py"), "{definition}");
