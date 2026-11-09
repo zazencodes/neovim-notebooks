@@ -485,3 +485,134 @@ async fn notebook_lsp_preserves_filetype_windows_and_required_roots() {
         assert_eq!(value(&h, "return #vim.lsp.get_clients()").await, 0, "required root is absent");
     }
 }
+
+#[tokio::test]
+async fn placements_never_reconstruct_or_transmit_notebook_sources() {
+    for enabled in [false, true] {
+        let init = format!(
+            r#"
+          vim.lsp.config('deferred', {{cmd={{'must-never-be-executed'}},filetypes={{'python'}},
+            root_dir=function() end}})
+          {}
+          _G.source_specs, _G.placements = 0, 0
+          local lsp = require('nbv.lsp')
+          local sync = lsp.sync
+          lsp.sync = function(spec, create)
+            if spec then source_specs = source_specs + 1 end
+            return sync(spec, create)
+          end
+          local layout = require('nbv').layout
+          require('nbv').layout = function(seq, spec)
+            assert(spec.notebook == nil, 'placement contains full notebook sources')
+            placements = placements + 1
+            return layout(seq, spec)
+          end
+        "#,
+            if enabled { "require('nbv.lsp').enable('deferred')" } else { "" }
+        );
+        let h = Harness::open("v4.5-outputs.ipynb", Options { init: Some(init), ..Options::default() }).await;
+        let mut rects = h.layout_all(None).await;
+        let initial = h.state.lock().unwrap().editor.lsp_context_stats();
+        assert_eq!(initial.documents, usize::from(enabled));
+        assert_eq!(initial.source_bytes > 0, enabled);
+        let received = value(&h, "return source_specs").await;
+        for i in 0..12 {
+            for rect in &mut rects {
+                rect.col = 4 + i % 2;
+            }
+            h.layout(None, &rects).await;
+        }
+        assert_eq!(
+            h.state.lock().unwrap().editor.lsp_context_stats(),
+            initial,
+            "scroll placements reconstructed notebook sources; enabled={enabled}"
+        );
+        assert_eq!(
+            value(&h, "return source_specs").await,
+            received,
+            "scroll placements sent or refreshed full document; enabled={enabled}"
+        );
+        assert_eq!(value(&h, "return placements").await, 13);
+        if !enabled {
+            {
+                let mut s = h.state.lock().unwrap();
+                let nbv_nvim::harness::State { nb, editor, .. } = &mut *s;
+                editor.sync(nb);
+            }
+            h.settle().await;
+            assert_eq!(
+                h.state.lock().unwrap().editor.lsp_context_stats(),
+                initial,
+                "disabled structural synchronization must not reconstruct LSP sources"
+            );
+            // Enable after Ready: the existing layout factory receives the initial snapshot.
+            h.lua("require('nbv.lsp').enable('deferred')").await;
+            h.wait("late notebook LSP enable", |s| s.editor.lsp_context_stats().documents == 1).await;
+            h.settle().await;
+            assert_eq!(value(&h, "return source_specs").await, 1);
+        }
+        let before_edit = h.state.lock().unwrap().editor.lsp_context_stats();
+        h.lua("for _,b in ipairs(vim.api.nvim_list_bufs()) do if vim.b[b].nbv_key and vim.bo[b].filetype == 'python' then vim.api.nvim_buf_set_lines(b,0,1,false,{'unsaved_placement_probe = 1'}); break end end").await;
+        h.layout(None, &rects).await;
+        assert_eq!(
+            h.state.lock().unwrap().editor.lsp_context_stats(),
+            before_edit,
+            "live text should use Lua buffer overlay without a Rust document payload"
+        );
+        {
+            let mut s = h.state.lock().unwrap();
+            let key = s.nb.new_cell(CellKind::Code, "topology_probe = 2");
+            s.nb.edit(vec![Change::Show { key, index: 0 }]);
+            let nbv_nvim::harness::State { nb, editor, .. } = &mut *s;
+            editor.sync(nb);
+        }
+        h.settle().await;
+        assert_eq!(h.state.lock().unwrap().editor.lsp_context_stats().documents, before_edit.documents + 1);
+        assert_eq!(value(&h, "local count = 0; for _,b in ipairs(vim.api.nvim_list_bufs()) do if vim.b[b].nbv_key and vim.api.nvim_buf_get_lines(b,0,1,false)[1] == 'topology_probe = 2' then count=count+1 end end; return count").await, 1,
+            "topology sync must materialize offscreen cells through the retained factory");
+    }
+}
+
+#[tokio::test]
+async fn late_enable_migrates_only_notebook_attachments() {
+    let Ok(server) = std::env::var("NBV_LSP_SERVER") else {
+        assert!(std::env::var_os("CI").is_none(), "CI must provision NBV_LSP_SERVER");
+        return;
+    };
+    let init = format!(
+        r#"
+      vim.lsp.config('late_pyright', {{cmd={{{},'--stdio'}},filetypes={{'python'}}}})
+      vim.lsp.enable('late_pyright')
+    "#,
+        serde_json::to_string(&server).unwrap()
+    );
+    let h = Harness::open("v4.5-outputs.ipynb", Options { init: Some(init), ..Options::default() }).await;
+    h.layout_all(None).await;
+    until(&h, "for _,c in ipairs(vim.lsp.get_clients({name='late_pyright'})) do if c.initialized then return true end end return false").await;
+    assert_eq!(h.state.lock().unwrap().editor.lsp_context_stats().documents, 0);
+    h.cmd("edit ordinary.py").await;
+    until(&h, "for _,c in ipairs(vim.lsp.get_clients({bufnr=vim.api.nvim_get_current_buf(),name='late_pyright'})) do if c.initialized then _G.ordinary_client=c.id; return true end end return false").await;
+    h.lua("require('nbv.lsp').enable('late_pyright')").await;
+    until(&h, "for _,c in ipairs(vim.lsp.get_clients({name='late_pyright-nbv'})) do if c.initialized then return true end end return false").await;
+    assert_eq!(h.state.lock().unwrap().editor.lsp_context_stats().documents, 1);
+    assert_eq!(
+        value(&h, "return vim.lsp.buf_is_attached(vim.api.nvim_get_current_buf(), ordinary_client)").await,
+        true
+    );
+    assert_eq!(
+        value(
+            &h,
+            r#"
+      for _,b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.b[b].nbv_key and vim.bo[b].filetype == 'python' then
+          if #vim.lsp.get_clients({bufnr=b,name='late_pyright'}) ~= 0 then return false end
+          if #vim.lsp.get_clients({bufnr=b,name='late_pyright-nbv'}) ~= 1 then return false end
+        end
+      end
+      return true
+    "#
+        )
+        .await,
+        true
+    );
+}

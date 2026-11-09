@@ -7,6 +7,7 @@ local document, factory, server, client_id
 local sessions = {}
 local server_config, starting
 local generation, membership = 0, nil
+local enabled_callback
 local watched = {}
 
 local function buffers()
@@ -328,10 +329,11 @@ local function transport(config)
         return sent
       end
       local uri = params and params.textDocument and params.textDocument.uri
-      if uri and document and (known[uri] or local_cell(snapshot(), uri)) then
+      if uri and document and known[uri] then
         if method == 'textDocument/didOpen' or method == 'textDocument/didChange'
           or method == 'textDocument/didClose' or method == 'textDocument/didSave' then
-          refresh()
+          -- on_lines coalesces live text updates, structural sync refreshes membership,
+          -- and every request flushes the overlay. Per-cell sync never rebuilds it.
           return true
         end
       end
@@ -418,32 +420,46 @@ end
 -- Completion consumers (Neovim's built-in completion and plugins) apply additional
 -- edits through this public utility. Route only explicitly tagged notebook edits; delegate
 -- all ordinary buffers and untagged edits unchanged. Validate the entire batch first.
-local apply_text_edits = vim.lsp.util.apply_text_edits
-vim.lsp.util.apply_text_edits = function(edits, bufnr, encoding)
-  local tagged = false
-  for _, e in ipairs(edits) do if e._nbv_uri then tagged = true; break end end
-  if not tagged then return apply_text_edits(edits, bufnr, encoding) end
-  if bufnr == 0 then bufnr = api.nvim_get_current_buf() end
-  local groups = {}
-  for _, e in ipairs(edits) do
-    local dest = e._nbv_uri and vim.uri_to_bufnr(e._nbv_uri) or bufnr
-    assert(not e._nbv_uri or vim.b[dest].nbv_key, 'nbv: completion edit targets a removed cell')
-    if e._nbv_uri and dest ~= bufnr then
-      assert(table.concat(api.nvim_buf_get_lines(dest, 0, -1, false), '\n') == e._nbv_source,
-        'nbv: completion edit targets a cell that changed since completion')
+local edit_routing_installed = false
+local function install_edit_routing()
+  if edit_routing_installed then return end
+  edit_routing_installed = true
+  local apply_text_edits = vim.lsp.util.apply_text_edits
+  vim.lsp.util.apply_text_edits = function(edits, bufnr, encoding)
+    local tagged = false
+    for _, e in ipairs(edits) do if e._nbv_uri then tagged = true; break end end
+    if not tagged then return apply_text_edits(edits, bufnr, encoding) end
+    if bufnr == 0 then bufnr = api.nvim_get_current_buf() end
+    local groups = {}
+    for _, e in ipairs(edits) do
+      local dest = e._nbv_uri and vim.uri_to_bufnr(e._nbv_uri) or bufnr
+      assert(not e._nbv_uri or vim.b[dest].nbv_key, 'nbv: completion edit targets a removed cell')
+      if e._nbv_uri and dest ~= bufnr then
+        assert(table.concat(api.nvim_buf_get_lines(dest, 0, -1, false), '\n') == e._nbv_source,
+          'nbv: completion edit targets a cell that changed since completion')
+      end
+      local copy = vim.deepcopy(e)
+      copy._nbv_uri, copy._nbv_source = nil, nil
+      groups[dest] = groups[dest] or {}
+      table.insert(groups[dest], copy)
     end
-    local copy = vim.deepcopy(e)
-    copy._nbv_uri, copy._nbv_source = nil, nil
-    groups[dest] = groups[dest] or {}
-    table.insert(groups[dest], copy)
+    for dest, batch in pairs(groups) do apply_text_edits(batch, dest, encoding) end
   end
-  for dest, batch in pairs(groups) do apply_text_edits(batch, dest, encoding) end
 end
 
 --- Opt into one configured server. Ordinary files retain automatic attachment.
 function M.enable(name)
   assert(not server or server == name, 'nbv: configure exactly one notebook language server')
   assert(vim.lsp.config[name], 'nbv: unknown language-server configuration: ' .. name)
+  install_edit_routing()
+  -- Late enablement migrates only notebook attachments. Ordinary buffers retain the
+  -- original configured client, and its automatic activation remains enabled.
+  for _, existing in ipairs(vim.lsp.get_clients({ name = name })) do
+    for buf in pairs(vim.deepcopy(existing.attached_buffers)) do
+      if vim.b[buf].nbv_key then vim.lsp.buf_detach_client(buf, existing.id) end
+    end
+    if not next(existing.attached_buffers) then existing:stop() end
+  end
   server_config = vim.deepcopy(vim.lsp.config[name])
   local original = server_config.root_dir
   vim.lsp.config(name, { root_dir = function(bufnr, on_dir)
@@ -453,6 +469,39 @@ function M.enable(name)
     if root or not server_config.workspace_required then on_dir(root) end
   end })
   server = name
+  local group = api.nvim_create_augroup('nbv_lsp_lifecycle', { clear = true })
+  api.nvim_create_autocmd('LspAttach', { group = group, callback = function(ev)
+    local attached = vim.lsp.get_client_by_id(ev.data.client_id)
+    if attached and attached.name == server .. '-nbv' then client_id = attached.id end
+  end })
+  api.nvim_create_autocmd('LspDetach', { group = group, callback = function(ev)
+    vim.schedule(function()
+      if not document or not api.nvim_buf_is_valid(ev.buf) then return end
+      local detached = vim.lsp.get_client_by_id(ev.data.client_id)
+      if not detached or detached:is_stopped() or detached.name ~= server .. '-nbv' then return end
+      local key = vim.b[ev.buf].nbv_key
+      for _, cell in ipairs(document.cells) do
+        if cell.key == key then vim.lsp.buf_attach_client(ev.buf, detached.id); return end
+      end
+    end)
+  end })
+  if enabled_callback then enabled_callback() end
+end
+
+function M.enabled()
+  return server ~= nil
+end
+
+function M.on_enable(callback)
+  enabled_callback = callback
+end
+
+-- Install the cell factory once, independently of the ordered source snapshot. A placement
+-- update never rebuilds or refreshes the projection; source changes use on_lines instead.
+function M.prepare(create)
+  if factory then return end
+  factory = create
+  if document then M.sync(document) end
 end
 
 function M.sync(spec, create)
@@ -485,6 +534,11 @@ function M.sync(spec, create)
         schedule_refresh()
       end, on_detach = function() watched[b] = nil end })
     end
+  end
+  -- Refresh membership once before attaching new cells, so their per-cell didOpen is
+  -- already known to the transport and suppressed without another source snapshot.
+  for _, session in ipairs(sessions) do
+    if not session.rpc.is_closing() then session.refresh() end
   end
   local client = client_id and vim.lsp.get_client_by_id(client_id)
   if not client then
@@ -527,9 +581,6 @@ function M.sync(spec, create)
     for _, c in ipairs(document.cells) do
       if not vim.lsp.buf_is_attached(by_key[c.key], client.id) then vim.lsp.buf_attach_client(by_key[c.key], client.id) end
     end
-  end
-  for _, session in ipairs(sessions) do
-    if document and not session.rpc.is_closing() then session.refresh() end
   end
 end
 

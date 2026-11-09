@@ -427,7 +427,7 @@ end
 function M.layout(seq, spec)
   local ok, err = pcall(function()
     setup_home_window(M.home_win)
-    require('nbv.lsp').sync(spec.notebook, function(c)
+    require('nbv.lsp').prepare(function(c)
       local buf = create_buffer(c.key, c)
       api.nvim_buf_call(buf, function() vim.bo[buf].filetype = c.filetype end)
       vim.b[buf].nbv_filetype_pending = c.filetype
@@ -896,7 +896,8 @@ local function post()
     M.act('open_output', { index = tonumber(o.fargs[1]), mime = o.fargs[2] })
   end, { nargs = '+' })
 
-  notify('ready', { home = M.home_buf, viewport = viewport(), theme = theme() })
+  M.ready = true
+  notify('ready', { home = M.home_buf, viewport = viewport(), theme = theme(), lsp = require('nbv.lsp').enabled() })
 end
 
 --- Pre-config: runs before the user's init.lua.
@@ -905,6 +906,9 @@ function M.pre(chan, home_name, transparent_sp)
   M.home_name = home_name
   M.transparent_sp = transparent_sp
   vim.g.nbv = true
+  require('nbv.lsp').on_enable(function()
+    if M.ready then notify('lsp_enabled') end
+  end)
   -- Set before the user's config too, so plugins that read it at setup (lualine's
   -- `globalstatus`) draw a global statusline.
   vim.o.laststatus = 3

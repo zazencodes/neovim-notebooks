@@ -165,6 +165,10 @@ pub struct Editor {
     pub grid: Grid,
     pub calls: Calls,
     home: Option<i64>,
+    lsp_enabled: bool,
+    lsp_dirty: bool,
+    #[cfg(feature = "harness")]
+    lsp_context_stats: LspContextStats,
     buffers: HashMap<i64, CellBuffer>,
     by_key: HashMap<CellKey, i64>,
     /// Buffers requested from the companion and not yet reported, with the type requested.
@@ -174,6 +178,15 @@ pub struct Editor {
     /// Each cell's display rows, as Neovim last measured them in its window, with the
     /// window's width.
     rows: HashMap<CellKey, (u16, usize)>,
+}
+
+/// Harness instrumentation at the source reconstruction boundary. Placement-only updates
+/// must leave both counters unchanged, whether notebook LSP is enabled or disabled.
+#[cfg(feature = "harness")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LspContextStats {
+    pub documents: usize,
+    pub source_bytes: usize,
 }
 
 pub fn field<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
@@ -218,6 +231,10 @@ impl Editor {
             grid: Grid::default(),
             calls: Calls::start(client, errors),
             home: None,
+            lsp_enabled: false,
+            lsp_dirty: true,
+            #[cfg(feature = "harness")]
+            lsp_context_stats: LspContextStats::default(),
             buffers: HashMap::new(),
             by_key: HashMap::new(),
             creating: HashMap::new(),
@@ -232,6 +249,7 @@ impl Editor {
         if language != self.language {
             self.language = language;
             self.wipe_all();
+            self.lsp_dirty = true;
         }
     }
 
@@ -252,6 +270,9 @@ impl Editor {
     /// Places the cell editor windows (§11.1). Buffers are created for cells that have none;
     /// windows for cells not listed are closed. `active` is the cell being edited.
     pub fn layout(&mut self, nb: &Notebook, seq: u64, active: Option<&CellKey>, rects: &[EditorRect]) {
+        if self.lsp_enabled && self.lsp_dirty {
+            self.sync_lsp_context(nb);
+        }
         let mut cells = vec![];
         for r in rects {
             let mut entries = vec![
@@ -288,11 +309,8 @@ impl Editor {
             }
             cells.push(map(entries));
         }
-        let spec = map(vec![
-            ("active", active.map_or(Value::Nil, |k| k.as_str().into())),
-            ("cells", Value::Array(cells)),
-            ("notebook", self.lsp_document(nb)),
-        ]);
+        let spec =
+            map(vec![("active", active.map_or(Value::Nil, |k| k.as_str().into())), ("cells", Value::Array(cells))]);
         self.calls.lua("require('nbv').layout(...)", vec![seq.into(), spec]);
     }
 
@@ -319,12 +337,30 @@ impl Editor {
         }
         self.wipe(wipe);
         self.creating.retain(|k, _| nb.is_live(k));
-        self.calls.lua("require('nbv.lsp').sync(...)", vec![self.lsp_document(nb)]);
+        self.sync_lsp_context(nb);
+    }
+
+    #[cfg(feature = "harness")]
+    pub fn lsp_context_stats(&self) -> LspContextStats {
+        self.lsp_context_stats
+    }
+
+    fn sync_lsp_context(&mut self, nb: &Notebook) {
+        if !self.lsp_enabled {
+            return;
+        }
+        let document = self.lsp_document(nb);
+        self.calls.lua("require('nbv.lsp').sync(...)", vec![document]);
+        self.lsp_dirty = false;
     }
 
     /// Ordered canonical sources for the language-server transport. Live buffers overlay these
     /// sources in Lua, so requests include typing that Rust has not received yet.
-    fn lsp_document(&self, nb: &Notebook) -> Value {
+    fn lsp_document(&mut self, nb: &Notebook) -> Value {
+        #[cfg(feature = "harness")]
+        {
+            self.lsp_context_stats.documents += 1;
+        }
         let cells = nb
             .order()
             .iter()
@@ -332,6 +368,11 @@ impl Editor {
                 let cell = nb.cell(key)?;
                 if cell.kind() != CellKind::Code {
                     return None;
+                }
+                let source = cell.source();
+                #[cfg(feature = "harness")]
+                {
+                    self.lsp_context_stats.source_bytes += source.len();
                 }
                 Some(map(vec![
                     ("key", key.as_str().into()),
@@ -343,7 +384,7 @@ impl Editor {
                             .into(),
                     ),
                     ("filetype", filetype(cell.kind(), self.language.as_deref()).into()),
-                    ("lines", Value::Array(source_lines(&cell.source()).into_iter().map(Value::from).collect())),
+                    ("lines", Value::Array(source_lines(&source).into_iter().map(Value::from).collect())),
                 ]))
             })
             .collect();
@@ -389,6 +430,7 @@ impl Editor {
     pub fn renamed(&mut self, nb: &Notebook) {
         self.calls.lua("require('nbv').rename_home(...)", vec![home_name(nb.path()).into()]);
         self.wipe_all();
+        self.sync_lsp_context(nb);
     }
 
     /// Marks the home buffer modified, so quitting with unsaved changes is refused as usual.
@@ -453,6 +495,8 @@ impl Editor {
         let seq = || field(&payload, "seq").and_then(Value::as_u64).unwrap_or(0);
         match action.as_str() {
             "ready" => {
+                self.lsp_enabled = field(&payload, "lsp").and_then(Value::as_bool).unwrap_or(false);
+                self.sync_lsp_context(nb);
                 self.home = field(&payload, "home").and_then(Value::as_i64);
                 let mut out = vec![];
                 if let Some(v) = field(&payload, "viewport").and_then(viewport) {
@@ -461,6 +505,13 @@ impl Editor {
                 out.push(EditorEvent::Theme(field(&payload, "theme").map(theme).unwrap_or_default()));
                 out.push(EditorEvent::Ready);
                 out
+            }
+            "lsp_enabled" => {
+                if !self.lsp_enabled {
+                    self.lsp_enabled = true;
+                    self.sync_lsp_context(nb);
+                }
+                vec![]
             }
             "buffer" => {
                 let key = field(&payload, "key").and_then(Value::as_str).map(CellKey::new);

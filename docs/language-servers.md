@@ -40,8 +40,13 @@ analysis of notebook order, independent of the order in which cells ran in the k
 
 ## Transport and ownership
 
-Rust remains the canonical notebook owner. Each layout and structural synchronization supplies
-an ordered list of code-cell keys, names, filetypes and sources. `nbv.lsp` overlays live buffer
+Rust remains the canonical notebook owner. The companion reports opt-in with Ready, or an
+explicit enable notification when enabled later. Only then does Rust build the initial ordered
+snapshot of code-cell keys, names, filetypes and sources. Structural synchronization, reload,
+language switches and notebook rename refresh that snapshot. Placement/scroll RPCs contain no
+notebook document, and neither rebuild sources nor refresh the projection in Lua. The cell
+factory is registered separately on the first layout and retained for offscreen materialization.
+`nbv.lsp` overlays live buffer
 text on that snapshot, including changes whose Rust line notification is still in flight.
 The module caches projection metadata for protocol translation; it never persists source or
 changes notebook structure. Its one synthetic URI is `<notebook>.ipynb.nvb.py`, beside the
@@ -71,12 +76,15 @@ from CompleteDone after inserting the selected word; unrelated source changes st
 Diagnostics clear when the
 projection changes. Cell insertion, deletion, movement and kind changes refresh the projection;
 changing away from Python stops the notebook client and switching back starts it again.
-Detached cells reattach at the next synchronization. Neovim's `:lsp restart` retains the
+Detached cells reattach through the LspDetach lifecycle hook. Neovim's `:lsp restart` retains the
 transport and configured callbacks. Asynchronous root discovery captures a generation and
 validates the first cell/buffer before starting; callbacks for replaced notebooks/cells expire.
 
 Snapshot construction scans Neovim buffers once. URI lookups are constant time, projected-line
 lookups use binary search, and on_lines refreshes coalesce into one scheduled callback.
+Harness counters at the Rust source-reconstruction boundary and Lua RPC interception verify
+that repeated placements send/rebuild zero document sources with LSP both disabled and enabled;
+late enablement and structural changes still send their initial/replacement context.
 
 ## Validation
 

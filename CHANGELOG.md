@@ -49,6 +49,8 @@ before 1.0, a breaking change bumps the minor version.
 - Long-running text output stays responsive as it grows, while the notebook keeps the full
   output and the inline view shows its latest rows.
 
+- Scrolling a notebook no longer rebuilds or sends its full language-server document on
+  every placement; disabled notebook LSP adds no source-projection work.
 - Inside tmux, switching panes, windows or apps no longer blanks nbv and sends every visible
   image to the terminal again (several megabytes each time, kept in the terminal's memory).
   Images are sent again only when a different tmux client shows the pane.
