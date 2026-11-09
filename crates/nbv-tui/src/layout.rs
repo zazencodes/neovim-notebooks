@@ -9,6 +9,8 @@
 //!        array([0, 1, 2])                  ← outputs, drawn by nbv
 //! ```
 
+use std::collections::HashMap;
+
 use nbv_core::{CellKey, CellKind};
 use nbv_nvim::{EditorRect, Viewport};
 
@@ -76,6 +78,7 @@ impl Geometry {
 pub struct Layout {
     pub blocks: Vec<Block>,
     pub total: usize,
+    indices: HashMap<CellKey, usize>,
 }
 
 impl Layout {
@@ -88,7 +91,8 @@ impl Layout {
             top += b.height();
             blocks.push(b);
         }
-        Layout { blocks, total: top }
+        let indices = blocks.iter().enumerate().map(|(i, b)| (b.key.clone(), i)).collect();
+        Layout { blocks, total: top, indices }
     }
 
     /// The contiguous visible block range, found without visiting offscreen cells.
@@ -99,7 +103,7 @@ impl Layout {
     }
 
     pub fn index_of(&self, key: &CellKey) -> Option<usize> {
-        self.blocks.iter().position(|b| &b.key == key)
+        self.indices.get(key).copied()
     }
 
     /// The largest useful scroll offset: the last block's end at the bottom of the area.
@@ -150,14 +154,13 @@ impl Layout {
     /// last block.
     pub fn middle(&self, scroll: usize, area: usize) -> Option<usize> {
         let row = (scroll + area / 2).min(self.total.checked_sub(1)?);
-        self.blocks.iter().position(|b| (b.top..b.top + b.height()).contains(&row))
+        Some(self.blocks.partition_point(|b| b.top + b.height() <= row))
     }
 
     /// Block `i`, or the visible block nearest it when it is out of view at `scroll`.
     pub fn nearest_visible(&self, scroll: usize, area: usize, i: usize) -> Option<usize> {
-        let first = self.blocks.iter().position(|b| b.top + b.height() > scroll)?;
-        let last = self.blocks.iter().rposition(|b| b.top < scroll + area)?;
-        Some(i.max(first).min(last))
+        let visible = self.visible(scroll, area);
+        (!visible.is_empty()).then(|| i.max(visible.start).min(visible.end - 1))
     }
 
     /// The editor windows for the blocks visible at `scroll`: each window shows the visible
@@ -193,7 +196,8 @@ impl Layout {
         if row >= g.area_top() + g.area_height() as u16 {
             return None;
         }
-        self.blocks.iter().position(|b| (b.top..b.top + b.height()).contains(&r))
+        let index = self.blocks.partition_point(|b| b.top + b.height() <= r);
+        (index < self.blocks.len()).then_some(index)
     }
 }
 

@@ -15,6 +15,9 @@ before 1.0, a breaking change bumps the minor version.
 
 ### Fixed
 
+- Scrolling and selecting cells reuse the notebook layout until cell heights or width change,
+  keeping navigation responsive in notebooks with many offscreen cells.
+
 - Plot images decode only when visible. Decoded images and terminal image encodings now have
   byte budgets and release obsolete plots when outputs are replaced, cleared, or scrolled away.
 

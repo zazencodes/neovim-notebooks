@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Stdout, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind};
@@ -121,6 +122,7 @@ struct App {
     source_rows: HashMap<CellKey, usize>,
     collapsed_outputs: HashSet<CellKey>,
     artifacts: crate::inspect::Artifacts,
+    cached_layout: Option<(u16, Arc<Layout>)>,
     protocols: HashMap<(u64, u16, u16), SlicedProtocol>,
     picker: Picker,
     tmux: Option<Tmux>,
@@ -150,9 +152,9 @@ struct App {
     /// The last editor placement sent, to skip identical ones.
     last_sent: Option<(Option<CellKey>, Vec<EditorRect>)>,
     /// Layouts sent and not yet on screen, with their scroll offsets.
-    sent: VecDeque<(u64, Layout, usize)>,
+    sent: VecDeque<(u64, Arc<Layout>, usize)>,
     /// The layout Neovim has on screen: nbv draws around the windows where they are.
-    shown: Option<(Layout, usize)>,
+    shown: Option<(Arc<Layout>, usize)>,
     relayout: bool,
     draw: bool,
     /// Whether the home buffer has been marked modified since the last write.
@@ -258,6 +260,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         source_rows: HashMap::new(),
         collapsed_outputs: HashSet::new(),
         artifacts: crate::inspect::Artifacts::new()?,
+        cached_layout: None,
         protocols: HashMap::new(),
         picker,
         tmux,
@@ -485,14 +488,15 @@ impl App {
                     // So `:x` in the home window writes it, as for any changed buffer.
                     self.mark_dirty();
                     // A cell's line count may have changed, and its staleness.
-                    self.relayout = true;
+                    self.invalidate_layout();
                     self.draw = true;
                 }
-                EditorEvent::Rows => self.relayout = true,
+                EditorEvent::Rows => self.invalidate_layout(),
                 EditorEvent::Reloaded => {
                     // A cell whose window closed reports the focus change.
                     self.views.clear();
                     self.source_rows.clear();
+                    self.invalidate_layout();
                     self.dirty = false;
                     self.last_sent = None;
                     self.relayout = true;
@@ -569,7 +573,7 @@ impl App {
                 self.editor.calls.request("nvim_ui_try_resize", vec![(w as u64).into(), (h as u64).into()]);
                 self.views.clear();
                 self.protocols.clear();
-                self.relayout = true;
+                self.invalidate_layout();
             }
             Event::FocusGained => {
                 self.editor.calls.request("nvim_ui_set_focus", vec![true.into()]);
@@ -658,7 +662,7 @@ impl App {
             ExecEvent::Cell(k) => {
                 self.views.remove(&k);
                 self.mark_dirty();
-                self.relayout = true;
+                self.invalidate_layout();
                 self.draw = true;
             }
             ExecEvent::Status(_) => self.draw = true,
@@ -735,6 +739,7 @@ impl App {
             }
             let Some(msg) = self.exec.request(&mut self.nb, &key) else { continue };
             self.views.remove(&key);
+            self.invalidate_layout();
             match self.kernel.as_mut() {
                 Some(k) => {
                     if let Err(e) = k.send_shell(msg).await {
@@ -797,6 +802,7 @@ impl App {
     fn structure_changed(&mut self, focus: Option<usize>) {
         self.source_rows.clear();
         self.views.clear();
+        self.invalidate_layout();
         self.editor.sync(&self.nb);
         if let Some(i) = focus {
             self.selected = i;
@@ -1000,7 +1006,7 @@ impl App {
                         self.collapsed_outputs.insert(k.clone());
                     }
                     self.views.remove(&k);
-                    self.relayout = true;
+                    self.invalidate_layout();
                     self.draw = true;
                 }
             }
@@ -1151,7 +1157,7 @@ impl App {
                     self.views.remove(&k);
                 }
                 self.mark_dirty();
-                self.relayout = true;
+                self.invalidate_layout();
             }
             "rename" => {
                 let name = field(args, "name").and_then(Value::as_str).expect("the prompt sends a name");
@@ -1164,7 +1170,7 @@ impl App {
                         });
                         self.editor.renamed(&self.nb);
                         self.last_sent = None;
-                        self.relayout = true;
+                        self.invalidate_layout();
                     }
                     Err(e) => self.message = Some(e.to_string()),
                 }
@@ -1182,6 +1188,7 @@ impl App {
                     self.message = Some(e.to_string());
                 }
                 self.editor.set_language(Some(cmd.language.clone()));
+                self.invalidate_layout();
                 self.kernel_cmd = Some(cmd);
                 self.last_sent = None;
                 self.relayout = true;
@@ -1238,8 +1245,13 @@ impl App {
     /// The document laid out for `g`: every cell's editor rows and output rows. A cell has the
     /// display rows Neovim measured in its window; one Neovim has not yet shown at this width
     /// has one row per line.
-    fn layout(&mut self, g: &Geometry) -> Layout {
+    fn layout(&mut self, g: &Geometry) -> Arc<Layout> {
         let width = g.inner_x().1;
+        if let Some((cached_width, layout)) = &self.cached_layout
+            && *cached_width == width
+        {
+            return layout.clone();
+        }
         let cells: Vec<(CellKey, CellKind, usize)> = self
             .nb
             .order()
@@ -1257,7 +1269,17 @@ impl App {
             let outputs = if kind == CellKind::Code { self.view(&key, width).map_or(0, |v| v.height) } else { 0 };
             items.push((key, kind, lines, outputs));
         }
-        Layout::new(items)
+        let layout = Arc::new(Layout::new(items));
+        self.cached_layout = Some((width, layout.clone()));
+        layout
+    }
+
+    /// Call whenever cell/source/output/display heights or structure change. Scrolling,
+    /// selection, focus and alignment only place the existing layout. Width is keyed above.
+    /// Output collapse/expand must invalidate here as well when integrated.
+    fn invalidate_layout(&mut self) {
+        self.cached_layout = None;
+        self.relayout = true;
     }
 
     /// Lays out the notebook and sends Neovim the editor windows' places, if they changed.
@@ -1699,10 +1721,9 @@ mod tests {
     use ratatui::text::Line;
 
     use super::*;
+    use nbv_nvim::harness::{Harness, Options};
 
-    #[tokio::test]
-    async fn entering_and_adding_cells_queue_layout_before_focus_with_a_layout_in_flight() {
-        use nbv_nvim::harness::{Harness, Options};
+    async fn fixture_app() -> (Harness, App) {
         let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
         let (errors, _rx) = mpsc::unbounded_channel();
         let terminal = Terminal::with_options(
@@ -1710,7 +1731,7 @@ mod tests {
             ratatui::TerminalOptions { viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)) },
         )
         .unwrap();
-        let mut app = App {
+        let app = App {
             nb: Notebook::open(&h.notebook).unwrap(),
             editor: Editor::new(h.client.clone(), errors),
             client: h.client.clone(),
@@ -1734,6 +1755,7 @@ mod tests {
             source_rows: HashMap::new(),
             collapsed_outputs: HashSet::new(),
             artifacts: crate::inspect::Artifacts::new().unwrap(),
+            cached_layout: None,
             protocols: HashMap::new(),
             picker: Picker::halfblocks(),
             tmux: None,
@@ -1762,6 +1784,112 @@ mod tests {
             dirty: false,
             disk_notified: None,
         };
+        (h, app)
+    }
+
+    #[tokio::test]
+    async fn output_collapse_invalidates_cached_geometry_without_changing_data() {
+        let (_h, mut app) = fixture_app().await;
+        app.selected = app
+            .nb
+            .order()
+            .iter()
+            .position(|key| app.nb.cell(key).is_some_and(|cell| !cell.outputs().is_empty()))
+            .expect("fixture with output");
+        let key = app.selected_key().unwrap();
+        app.nb.cell_mut(&key).unwrap().outputs_mut().push(serde_json::json!({
+            "output_type": "stream", "name": "stdout", "text": "first\nsecond\nthird\n"
+        }));
+        let saved = app.nb.to_json();
+        let g = app.geometry.unwrap();
+        let before = app.layout(&g);
+        app.on_action(Action::ToggleOutput).await;
+        let collapsed = app.layout(&g);
+        assert!(!Arc::ptr_eq(&before, &collapsed));
+        assert!(collapsed.total < before.total);
+        app.on_action(Action::ToggleOutput).await;
+        let expanded = app.layout(&g);
+        assert_eq!(expanded.total, before.total);
+        assert_eq!(app.nb.to_json(), saved);
+    }
+
+    #[tokio::test]
+    #[ignore = "release performance scenario: cargo test -p nbv-tui --release cached_navigation_scenario -- --ignored --nocapture"]
+    async fn cached_navigation_scenario() {
+        use std::{hint::black_box, time::Instant};
+        let (_h, mut app) = fixture_app().await;
+        let cells: Vec<_> = (0..20_000)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("cell-{i}"), "cell_type":"code", "metadata":{}, "execution_count":null,
+                    "outputs":[], "source":"one\ntwo\nthree",
+                })
+            })
+            .collect();
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":cells}))
+                .unwrap();
+        app.nb = Notebook::from_bytes(app.nb.path(), &bytes, Default::default()).unwrap();
+        let g = app.geometry.unwrap();
+        let original = app.layout(&g);
+        let start = Instant::now();
+        for _ in 0..200 {
+            black_box(Layout::new(original.blocks.iter().map(|b| (b.key.clone(), b.kind, b.rows, b.outputs))));
+        }
+        let rebuild = start.elapsed();
+        let start = Instant::now();
+        for i in 0..200 {
+            app.pan(1);
+            app.scroll_by(1);
+            app.select(i);
+            app.align(Layout::center);
+            assert!(Arc::ptr_eq(&original, &app.layout(&g)));
+        }
+        eprintln!(
+            "20000 cells, 200 navigation turns: geometry rebuild={rebuild:?}, cached pan/scroll/select/align={:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn scrolling_selection_and_alignment_reuse_layout_until_heights_change() {
+        let (_h, mut app) = fixture_app().await;
+        let g = app.geometry.unwrap();
+        let original = app.layout(&g);
+        for i in 0..100 {
+            app.pan(1);
+            app.scroll_by(-1);
+            app.select(i % app.nb.order().len());
+            app.align(Layout::center);
+            assert!(Arc::ptr_eq(&original, &app.layout(&g)), "pure navigation rebuilt all blocks");
+        }
+        let key = app.nb.order()[0].clone();
+        app.on_exec_event(ExecEvent::Cell(key.clone()));
+        let output_changed = app.layout(&g);
+        assert!(!Arc::ptr_eq(&original, &output_changed));
+        let payload = Value::Array(vec![Value::Map(vec![
+            ("key".into(), key.as_str().into()),
+            ("width".into(), g.inner_x().1.into()),
+            ("rows".into(), 123.into()),
+        ])]);
+        app.on_nvim(NvimEvent::Notify { name: "nbv".into(), args: vec!["rows".into(), payload] }).await;
+        let measured = app.layout(&g);
+        assert!(!Arc::ptr_eq(&measured, &output_changed));
+        assert_eq!(measured.blocks[0].rows, 123);
+        let mut narrow = g;
+        narrow.viewport.width -= 10;
+        let resized = app.layout(&narrow);
+        assert!(!Arc::ptr_eq(&resized, &measured));
+        assert_ne!(resized.blocks[0].rows, 123, "new width must discard old measured rows");
+        app.add(app.nb.order().len());
+        let structural = app.layout(&narrow);
+        assert!(!Arc::ptr_eq(&structural, &resized));
+        assert_eq!(structural.blocks.len(), resized.blocks.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn entering_and_adding_cells_queue_layout_before_focus_with_a_layout_in_flight() {
+        let (h, mut app) = fixture_app().await;
         let key = app.nb.order().last().unwrap().clone();
         {
             let mut st = h.state.lock().unwrap();
