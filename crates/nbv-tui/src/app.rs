@@ -1412,25 +1412,59 @@ impl App {
             return Ok(());
         }
         // Views and image protocols for the outputs about to be shown.
-        let visible: Vec<CellKey> = match (self.geometry, &self.shown) {
+        let visible: Vec<(CellKey, usize, usize, usize)> = match (self.geometry, &self.shown) {
             (Some(g), Some((layout, scroll))) => layout.blocks[layout.visible(*scroll, g.area_height())]
                 .iter()
                 .filter(|b| b.outputs > 0)
-                .map(|b| b.key.clone())
+                .map(|b| (b.key.clone(), b.top + b.box_height(), *scroll, g.area_height()))
                 .collect(),
             _ => vec![],
         };
         let width = self.geometry.map_or(0, |g| g.inner_x().1);
-        for key in &visible {
-            let Some(view) = self.view(key, width).cloned() else { continue };
-            for block in &view.blocks {
-                if let outputs::Block::Image { hash, image, cols, rows } = block {
-                    let id = (*hash, *cols, *rows);
-                    if !self.protocols.contains_key(&id)
-                        && let Ok(p) =
-                            SlicedProtocol::new(&self.picker, (**image).clone(), Some(Size::new(*cols, *rows)))
-                    {
-                        self.protocols.insert(id, p);
+        let mut needed = vec![];
+        for (key, first, scroll, area) in &visible {
+            let Some(view) = self.view(key, width) else { continue };
+            let mut row = *first;
+            for (index, block) in view.blocks.iter().enumerate() {
+                let end = row + block.height();
+                if row >= scroll + area {
+                    break;
+                }
+                if end > *scroll
+                    && let outputs::Block::Image { hash, data, cols, rows } = block
+                {
+                    needed.push((key.clone(), index, (*hash, *cols, *rows), data.clone()));
+                }
+                row = end;
+            }
+        }
+        let live: HashSet<_> = needed.iter().map(|(_, _, id, _)| *id).collect();
+        // Views own compressed data only. Removing obsolete rasters really releases their
+        // pixels, rather than leaving hidden Arc owners in offscreen output views.
+        self.images.retain(|hash| live.iter().any(|id| id.0 == hash));
+        self.protocols.retain(|id, _| live.contains(id));
+        for (key, index, id, data) in &needed {
+            if self.protocols.contains_key(id) {
+                continue;
+            }
+            let result = self.images.decode(id.0, data).and_then(|image| {
+                SlicedProtocol::new(&self.picker, (*image).clone(), Some(Size::new(id.1, id.2)))
+                    .map_err(|e| e.to_string())
+            });
+            match result {
+                Ok(protocol) => {
+                    self.protocols.insert(*id, protocol);
+                }
+                Err(error) => {
+                    // Keep the measured height until the next layout, so clipping and the
+                    // confirmed editor rectangles remain in agreement even on decode failure.
+                    if let Some(view) = self.views.get_mut(key) {
+                        let mut lines = vec![Line::default(); id.2 as usize];
+                        lines[0] = Line::styled(
+                            format!("image could not be rendered: {error}"),
+                            Style::default().fg(Color::LightRed),
+                        );
+                        view.blocks[*index] = outputs::Block::Text(lines);
                     }
                 }
             }
@@ -1481,6 +1515,15 @@ impl App {
                 f.set_cursor_position((col as u16, row as u16));
             }
         })?;
+        // Protocol internals are opaque upstream. Charge a conservative byte ceiling based
+        // on the resized pixels and terminal cells (covers raw/encoded data and row buffers).
+        // Oversized visible frames render transiently, then release entries over the budget.
+        trim_protocols(
+            &mut self.protocols,
+            &needed.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>(),
+            self.picker.font_size(),
+            PROTOCOL_BYTES,
+        );
         let mode = grid.modes.get(grid.mode).map(|m| (m.shape.clone(), m.percentage));
         if mode != self.cursor_shape {
             let style = match mode.as_ref().map(|m| &m.0) {
@@ -1517,6 +1560,41 @@ impl App {
         };
         Decoration { border, bold: active || selected, gutter, status, label, dim }
     }
+}
+
+/// Retained protocol budget, separate from the decoded raster budget.
+const PROTOCOL_BYTES: usize = 64 * 1024 * 1024;
+
+fn protocol_bytes(id: (u64, u16, u16), font: ratatui_image::FontSize) -> usize {
+    let cells = usize::from(id.1) * usize::from(id.2);
+    // 128 bytes/pixel covers sixel worst-case runs, PNG/base64 plus transmission
+    // strings; 1024 bytes/cell covers halfblock buffers and sliced row overhead.
+    cells
+        .saturating_mul(usize::from(font.width.max(1)))
+        .saturating_mul(usize::from(font.height.max(1)))
+        .saturating_mul(128)
+        .saturating_add(cells.saturating_mul(1024))
+}
+
+fn trim_protocols(
+    protocols: &mut HashMap<(u64, u16, u16), SlicedProtocol>,
+    visible: &[(u64, u16, u16)],
+    font: ratatui_image::FontSize,
+    budget: usize,
+) {
+    let mut retained = HashSet::new();
+    let mut bytes = 0usize;
+    for id in visible {
+        if retained.contains(id) || !protocols.contains_key(id) {
+            continue;
+        }
+        let charge = protocol_bytes(*id, font);
+        if bytes.saturating_add(charge) <= budget {
+            bytes += charge;
+            retained.insert(*id);
+        }
+    }
+    protocols.retain(|id, _| retained.contains(id));
 }
 
 /// How one block is drawn, beyond its geometry.
@@ -1710,6 +1788,33 @@ mod tests {
         }
         h.wait("new cell focus", |st| st.focus.as_ref() == Some(&(app.focus_seq, Focus::Cell(added.clone())))).await;
         assert!(h.state.lock().unwrap().errors.is_empty());
+    }
+
+    #[test]
+    fn protocol_cache_plateaus_by_bytes_and_discards_obsolete_plots() {
+        let picker = Picker::halfblocks();
+        let font = picker.font_size();
+        let mut protocols = HashMap::new();
+        let budget = protocol_bytes((0, 2, 2), font) * 2;
+        for hash in 0..100 {
+            let id = (hash, 2, 2);
+            let protocol =
+                SlicedProtocol::new(&picker, image::DynamicImage::new_rgb8(4, 4), Some(Size::new(2, 2))).unwrap();
+            protocols.insert(id, protocol);
+            trim_protocols(&mut protocols, &[id], font, budget);
+            assert_eq!(protocols.len(), 1);
+            assert!(protocols.contains_key(&id));
+            assert!(protocols.keys().map(|id| protocol_bytes(*id, font)).sum::<usize>() <= budget);
+        }
+        trim_protocols(&mut protocols, &[], font, budget);
+        assert!(protocols.is_empty(), "cleared/replaced outputs release their encodings");
+        let id = (100, 2, 2);
+        protocols.insert(
+            id,
+            SlicedProtocol::new(&picker, image::DynamicImage::new_rgb8(4, 4), Some(Size::new(2, 2))).unwrap(),
+        );
+        trim_protocols(&mut protocols, &[id], font, 1);
+        assert!(protocols.is_empty(), "oversized encodings are transient");
     }
 
     #[test]

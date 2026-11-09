@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io::Cursor;
 use std::sync::Arc;
 
 use base64::Engine;
@@ -25,7 +26,7 @@ pub const MAX_IMAGE_ROWS: u16 = 24;
 #[derive(Clone)]
 pub enum Block {
     Text(Vec<Line<'static>>),
-    Image { hash: u64, image: Arc<DynamicImage>, cols: u16, rows: u16 },
+    Image { hash: u64, data: Arc<[u8]>, cols: u16, rows: u16 },
 }
 
 impl Block {
@@ -56,27 +57,73 @@ impl OutputView {
     }
 }
 
-/// Decoded images by content hash, so re-rendering does not re-decode.
+struct MeasuredImage {
+    hash: u64,
+    data: Arc<[u8]>,
+    dimensions: (u32, u32),
+}
+
+/// Raster cache budget. Output views retain compressed bytes, never decoded raster Arcs.
+const DECODED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Decoded rasters are retained by bytes, with least-recently-used eviction.
 #[derive(Default)]
 pub struct Images {
-    decoded: HashMap<u64, Result<Arc<DynamicImage>, String>>,
+    decoded: HashMap<u64, (Arc<DynamicImage>, u64)>,
+    bytes: usize,
+    clock: u64,
 }
 
 impl Images {
-    fn get(&mut self, b64: &str) -> Result<(u64, Arc<DynamicImage>), String> {
+    /// Header-only measurement: layout never expands offscreen images into pixels.
+    fn measure(&mut self, b64: &str) -> Result<MeasuredImage, String> {
+        let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(clean).map_err(|e| e.to_string())?;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        b64.hash(&mut h);
-        let hash = h.finish();
-        let img = self
-            .decoded
-            .entry(hash)
-            .or_insert_with(|| {
-                let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
-                let bytes = base64::engine::general_purpose::STANDARD.decode(clean).map_err(|e| e.to_string())?;
-                image::load_from_memory(&bytes).map(Arc::new).map_err(|e| e.to_string())
-            })
-            .clone()?;
-        Ok((hash, img))
+        bytes.hash(&mut h);
+        let dimensions = image::ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?
+            .into_dimensions()
+            .map_err(|e| e.to_string())?;
+        Ok(MeasuredImage { hash: h.finish(), data: bytes.into(), dimensions })
+    }
+
+    pub fn decode(&mut self, hash: u64, data: &[u8]) -> Result<Arc<DynamicImage>, String> {
+        self.decode_with_budget(hash, data, DECODED_BYTES)
+    }
+
+    fn decode_with_budget(&mut self, hash: u64, data: &[u8], budget: usize) -> Result<Arc<DynamicImage>, String> {
+        self.clock += 1;
+        if let Some((image, used)) = self.decoded.get_mut(&hash) {
+            *used = self.clock;
+            return Ok(image.clone());
+        }
+        let image = Arc::new(image::load_from_memory(data).map_err(|e| e.to_string())?);
+        let bytes = image.as_bytes().len();
+        while self.bytes.saturating_add(bytes) > budget && !self.decoded.is_empty() {
+            let oldest = *self.decoded.iter().min_by_key(|(_, (_, used))| used).expect("nonempty cache").0;
+            let (old, _) = self.decoded.remove(&oldest).expect("cached image");
+            self.bytes -= old.as_bytes().len();
+        }
+        // A single oversized raster may be rendered transiently but is never cached.
+        if bytes <= budget {
+            self.bytes += bytes;
+            self.decoded.insert(hash, (image.clone(), self.clock));
+        }
+        Ok(image)
+    }
+
+    /// Remove obsolete rasters, including images whose outputs were replaced or cleared.
+    pub fn retain(&mut self, mut keep: impl FnMut(u64) -> bool) {
+        self.decoded.retain(|hash, (image, _)| {
+            if keep(*hash) {
+                true
+            } else {
+                self.bytes -= image.as_bytes().len();
+                false
+            }
+        });
     }
 }
 
@@ -122,10 +169,10 @@ fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
 }
 
 /// Image size in cells: natural size, shrunk to fit `max_cols` × `MAX_IMAGE_ROWS`.
-fn image_cells(img: &DynamicImage, font: FontSize, max_cols: u16) -> (u16, u16) {
+fn image_cells(dimensions: (u32, u32), font: FontSize, max_cols: u16) -> (u16, u16) {
     let fw = font.width.max(1) as f64;
     let fh = font.height.max(1) as f64;
-    let (w, h) = (img.width() as f64 / fw, img.height() as f64 / fh);
+    let (w, h) = (dimensions.0 as f64 / fw, dimensions.1 as f64 / fh);
     let scale = (max_cols as f64 / w).min(MAX_IMAGE_ROWS as f64 / h).min(1.0);
     (((w * scale).ceil() as u16).max(1), ((h * scale).ceil() as u16).max(1))
 }
@@ -162,15 +209,15 @@ pub fn build(cell: &Cell, width: u16, font: FontSize, images: &mut Images) -> Ou
                 blocks.push(Block::Text(text_block(&text, Style::default())));
             }
             "execute_result" | "display_data" => {
-                let data = out.get("data").cloned().unwrap_or(Value::Null);
+                let data = out.get("data").unwrap_or(&Value::Null);
                 let image = ["image/png", "image/jpeg", "image/gif"]
                     .iter()
-                    .find_map(|m| data.get(*m).map(|v| (m, images.get(&multiline(Some(v))))));
+                    .find_map(|m| data.get(*m).map(|v| (m, images.measure(&multiline(Some(v))))));
                 if let Some((mime, image)) = image {
                     match image {
-                        Ok((hash, image)) => {
-                            let (cols, rows) = image_cells(&image, font, width.saturating_sub(2).max(1));
-                            blocks.push(Block::Image { hash, image, cols, rows });
+                        Ok(MeasuredImage { hash, data, dimensions }) => {
+                            let (cols, rows) = image_cells(dimensions, font, width.saturating_sub(2).max(1));
+                            blocks.push(Block::Image { hash, data, cols, rows });
                         }
                         Err(e) => blocks.push(Block::Text(vec![Line::styled(
                             format!("{mime} could not be decoded: {e}"),
@@ -285,6 +332,84 @@ mod tests {
         let v = build(&c, 80, FontSize::new(10, 20), &mut Images::default());
         let Block::Text(lines) = v.blocks.last().unwrap() else { panic!() };
         assert_eq!(lines[0].spans[0].content, "no kernel");
+    }
+
+    fn png_data(side: u32, value: u8) -> Vec<u8> {
+        let mut bytes = Cursor::new(vec![]);
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(side, side, image::Rgba([value, 0, 0, 255])));
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn offscreen_measurement_retains_no_raster_and_eviction_releases_view_images() {
+        let data = png_data(32, 7);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let c = cell(json!([{"output_type":"display_data", "data":{"image/png":b64}}]));
+        let mut images = Images::default();
+        let view = build(&c, 80, FontSize::new(10, 20), &mut images);
+        assert!(images.decoded.is_empty(), "measuring output height must not decode pixels");
+        let Block::Image { hash, data, .. } = &view.blocks[0] else { panic!("image") };
+        let decoded = images.decode(*hash, data).unwrap();
+        let weak = Arc::downgrade(&decoded);
+        drop(decoded);
+        images.retain(|_| false);
+        assert_eq!(images.bytes, 0);
+        assert!(weak.upgrade().is_none(), "a still-cached OutputView must not own decoded pixels");
+        assert_eq!(view.blocks.len(), 1);
+        assert_eq!(c.outputs()[0]["data"]["image/png"], b64, "canonical notebook image remains intact");
+    }
+
+    #[test]
+    fn raster_cache_plateaus_by_bytes_and_releases_oversized_images() {
+        let mut images = Images::default();
+        let budget = 2 * 32 * 32 * 4;
+        for id in 0..100 {
+            drop(images.decode_with_budget(id, &png_data(32, id as u8), budget).unwrap());
+            assert!(images.bytes <= budget);
+            assert!(images.decoded.len() <= 2);
+        }
+        assert!(images.decoded.contains_key(&99));
+        // Touch the oldest entry, then prove LRU rather than insertion-order eviction.
+        images.decode_with_budget(98, &[], budget).unwrap();
+        images.decode_with_budget(100, &png_data(32, 100), budget).unwrap();
+        assert!(images.decoded.contains_key(&98));
+        assert!(!images.decoded.contains_key(&99));
+        let oversized = images.decode_with_budget(101, &png_data(64, 101), budget).unwrap();
+        assert_eq!(oversized.width(), 64);
+        assert!(!images.decoded.contains_key(&101));
+        assert_eq!(images.bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "release performance scenario: cargo test -p nbv-tui --release plotting_cache_scenario -- --ignored --nocapture"]
+    fn plotting_cache_scenario() {
+        use std::time::Instant;
+        let data = png_data(800, 7);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let mut images = Images::default();
+        let start = Instant::now();
+        for _ in 0..200 {
+            std::hint::black_box(image::load_from_memory(&data).unwrap());
+        }
+        let full_decode = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..200 {
+            std::hint::black_box(images.measure(&b64).unwrap());
+        }
+        let header_measure = start.elapsed();
+        let start = Instant::now();
+        let mut peak = 0;
+        for id in 0..200 {
+            images.retain(|_| false);
+            drop(images.decode(id, &data).unwrap());
+            peak = peak.max(images.bytes);
+            assert!(images.bytes <= DECODED_BYTES);
+        }
+        eprintln!(
+            "200 800x800 plots: full raster decode={full_decode:?}, header-only layout={header_measure:?}; repeated visible plotting={:?}, retained raster peak={peak} bytes",
+            start.elapsed()
+        );
     }
 
     #[test]

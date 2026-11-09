@@ -15,6 +15,9 @@ before 1.0, a breaking change bumps the minor version.
 
 ### Fixed
 
+- Plot images decode only when visible. Decoded images and terminal image encodings now have
+  byte budgets and release obsolete plots when outputs are replaced, cleared, or scrolled away.
+
 - Large notebooks keep rendering work within the visible cells and rows, and sustained kernel
   or Neovim output yields between batches so input and drawing keep progressing.
 - Kernel transport and send failures now fail queued and running cells with a restart action.
