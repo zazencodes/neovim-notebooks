@@ -50,6 +50,13 @@ jobs:
         run: |
           uv venv .venv
           uv pip install --python .venv/bin/python ipykernel ruff
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Python language server
+        run: |
+          npm install --prefix .tools/pyright --no-audit --no-fund pyright@1.1.414
+          echo "NBV_LSP_SERVER=$PWD/.tools/pyright/node_modules/.bin/pyright-langserver" >> "$GITHUB_ENV"
       - run: cargo test --workspace
       - name: Property tests, extended
         run: PROPTEST_CASES=20000 cargo test --release -p nbv-core --test properties

@@ -162,15 +162,35 @@ falls back quietly: a notebook nbv cannot read correctly (an unknown cell type, 
 metadata) is refused at startup with the reason, and an image that cannot be decoded says so
 where it would be.
 
-**Language servers.** Each cell is its own buffer, so a language server sees each cell as a
-separate file. Names defined in one cell show as undefined in the next. This is a known gap.
-Cell buffers are named `<notebook>.ipynb.<cell>.py`, so a linter can skip these checks for
-them. For ruff, in its configuration:
+**Language servers.** Python notebooks can share one language-server document across code
+cells, while keeping separate editable cell buffers. Configure a server in your Neovim as
+usual, then opt in after its configuration is available:
 
-```toml
-[lint.per-file-ignores]
-"*.ipynb.*.py" = ["F401", "F821"]
+```lua
+vim.lsp.config('pyright', {
+  cmd = { 'pyright-langserver', '--stdio' },
+  filetypes = { 'python' },
+})
+vim.lsp.enable('pyright')
+if vim.g.nbv then
+  require('nbv.lsp').enable('pyright')
+end
 ```
+
+This uses your server command, settings, capabilities, project root and callbacks. The chosen
+server attaches once to the notebook; ordinary files retain their usual automatic attachment.
+Diagnostics, completion (including resolved auto-import edits into another cell), definitions,
+references and rename use all code cells in notebook order, including unsaved and offscreen
+cells. Your existing LSP mappings and completion plugins continue to use cell buffers.
+`:lsp restart` works from a cell.
+
+The integration currently supports **Python source**, with Pyright tested. Markdown and raw
+cells are excluded. IPython magics and shell escapes remain verbatim and may report Python
+syntax errors. Code follows textual notebook order, rather than kernel execution history.
+Formatting, semantic tokens and other features without supported coordinate mapping are
+unavailable on the notebook client. See [language-server support](docs/language-servers.md)
+for capability details and the transport design. Without opt-in, servers retain their usual
+per-cell view.
 
 **Troubleshooting.** `nvb --clean` starts Neovim without your configuration. If a problem goes
 away with `--clean`, its source is in your config or plugins. Kernel channel and send failures
@@ -233,7 +253,15 @@ cargo test --workspace
 The Neovim-driven tests use `$NBV_NVIM`, or `.tools/nvim-macos-arm64/bin/nvim` when present,
 and skip themselves without Neovim 0.12. The kernel and tmux tests use a `.venv` at the repository
 root with `ipykernel` and `ruff` (`uv venv .venv && uv pip install --python .venv/bin/python
-ipykernel ruff`). CI runs everything on Linux and macOS.
+ipykernel ruff`). The real language-server test requires Pyright 1.1.414:
+
+```sh
+npm install --prefix .tools/pyright --no-audit --no-fund pyright@1.1.414
+NBV_LSP_SERVER="$PWD/.tools/pyright/node_modules/.bin/pyright-langserver" cargo test -p nbv-nvim --test language_server
+```
+
+Without `NBV_LSP_SERVER`, that test reports a skip locally; CI requires it and provisions the
+server. CI runs everything on Linux and macOS.
 
 | Crate | Role |
 |---|---|

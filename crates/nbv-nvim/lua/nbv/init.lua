@@ -427,6 +427,13 @@ end
 function M.layout(seq, spec)
   local ok, err = pcall(function()
     setup_home_window(M.home_win)
+    require('nbv.lsp').sync(spec.notebook, function(c)
+      local buf = create_buffer(c.key, c)
+      api.nvim_buf_call(buf, function() vim.bo[buf].filetype = c.filetype end)
+      vim.b[buf].nbv_filetype_pending = c.filetype
+      notify('buffer', { key = c.key, buf = buf, kind = 'code' })
+      return buf
+    end)
     local bufs = {}
     for _, b in ipairs(api.nvim_list_bufs()) do
       local k = vim.b[b].nbv_key
@@ -456,6 +463,11 @@ function M.layout(seq, spec)
       if not buf and c.create then
         buf = create_buffer(c.key, c.create)
         created[#created + 1] = { key = c.key, buf = buf, filetype = c.create.filetype }
+      end
+      if buf and vim.b[buf].nbv_filetype_pending then
+        created[#created + 1] = { key = c.key, buf = buf,
+          filetype = vim.b[buf].nbv_filetype_pending, reported = true }
+        vim.b[buf].nbv_filetype_pending = nil
       end
       if buf then
         local active = c.key == spec.active
@@ -491,7 +503,7 @@ function M.layout(seq, spec)
       api.nvim_win_call(wins[n.key], function()
         vim.bo[n.buf].filetype = n.filetype
       end)
-      notify('buffer', { key = n.key, buf = n.buf })
+      if not n.reported then notify('buffer', { key = n.key, buf = n.buf }) end
     end
   end)
   vim.cmd.redraw()

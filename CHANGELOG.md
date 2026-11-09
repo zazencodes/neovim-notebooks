@@ -12,6 +12,10 @@ before 1.0, a breaking change bumps the minor version.
   and yank, including text tables and JSON. `za` collapses or expands inline output per cell.
 - `:NvbOpenOutput <output-number> <mime>` explicitly opens HTML, SVG, images or text artifacts
   externally; extracted files are private and removed when the session ends.
+- Opt-in cross-cell Python language-server context through `require('nbv.lsp').enable('pyright')`
+  in your Neovim config: diagnostics, completion and auto-imports, definitions, references and
+  rename see code cells together, including unsaved edits. Cell buffers keep their own text,
+  plugins and editing behavior; ordinary files keep their configured LSP attachment.
 
 ### Fixed
 

@@ -17,6 +17,7 @@ use crate::grid::Grid;
 
 /// The companion (R6), embedded in the binary and loaded pre-config.
 pub const COMPANION: &str = include_str!("../lua/nbv/init.lua");
+const LSP: &str = include_str!("../lua/nbv/lsp.lua");
 
 /// The home buffer's name: the notebook's path under the `nbv://` scheme (§9.1).
 pub fn home_name(notebook: &Path) -> String {
@@ -287,8 +288,11 @@ impl Editor {
             }
             cells.push(map(entries));
         }
-        let spec =
-            map(vec![("active", active.map_or(Value::Nil, |k| k.as_str().into())), ("cells", Value::Array(cells))]);
+        let spec = map(vec![
+            ("active", active.map_or(Value::Nil, |k| k.as_str().into())),
+            ("cells", Value::Array(cells)),
+            ("notebook", self.lsp_document(nb)),
+        ]);
         self.calls.lua("require('nbv').layout(...)", vec![seq.into(), spec]);
     }
 
@@ -315,6 +319,39 @@ impl Editor {
         }
         self.wipe(wipe);
         self.creating.retain(|k, _| nb.is_live(k));
+        self.calls.lua("require('nbv.lsp').sync(...)", vec![self.lsp_document(nb)]);
+    }
+
+    /// Ordered canonical sources for the language-server transport. Live buffers overlay these
+    /// sources in Lua, so requests include typing that Rust has not received yet.
+    fn lsp_document(&self, nb: &Notebook) -> Value {
+        let cells = nb
+            .order()
+            .iter()
+            .filter_map(|key| {
+                let cell = nb.cell(key)?;
+                if cell.kind() != CellKind::Code {
+                    return None;
+                }
+                Some(map(vec![
+                    ("key", key.as_str().into()),
+                    (
+                        "name",
+                        cell_buffer_name(nb, key, cell.kind(), self.language.as_deref())
+                            .to_string_lossy()
+                            .into_owned()
+                            .into(),
+                    ),
+                    ("filetype", filetype(cell.kind(), self.language.as_deref()).into()),
+                    ("lines", Value::Array(source_lines(&cell.source()).into_iter().map(Value::from).collect())),
+                ]))
+            })
+            .collect();
+        map(vec![
+            ("name", format!("{}.nvb.py", nb.path().display()).into()),
+            ("language", self.language.clone().map_or(Value::Nil, Value::from)),
+            ("cells", Value::Array(cells)),
+        ])
     }
 
     /// Wipes every cell buffer, e.g. after a change of language or name.
@@ -429,7 +466,9 @@ impl Editor {
                 let key = field(&payload, "key").and_then(Value::as_str).map(CellKey::new);
                 let buf = field(&payload, "buf").and_then(Value::as_i64);
                 let (Some(key), Some(buf)) = (key, buf) else { return vec![] };
-                let requested = self.creating.remove(&key);
+                let requested = self.creating.remove(&key).or_else(|| {
+                    (field(&payload, "kind").and_then(Value::as_str) == Some("code")).then_some(CellKind::Code)
+                });
                 match (requested, nb.cell(&key).filter(|_| nb.is_live(&key))) {
                     (Some(kind), Some(cell)) if cell.kind() == kind => {
                         self.buffers.insert(buf, CellBuffer { key: key.clone(), kind, lines: vec![] });
@@ -546,7 +585,8 @@ pub async fn handshake<C: NvimClient>(
     let chan = info.as_array().and_then(|a| a.first()).and_then(Value::as_i64).unwrap_or(1);
     client
         .exec_lua(
-            "local src, chan, home, sp = ...\n\
+            "local src, chan, home, sp, lsp = ...\n\
+             package.preload['nbv.lsp'] = assert(loadstring(lsp, '@nbv/lsp.lua'))\n\
              local M = assert(loadstring(src, '@nbv/init.lua'))()\n\
              M.pre(chan, home, sp)",
             vec![
@@ -554,6 +594,7 @@ pub async fn handshake<C: NvimClient>(
                 chan.into(),
                 home_name(notebook).into(),
                 (crate::grid::TRANSPARENT_SP as u64).into(),
+                LSP.into(),
             ],
         )
         .await?;
