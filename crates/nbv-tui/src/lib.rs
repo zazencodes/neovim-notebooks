@@ -11,6 +11,7 @@ pub mod layout;
 pub mod nav;
 pub mod outputs;
 pub mod query;
+mod recovery;
 pub mod terminal;
 
 pub use app::{Options, run};

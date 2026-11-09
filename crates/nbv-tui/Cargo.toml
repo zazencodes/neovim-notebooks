@@ -26,3 +26,4 @@ unicode-width = "0.2"
 
 [dev-dependencies]
 nbv-nvim = { workspace = true, features = ["harness"] }
+tempfile = "3"

@@ -150,6 +150,27 @@ because `BufWritePre` and `BufWritePost` fire around the commit on every changed
 not files. Opening and saving without edits loses nothing, and older (4.0–4.4)
 notebooks gain cell ids only once you change something.
 
+**Crash recovery.** Independently of autosave, nbv snapshots unsaved notebook sources,
+cell structure and outputs about once a second, including while you stay in Insert mode.
+Snapshots do not run format-on-save hooks. Encoding and durable writes run in the background;
+unchanged outputs, including images, are reused between snapshots. A crash can lose edits
+since the last completed snapshot, normally about a second. Slow disk writes can extend that
+interval; edits coalesce while a write is in progress.
+
+Recovery lives under `$XDG_STATE_HOME/nbv/recovery/` (by default
+`~/.local/state/nbv/recovery/`), associated with the notebook's canonical absolute path.
+File and directory symlink aliases share recovery and the session lock. After a crash,
+opening that path offers **Recover unsaved snapshot** or **Discard snapshot and open disk
+file**, showing the full file name. Cancelling leaves the snapshot available for next time.
+Recovering retains the saved baseline: an externally changed or deleted notebook cannot be
+overwritten by an ordinary save; use `:e!` to load the disk version or explicitly `:w!` to
+keep the recovered version. A damaged or unreadable snapshot is reported with both paths.
+
+Recovery follows a rename; renaming an opened file symlink moves that link in its directory
+and keeps its real target in place. A successful save, an accepted external reload, or a clean quit
+(including `:q!`, which explicitly discards changes) removes it. The same notebook path can
+be open in only one nbv process at a time, to protect its recovery data.
+
 **Changes on disk.** When another program changes the `.ipynb`, nbv reloads it, as Neovim's
 `'autoread'` does, keeping the cell you are editing open. If you also have unsaved changes,
 nbv asks whether to load the file (discarding them) or keep yours (overwriting it). Either
@@ -270,6 +291,9 @@ server. CI runs everything on Linux and macOS.
 | `nbv-tui` | Event loop, notebook layout, navigation mode, compositor, output layer, image backend, terminal and tmux detection. |
 | `nvb` (`crates/nbv-cli`) | The `nvb` binary, and the tmux end-to-end harness. |
 | `crates/nbv-nvim/lua/nbv` | The Lua companion loaded into the embedded Neovim. It holds no notebook state. |
+
+[Recovery performance](docs/recovery-performance.md) includes a repeatable release-mode
+component profile and the remaining synchronous save costs.
 
 `tests/corpus/` holds deliberately ugly notebooks. Every one must survive open → save without
 losing information.

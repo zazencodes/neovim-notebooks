@@ -8,6 +8,7 @@ pub mod kernel;
 pub mod key;
 pub mod memory;
 pub mod notebook;
+pub mod recovery;
 
 pub use document::{Cell, CellKind, ExecState, Runtime};
 pub use key::CellKey;

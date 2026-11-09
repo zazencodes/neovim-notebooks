@@ -37,6 +37,14 @@ impl Session {
 
     /// As `start`, under a tmux configured with `conf`.
     fn start_with(cells: &[&str], conf: &str) -> Option<Session> {
+        Self::start_setup(cells, conf, false)
+    }
+
+    fn start_file_link(cells: &[&str]) -> Option<Session> {
+        Self::start_setup(cells, "", true)
+    }
+
+    fn start_setup(cells: &[&str], conf: &str, file_link: bool) -> Option<Session> {
         let nvim = nvim()?;
         let venv = root().join(".venv");
         if !venv.join("bin/python").exists() || Command::new("tmux").arg("-V").output().is_err() {
@@ -54,10 +62,15 @@ impl Session {
         let nb = serde_json::json!({"cells": cells, "metadata": {"kernelspec": {"name": "python3", "display_name": "Python 3"}},
             "nbformat": 4, "nbformat_minor": 5});
         std::fs::write(dir.path().join("t.ipynb"), serde_json::to_vec_pretty(&nb).unwrap()).unwrap();
+        if file_link {
+            std::fs::create_dir(dir.path().join("data")).unwrap();
+            std::fs::rename(dir.path().join("t.ipynb"), dir.path().join("data/real.ipynb")).unwrap();
+            std::os::unix::fs::symlink("data/real.ipynb", dir.path().join("t.ipynb")).unwrap();
+        }
         // The temporary directory's name is unique, so parallel tests get their own servers.
         let socket = format!("nbv-test-{}", dir.path().file_name().unwrap().to_string_lossy());
         let cmd = format!(
-            "cd {0} && XDG_STATE_HOME={0}/state VIRTUAL_ENV={1} NBV_NVIM={2} {3} --clean t.ipynb; echo NVB-EXITED-$?; sleep 30",
+            "cd {0} && XDG_CONFIG_HOME={0}/config XDG_DATA_HOME={0}/data XDG_CACHE_HOME={0}/cache XDG_STATE_HOME={0}/state VIRTUAL_ENV={1} NBV_NVIM={2} {3} --clean t.ipynb; echo NVB-EXITED-$?; sleep 30",
             dir.path().display(),
             venv.display(),
             nvim.display(),
@@ -70,6 +83,42 @@ impl Session {
         s.tmux(&["-f", &conf_path.to_string_lossy(), "new-session", "-d", "-s", "t", "-x", "200", "-y", "30", &cmd]);
         s.wait_for(" NAV");
         Some(s)
+    }
+
+    /// Abruptly replace the foreground application, then reopen the same path and state.
+    /// This kills the process rather than sending Neovim a clean quit command.
+    fn reopen_after_crash(&self) {
+        self.reopen_with_init(None);
+    }
+
+    fn reopen_with_init(&self, init: Option<&str>) {
+        self.reopen_named("t.ipynb", init);
+    }
+
+    fn reopen_named(&self, name: &str, init: Option<&str>) {
+        let clean = if let Some(init) = init {
+            let config = self.dir.path().join("config/nvim");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(config.join("init.lua"), init).unwrap();
+            ""
+        } else {
+            "--clean"
+        };
+        let cmd = format!(
+            "cd {0} && XDG_CONFIG_HOME={0}/config XDG_DATA_HOME={0}/data XDG_CACHE_HOME={0}/cache XDG_STATE_HOME={0}/state VIRTUAL_ENV={1} NBV_NVIM={2} {3} {clean} {name}; echo NVB-EXITED-$?; sleep 30",
+            self.dir.path().display(),
+            root().join(".venv").display(),
+            nvim().unwrap().display(),
+            env!("CARGO_BIN_EXE_nvb"),
+        );
+        self.tmux(&["respawn-pane", "-k", "-t", "t", &cmd]);
+    }
+
+    fn recovery_manifest(&self) -> Option<serde_json::Value> {
+        std::fs::read_dir(self.dir.path().join("state/nbv/recovery")).ok()?.filter_map(Result::ok).find_map(|e| {
+            let bytes = std::fs::read(e.path().join("snapshot.json")).ok()?;
+            serde_json::from_slice(&bytes).ok()
+        })
     }
 
     fn screen(&self) -> String {
@@ -489,4 +538,266 @@ fn terminal_input_and_drawing_progress_during_a_kernel_flood() {
         assert!(Instant::now() < deadline, "save RPC starved during kernel flood\n{}", s.screen());
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn crash_during_insert_offers_explicit_recovery_on_reopen() {
+    let Some(s) = Session::start(&["value = 1"]) else { return };
+    s.wait_for("│value = 1");
+    s.keys(&["Enter", "A", " # unsaved insert"]);
+    s.wait_until("Insert-mode recovery persisted", |_| {
+        s.recovery_manifest().is_some_and(|m| m["cells"][0]["raw"]["source"] == "value = 1 # unsaved insert")
+    });
+    assert_eq!(s.saved()["cells"][0]["source"], "value = 1");
+    s.reopen_after_crash();
+    s.wait_until("file-associated recovery choice", |screen| {
+        screen.contains("Recovery for") && screen.contains("t.ipynb") && screen.contains("Recover unsaved snapshot")
+    });
+    assert_eq!(s.saved()["cells"][0]["source"], "value = 1", "the prompt must not save anything");
+    s.keys(&["1", "Enter"]);
+    s.wait_for("│value = 1 # unsaved insert");
+    s.wait_saved("recovered document saved", |nb| nb["cells"][0]["source"] == "value = 1 # unsaved insert");
+    s.wait_until("successful save removed recovery", |_| s.recovery_manifest().is_none());
+    s.keys(&[":q", "Enter"]);
+    s.wait_for("NVB-EXITED-0");
+    assert!(s.recovery_manifest().is_none());
+}
+
+#[test]
+fn reopening_can_discard_recovery_and_cancel_keeps_it_available() {
+    let Some(s) = Session::start(&["value = 1"]) else { return };
+    s.wait_for("│value = 1");
+    s.keys(&["Enter", "A", " # discard me"]);
+    s.wait_until("recovery persisted", |_| {
+        s.recovery_manifest().is_some_and(|m| m["cells"][0]["raw"]["source"] == "value = 1 # discard me")
+    });
+    s.reopen_after_crash();
+    s.wait_for("Recover unsaved snapshot");
+    s.keys(&["Escape"]);
+    s.wait_for("NVB-EXITED-0");
+    assert!(s.recovery_manifest().is_some(), "cancelling must preserve recovery");
+    s.reopen_after_crash();
+    s.wait_for("Recover unsaved snapshot");
+    s.keys(&["2", "Enter"]);
+    s.wait_for("│value = 1");
+    s.wait_until("discard removed recovery", |_| s.recovery_manifest().is_none());
+    assert_eq!(s.saved()["cells"][0]["source"], "value = 1");
+    s.keys(&[":q!", "Enter"]);
+    s.wait_for("NVB-EXITED-0");
+}
+
+#[test]
+fn clean_forced_quit_discards_insert_mode_recovery() {
+    let Some(s) = Session::start(&["value = 1"]) else { return };
+    s.wait_for("│value = 1");
+    s.keys(&["Enter", "A", " # intentionally discarded"]);
+    s.wait_until("recovery persisted", |_| s.recovery_manifest().is_some());
+    // Insert-mode Ctrl-o runs one command without becoming idle in Normal mode, so an
+    // autosave tick cannot save the deliberately discarded text before :qa! is entered.
+    // :qa! quits the home window as well as the cell's floating window.
+    s.keys(&["C-o", ":qa!", "Enter"]);
+    s.wait_for("NVB-EXITED-0");
+    assert!(s.recovery_manifest().is_none());
+    assert_eq!(s.saved()["cells"][0]["source"], "value = 1");
+}
+
+#[test]
+fn recovered_edits_keep_external_change_protection_and_reload_cleanup() {
+    let Some(s) = Session::start(&["value = 1"]) else { return };
+    s.wait_for("│value = 1");
+    s.keys(&["Enter", "A", " # recovered"]);
+    s.wait_until("recovery persisted", |_| {
+        s.recovery_manifest().is_some_and(|m| m["cells"][0]["raw"]["source"] == "value = 1 # recovered")
+    });
+    s.write_outside(0, "external = 2");
+    s.reopen_after_crash();
+    s.wait_for("Recover unsaved snapshot");
+    s.keys(&["1", "Enter"]);
+    s.wait_for("changed on disk, and you have unsaved changes");
+    assert_eq!(s.saved()["cells"][0]["source"], "external = 2");
+    s.keys(&["Escape"]);
+    s.wait_for(":w! keeps yours");
+    s.keys(&[":e!", "Enter"]);
+    s.wait_for("│external = 2");
+    s.wait_until("external reload removed recovery", |_| s.recovery_manifest().is_none());
+    assert_eq!(s.saved()["cells"][0]["source"], "external = 2");
+}
+
+#[test]
+fn recovery_remains_available_when_the_disk_file_was_deleted() {
+    let Some(s) = Session::start(&["value = 1"]) else { return };
+    s.wait_for("│value = 1");
+    s.keys(&["Enter", "A", " # recovered"]);
+    s.wait_until("recovery persisted", |_| {
+        s.recovery_manifest().is_some_and(|m| m["cells"][0]["raw"]["source"] == "value = 1 # recovered")
+    });
+    std::fs::remove_file(s.dir.path().join("t.ipynb")).unwrap();
+    s.reopen_after_crash();
+    s.wait_for("Recover unsaved snapshot");
+    assert!(!s.dir.path().join("t.ipynb").exists());
+    s.keys(&["1", "Enter"]);
+    s.wait_for("│value = 1 # recovered");
+    assert!(!s.dir.path().join("t.ipynb").exists(), "ordinary autosave must not recreate a deleted file");
+    s.keys(&[":w!", "Enter"]);
+    s.wait_until("explicit force recreated the notebook", |_| s.dir.path().join("t.ipynb").exists());
+    s.wait_saved("forced recovered save", |nb| nb["cells"][0]["source"] == "value = 1 # recovered");
+    s.wait_until("forced save removed recovery", |_| s.recovery_manifest().is_none());
+}
+
+#[test]
+fn corrupt_recovery_is_reported_with_both_file_paths() {
+    let Some(s) = Session::start(&["value = 1"]) else { return };
+    s.wait_for("│value = 1");
+    s.keys(&["Enter", "A", " # recovered"]);
+    s.wait_until("recovery persisted", |_| s.recovery_manifest().is_some());
+    let manifest = std::fs::read_dir(s.dir.path().join("state/nbv/recovery"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path().join("snapshot.json"))
+        .find(|p| p.exists())
+        .unwrap();
+    std::fs::write(&manifest, "broken").unwrap();
+    s.reopen_after_crash();
+    s.wait_until("explicit recovery corruption error", |screen| {
+        screen.contains("recovery for")
+            && screen.contains("t.ipynb")
+            && screen.contains("snapshot.json")
+            && screen.contains("NVB-EXITED-1")
+    });
+    assert_eq!(s.saved()["cells"][0]["source"], "value = 1");
+}
+
+#[test]
+fn timer_writes_and_reloads_cannot_discard_an_unresolved_recovery_choice() {
+    let Some(s) = Session::start(&["value = 1"]) else { return };
+    s.wait_for("│value = 1");
+    s.keys(&["Enter", "A", " # pending"]);
+    s.wait_until("recovery persisted", |_| {
+        s.recovery_manifest().is_some_and(|m| m["cells"][0]["raw"]["source"] == "value = 1 # pending")
+    });
+    let before = s.recovery_manifest().unwrap();
+    s.reopen_with_init(Some(r#"
+        vim.ui.select = function(_, _, callback)
+          _G.recovery_choice = callback
+          vim.defer_fn(function()
+            local write_ok, write_error = pcall(vim.cmd, 'write')
+            local reload_ok, reload_error = pcall(vim.cmd, 'edit!')
+            vim.fn.writefile({vim.json.encode({write_ok, tostring(write_error), reload_ok, tostring(reload_error)})}, 'guard-results.json')
+          end, 50)
+        end
+    "#));
+    let results = s.dir.path().join("guard-results.json");
+    s.wait_until("timer write/reload rejected", |_| results.exists());
+    let results: serde_json::Value = serde_json::from_slice(&std::fs::read(results).unwrap()).unwrap();
+    assert_eq!(results[0], false);
+    assert_eq!(results[2], false);
+    assert!(results[1].as_str().unwrap().contains("recover or discard"), "{results}");
+    assert!(results[3].as_str().unwrap().contains("recover or discard"), "{results}");
+    assert_eq!(s.recovery_manifest().unwrap(), before);
+    assert_eq!(s.saved()["cells"][0]["source"], "value = 1");
+    s.reopen_after_crash();
+    s.wait_for("Recover unsaved snapshot");
+}
+
+#[test]
+fn deadly_editor_signals_keep_recovery_available() {
+    for signal in ["-TERM", "-HUP"] {
+        let Some(s) = Session::start(&["value = 1"]) else { return };
+        s.wait_for("│value = 1");
+        s.keys(&["Enter", "A", " # signal recovery"]);
+        s.wait_until("recovery persisted", |_| {
+            s.recovery_manifest().is_some_and(|m| m["cells"][0]["raw"]["source"] == "value = 1 # signal recovery")
+        });
+        // Obtain the actual embedded Neovim pid while staying out of idle Normal mode.
+        s.keys(&["C-o", ":call writefile([string(getpid())], 'nvim.pid')", "Enter"]);
+        let pid_file = s.dir.path().join("nvim.pid");
+        s.wait_until("editor pid written", |_| pid_file.exists());
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        assert!(Command::new("kill").args([signal, pid.trim()]).status().unwrap().success());
+        s.wait_for("NVB-EXITED-");
+        assert!(s.recovery_manifest().is_some(), "{signal} must preserve the durable snapshot");
+        assert_eq!(s.saved()["cells"][0]["source"], "value = 1");
+        s.reopen_after_crash();
+        s.wait_for("Recover unsaved snapshot");
+        s.keys(&["1", "Enter"]);
+        s.wait_for("│value = 1 # signal recovery");
+    }
+}
+
+#[test]
+fn corrupt_disk_file_does_not_hide_valid_recovery_or_allow_discard_on_failed_reload() {
+    let Some(s) = Session::start(&["value = 1"]) else { return };
+    s.wait_for("│value = 1");
+    s.keys(&["Enter", "A", " # valid snapshot"]);
+    s.wait_until("recovery persisted", |_| {
+        s.recovery_manifest().is_some_and(|m| m["cells"][0]["raw"]["source"] == "value = 1 # valid snapshot")
+    });
+    std::fs::write(s.dir.path().join("t.ipynb"), "broken notebook JSON").unwrap();
+    s.reopen_after_crash();
+    s.wait_for("Recover unsaved snapshot");
+    s.keys(&["2", "Enter"]);
+    s.wait_for("Recover unsaved snapshot");
+    assert!(s.recovery_manifest().is_some(), "failed reload must keep recovery available");
+    assert_eq!(std::fs::read_to_string(s.dir.path().join("t.ipynb")).unwrap(), "broken notebook JSON");
+    s.keys(&["1", "Enter"]);
+    s.wait_for("│value = 1 # valid snapshot");
+}
+
+#[test]
+fn cross_directory_file_link_rename_preserves_target_and_recovers_through_the_new_alias() {
+    let Some(s) = Session::start_file_link(&["value = 1"]) else { return };
+    s.wait_for(" t.ipynb ");
+    s.wait_for("│value = 1");
+    let target = s.dir.path().join("data/real.ipynb");
+    let original = std::fs::read(&target).unwrap();
+    s.keys(&["Enter", "A", " # alias recovery"]);
+    s.wait_until("alias recovery persisted", |_| {
+        s.recovery_manifest().is_some_and(|m| m["cells"][0]["raw"]["source"] == "value = 1 # alias recovery")
+    });
+    // Keep the unsaved state while exercising the actual header rename picker. Recovery's
+    // own timer remains active and independent of this test's disabled normal autosave.
+    s.keys(&["C-o", ":lua require('nbv').autosave = function() end", "Enter"]);
+    s.keys(&["Escape"]);
+    s.keys(&["Escape"]);
+    s.wait_for(" NAV");
+    s.keys(&["k"]);
+    s.wait_for("h l select");
+    s.keys(&["Enter"]);
+    s.wait_for("Rename: t.ipynb");
+    s.keys(&["C-u", "renamed.ipynb", "Enter"]);
+    s.wait_for(" renamed.ipynb ");
+    let alias = s.dir.path().join("renamed.ipynb");
+    assert!(!s.dir.path().join("t.ipynb").exists());
+    assert!(std::fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        original,
+        "renaming the link must leave its target in place and unsaved"
+    );
+    let manifest = s.recovery_manifest().unwrap();
+    assert_eq!(manifest["notebook"], target.canonicalize().unwrap().to_string_lossy().as_ref());
+    let second = Command::new(env!("CARGO_BIN_EXE_nvb"))
+        .args(["--clean", "data/real.ipynb"])
+        .current_dir(s.dir.path())
+        .env("XDG_STATE_HOME", s.dir.path().join("state"))
+        .env("NBV_NVIM", nvim().unwrap())
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("cannot acquire recovery lock"));
+    s.reopen_named("renamed.ipynb", None);
+    s.wait_until("renamed alias recovery choice", |screen| {
+        screen.contains("Recovery for") && screen.contains("renamed.ipynb")
+    });
+    s.keys(&["1", "Enter"]);
+    s.wait_for(" renamed.ipynb ");
+    s.wait_for("│value = 1 # alias recovery");
+    s.wait_until("recovered source saved through alias", |_| {
+        std::fs::read(&target)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|nb| nb["cells"][0]["source"] == "value = 1 # alias recovery")
+    });
+    assert!(std::fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+    s.wait_until("alias recovery cleaned after save", |_| s.recovery_manifest().is_none());
 }

@@ -18,6 +18,7 @@ use jupyter_protocol::JupyterMessage;
 use nbv_core::exec::{ExecEvent, Executor, KernelStatus};
 use nbv_core::kernel::{self, Kernel, KernelCommand, KernelError, KernelMessage};
 use nbv_core::memory::KernelMemory;
+use nbv_core::recovery::RecoveryStore;
 use nbv_core::{CellKey, CellKind, Change, ExecState, Notebook};
 use nbv_nvim::editor::{self, Editor, EditorEvent, EditorRect, Focus, Theme, field};
 use nbv_nvim::redraw::CursorShape;
@@ -38,6 +39,7 @@ use crate::image_cache::{PROTOCOL_BYTES, Protocols};
 use crate::layout::{Block, Geometry, Layout};
 use crate::nav::{self, Action, Nav};
 use crate::outputs::{self, Images, OutputView};
+use crate::recovery::{Recovery, gate_pending_request};
 use crate::terminal::{self as term, Tmux};
 
 pub struct Options {
@@ -162,6 +164,9 @@ struct App {
     draw: bool,
     /// Whether the home buffer has been marked modified since the last write.
     dirty: bool,
+    recovery: Recovery,
+    pending_recovery: Option<Notebook>,
+    clean_exit: bool,
     /// The content on disk Neovim was last told about, while the notebook differs from it
     /// (§9.6), so the user is asked once about each change.
     disk_notified: Option<[u8; 32]>,
@@ -191,7 +196,18 @@ impl Drop for TerminalGuard {
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
     let notebook = std::path::absolute(&opts.notebook)?;
-    let nb = Notebook::open(&notebook)?;
+    let recovery_store = RecoveryStore::open(&notebook)?;
+    let pending_recovery = recovery_store.load()?;
+    let (nb, open_error) = match Notebook::open(&notebook) {
+        Ok(nb) => (nb, None),
+        Err(e) => {
+            let Some(recovery) = &pending_recovery else { return Err(e.into()) };
+            // The recovery choice must remain accessible when another program deleted or
+            // damaged the disk file. This display copy is never saved before that choice.
+            let display = Notebook::from_bytes(&notebook, &recovery.to_bytes(), Default::default())?;
+            (display, Some(e.to_string()))
+        }
+    };
     let tmux = term::in_tmux().then(term::probe_tmux);
 
     terminal::enable_raw_mode()?;
@@ -254,7 +270,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         start_tx,
         pending: vec![],
         input_request: None,
-        message: None,
+        message: open_error,
         // Short enough not to wrap into a hit-enter prompt; the README has the lines to add.
         tmux_keys_missing: tmux.as_ref().is_some_and(|t| !t.extended_keys),
         memory,
@@ -293,17 +309,23 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         relayout: false,
         draw: true,
         dirty: false,
+        recovery: Recovery::new(recovery_store),
+        pending_recovery,
+        clean_exit: false,
         disk_notified: None,
     };
-    app.start_kernel();
+    if app.pending_recovery.is_none() {
+        app.start_kernel();
+    }
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut result = Ok(());
     while !app.quit {
         tokio::select! {
             biased;
-            _ = tick.tick() => app.tick(),
+            _ = tick.tick() => app.tick().await,
             ev = events.next() => match ev {
                 Some(Ok(ev)) => app.on_terminal(ev).await,
                 _ => app.quit = true,
@@ -320,24 +342,37 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             }
         }
         app.service_ready(&mut nvim_rx, &mut kernel_rx, &mut start_rx, &mut err_rx).await;
-        if app.relayout {
+        if app.relayout && app.pending_recovery.is_none() {
             app.relayout();
         }
-        if app.draw {
-            app.draw()?;
+        if app.draw
+            && let Err(e) = app.draw()
+        {
+            result = Err(e);
+            break;
         }
     }
 
+    let discard_recovery = app.clean_exit && app.exit_error.is_none();
+    if let Some(error) = app.exit_error.take()
+        && result.is_ok()
+    {
+        result = Err(NvimError::Rpc(error).into());
+    }
+    if app.pending_recovery.is_none() {
+        result = app.recovery.finish_session(&app.nb, discard_recovery, result).await;
+    }
     app.protocols.clear();
-    app.protocols.flush_deletions(&mut std::io::stdout(), app.picker.tmux_detected())?;
+    if let Err(error) = app.protocols.flush_deletions(&mut std::io::stdout(), app.picker.tmux_detected())
+        && result.is_ok()
+    {
+        result = Err(error.into());
+    }
     if let Some(k) = app.kernel.take() {
         let _ = tokio::time::timeout(Duration::from_secs(3), k.shutdown()).await;
     }
     let _ = tokio::time::timeout(Duration::from_millis(500), app.client.quit()).await;
-    if let Some(error) = app.exit_error {
-        return Err(NvimError::Rpc(error).into());
-    }
-    Ok(())
+    result
 }
 
 const EVENT_BATCH: usize = 64;
@@ -351,6 +386,17 @@ fn rgb(c: Option<u32>) -> Option<Color> {
 }
 
 impl App {
+    fn offer_recovery(&self) {
+        // Return the RPC before opening a blocking default picker, so the serialized Calls
+        // queue can still deliver the user's input.
+        self.editor.calls.lua(
+            "local prompt = ...; vim.schedule(function() \
+             vim.ui.select({'Recover unsaved snapshot', 'Discard snapshot and open disk file'}, \
+             {prompt = prompt}, function(choice) require('nbv').act('recovery_choice', {choice = choice}) end) end)",
+            vec![format!("Recovery for {}", self.nb.path().display()).into()],
+        );
+    }
+
     /// Starts the chosen kernel. Without one, `kernel_error` already says why.
     /// Every background channel gets a bounded service slot per turn, even when the
     /// input/tick-prioritized select repeatedly chooses a ready Neovim stream.
@@ -496,6 +542,12 @@ impl App {
     }
 
     async fn on_nvim(&mut self, ev: NvimEvent) {
+        let ev = if self.pending_recovery.is_some() {
+            let Some(ev) = gate_pending_request(ev) else { return };
+            ev
+        } else {
+            ev
+        };
         for e in self.editor.handle(&mut self.nb, ev) {
             match e {
                 EditorEvent::Flush => {
@@ -506,8 +558,13 @@ impl App {
                 }
                 EditorEvent::Ready => {
                     self.nvim_ready = true;
-                    self.offer_install();
-                    self.relayout = true;
+                    if self.pending_recovery.is_some() {
+                        self.mode = Mode::Other;
+                        self.offer_recovery();
+                    } else {
+                        self.offer_install();
+                        self.relayout = true;
+                    }
                 }
                 EditorEvent::SourceChanged(key) => {
                     self.source_rows.remove(&key);
@@ -525,11 +582,18 @@ impl App {
                     self.invalidate_layout();
                     self.text_tails.clear();
                     self.dirty = false;
+                    if let Err(e) = self.recovery.clear().await {
+                        self.message = Some(e.to_string());
+                        self.draw = true;
+                    }
                     self.last_sent = None;
                     self.relayout = true;
                 }
                 EditorEvent::Written => {
                     self.dirty = false;
+                    if let Err(e) = self.recovery.clear().await {
+                        self.message = Some(e.to_string());
+                    }
                     self.draw = true;
                 }
                 EditorEvent::Focus { seq, focus } => {
@@ -635,6 +699,10 @@ impl App {
     async fn on_key(&mut self, k: KeyEvent) {
         let Some(keys) = crate::keys::encode(k) else { return };
         let calls = self.editor.calls.clone();
+        if self.pending_recovery.is_some() {
+            calls.input(&keys);
+            return;
+        }
         match self.mode.clone() {
             // A cell's own <Esc> mapping leaves it (§10.2); everything else is Neovim's.
             Mode::Edit(_) | Mode::Other => calls.input(&keys),
@@ -708,9 +776,13 @@ impl App {
 
     /// Once a second (§9.6): a notebook changed on disk is reloaded, or the user is asked about
     /// it; otherwise unsaved changes are written. Neovim does either only while the user is idle.
-    fn tick(&mut self) {
-        if !self.nvim_ready {
+    async fn tick(&mut self) {
+        if !self.nvim_ready || self.pending_recovery.is_some() {
             return;
+        }
+        if let Err(e) = self.recovery.tick(&self.nb).await {
+            self.message = Some(e.to_string());
+            self.draw = true;
         }
         match self.nb.disk_change() {
             Err(e) => {
@@ -735,6 +807,7 @@ impl App {
     /// The document changed: mark the home buffer modified, so quitting without saving is
     /// refused, and `:x` writes, as for any buffer.
     fn mark_dirty(&mut self) {
+        self.recovery.changed();
         if !self.dirty {
             self.dirty = true;
             self.editor.set_modified();
@@ -1109,6 +1182,9 @@ impl App {
     }
 
     async fn on_command(&mut self, action: &str, args: &Value) {
+        if self.pending_recovery.is_some() && !matches!(action, "recovery_choice" | "clean_exit") {
+            return;
+        }
         let key = self.command_key(args);
         match action {
             // <S-CR> and <C-CR> in the cell being edited.
@@ -1185,15 +1261,97 @@ impl App {
                 self.mark_dirty();
                 self.invalidate_layout();
             }
+            "clean_exit" => self.clean_exit = true,
+            "recovery_choice" => {
+                match field(args, "choice").and_then(Value::as_str) {
+                    Some("Recover unsaved snapshot") => {
+                        if let Some(nb) = self.pending_recovery.take() {
+                            self.nb = nb;
+                            self.clear_views();
+                            self.source_rows.clear();
+                            self.last_sent = None;
+                            self.invalidate_layout();
+                            self.editor.sync(&self.nb);
+                            self.mark_dirty();
+                        }
+                    }
+                    Some("Discard snapshot and open disk file") => {
+                        if let Err(e) = self.nb.reload() {
+                            self.message = Some(e.to_string());
+                            self.draw = true;
+                            self.offer_recovery();
+                            return;
+                        }
+                        if let Err(e) = self.recovery.clear().await {
+                            self.message = Some(e.to_string());
+                            self.quit = true;
+                            return;
+                        }
+                        self.pending_recovery = None;
+                    }
+                    _ => {
+                        // Cancelling leaves the snapshot untouched for another session.
+                        self.quit = true;
+                        return;
+                    }
+                }
+                self.mode = Mode::Nav;
+                self.relayout = true;
+                self.draw = true;
+                self.start_kernel();
+                self.offer_install();
+            }
             "rename" => {
                 let name = field(args, "name").and_then(Value::as_str).expect("the prompt sends a name");
                 let from = self.nb.path().to_path_buf();
+                let file_link = match std::fs::symlink_metadata(self.nb.path()) {
+                    Ok(metadata) => metadata.file_type().is_symlink(),
+                    Err(e) => {
+                        self.message = Some(format!("cannot inspect {} before rename: {e}", self.nb.path().display()));
+                        self.draw = true;
+                        return;
+                    }
+                };
+                let store = if file_link {
+                    // Moving a file link preserves the same target association and lock.
+                    None
+                } else {
+                    let destination = self.nb.path().with_file_name(name);
+                    match RecoveryStore::open(&destination).and_then(|store| {
+                        if store.load()?.is_some() {
+                            return Err(store.conflict_error());
+                        }
+                        Ok(store)
+                    }) {
+                        Ok(store) => Some(store),
+                        Err(e) => {
+                            self.message = Some(e.to_string());
+                            self.draw = true;
+                            return;
+                        }
+                    }
+                };
+                // Preserve the latest work at the old association before moving the file.
+                // A failed background write must leave both names and associations intact.
+                if let Err(e) = self.recovery.flush(&self.nb).await {
+                    self.message = Some(e.to_string());
+                    self.draw = true;
+                    return;
+                }
                 match self.nb.rename(name) {
                     Ok(()) => {
                         self.message = Some(match self.memory.renamed(&from, self.nb.path()) {
                             Ok(()) => format!("renamed to {name}"),
                             Err(e) => e.to_string(),
                         });
+                        let recovery_result = if let Some(store) = store {
+                            self.recovery.renamed(store, &self.nb, self.dirty).await
+                        } else {
+                            self.recovery.store.follow_file_link_rename(self.nb.path()).map_err(anyhow::Error::from)
+                        };
+                        if let Err(e) = recovery_result {
+                            self.message = Some(e.to_string());
+                        }
                         self.editor.renamed(&self.nb);
                         self.last_sent = None;
                         self.invalidate_layout();
@@ -1827,6 +1985,9 @@ mod tests {
             relayout: true,
             draw: false,
             dirty: false,
+            recovery: Recovery::new(RecoveryStore::at(&h.notebook.with_extension("recovery"), &h.notebook).unwrap()),
+            pending_recovery: None,
+            clean_exit: false,
             disk_notified: None,
         };
         (h, app)

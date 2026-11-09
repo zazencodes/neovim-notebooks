@@ -74,8 +74,8 @@ pub enum RenameError {
 pub struct Notebook {
     path: PathBuf,
     /// The top-level object. Its `cells` entry is rebuilt from `order` on serialisation.
-    top: Map<String, Value>,
-    trailing_newline: bool,
+    pub(crate) top: Map<String, Value>,
+    pub(crate) trailing_newline: bool,
     order: Vec<CellKey>,
     live: HashMap<CellKey, Cell>,
     /// Deleted cells, and cells created but not yet shown (§7.4).
@@ -86,7 +86,7 @@ pub struct Notebook {
     redo: Vec<Vec<Change>>,
     /// Whether any source, structure, type, output or execution change has happened (§6.3).
     mutated: bool,
-    disk_hash: Option<[u8; 32]>,
+    pub(crate) disk_hash: Option<[u8; 32]>,
     /// The `.ipynb`'s modification time and size when it last hashed as `disk_hash`, so an
     /// unchanged file is not read again (`disk_change`).
     disk_stamp: Option<(SystemTime, u64)>,
@@ -171,6 +171,15 @@ impl Notebook {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Restores unsaved recovery data while retaining its original saved baseline. In
+    /// particular, opening a newer disk file must not authorize overwriting that file.
+    pub(crate) fn recover(path: &Path, bytes: &[u8], baseline: Option<[u8; 32]>) -> Result<Self, OpenError> {
+        let mut nb = Self::from_bytes(path, bytes, KeyMinter::default())?;
+        nb.disk_hash = baseline;
+        nb.mutated = true;
+        Ok(nb)
     }
 
     /// The kernel name from `metadata.kernelspec.name`, if any.
@@ -420,7 +429,7 @@ impl Notebook {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(io(e)),
         };
-        if !opts.force && on_disk.is_some() && on_disk != self.disk_hash {
+        if !opts.force && on_disk != self.disk_hash {
             return Err(CommitError::ChangedOnDisk(self.path.clone()));
         }
 

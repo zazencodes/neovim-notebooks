@@ -17,7 +17,16 @@ before 1.0, a breaking change bumps the minor version.
   rename see code cells together, including unsaved edits. Cell buffers keep their own text,
   plugins and editing behavior; ordinary files keep their configured LSP attachment.
 
+- Unsaved notebook sources, structure and outputs receive durable crash recovery snapshots
+  about once a second, including during Insert mode. Reopening offers recovery or discard
+  for that file; recovery preserves protection against external changes. Snapshots follow
+  renames and are removed after saves, reloads and clean quits. Opening a notebook already
+  in use by another nbv process is refused to protect its recovery data.
+
 ### Fixed
+
+- A notebook deleted by another program requires an explicit `:w!` before it can be recreated,
+  preserving external-change protection.
 
 - Recently viewed plots reuse their cached images when scrolling back within the cache budget.
   Replaced, cleared, and evicted Kitty images release their terminal image data explicitly.

@@ -829,6 +829,16 @@ local function post()
   })
 
   local group = api.nvim_create_augroup('nbv_post', { clear = true })
+  api.nvim_create_autocmd('VimLeavePre', {
+    group = group,
+    callback = function()
+      -- VimLeavePre also runs after deadly signals. Only an intentional successful exit
+      -- authorizes discarding recovery; dying/exiting are set before this autocmd.
+      if vim.v.dying == 0 and vim.v.exiting == 0 then
+        notify('clean_exit')
+      end
+    end,
+  })
   api.nvim_create_autocmd('WinEnter', { group = group, callback = report_focus })
   api.nvim_create_autocmd('ModeChanged', {
     group = group,
