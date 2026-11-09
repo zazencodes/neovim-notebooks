@@ -25,6 +25,8 @@ before 1.0, a breaking change bumps the minor version.
 
 ### Fixed
 
+- Saving works when a notebook's directory contains a symbolic link, including macOS
+  paths under `/var` that Neovim resolves to `/private/var`.
 - A notebook deleted by another program requires an explicit `:w!` before it can be recreated,
   preserving external-change protection.
 - Redrawing an unchanged executed cell reuses its edited-state check, keeping giant cell

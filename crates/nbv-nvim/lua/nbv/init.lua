@@ -299,7 +299,10 @@ end
 --- BufWriteCmd (§9.2): `:w` from whichever notebook buffer it ran in.
 local function on_write(ev)
   local name = api.nvim_buf_get_name(ev.buf)
-  if ev.match ~= name and vim.fn.fnamemodify(ev.match, ':p') ~= name then
+  -- Neovim canonicalizes buffer names, while <amatch> can retain a symlinked
+  -- parent (for example /var versus /private/var on macOS). Cell files are
+  -- virtual, so resolve() must also handle a nonexistent final component.
+  if ev.match ~= name and vim.fn.resolve(vim.fn.fnamemodify(ev.match, ':p')) ~= vim.fn.resolve(name) then
     fail('notebook buffers can only be written to their notebook (use :w)')
   end
   api.nvim_echo({ { write(vim.v.cmdbang == 1) } }, false, {})

@@ -81,6 +81,26 @@ async fn motions_and_edits_stay_inside_the_cell() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn write_through_a_symlinked_directory_commits_only_the_notebook() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().canonicalize().unwrap().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    std::fs::copy(repo_root().join("tests/corpus/v4.5-outputs.ipynb"), real.join("notebook.ipynb")).unwrap();
+    let h = Harness::open_path(dir, alias.join("notebook.ipynb"), Options::default()).await;
+    h.enter(&h.key(1), false).await;
+    h.keys("ax<Esc>").await;
+    h.cmd("w").await;
+    assert!(!h.lua("return vim.bo.modified").await.as_bool().unwrap());
+    assert!(h.saved()["cells"][1]["source"].to_string().contains("ixmport"));
+    assert!(h.try_cmd("w other.py").await.is_err());
+    let names: Vec<_> = std::fs::read_dir(&real).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, ["notebook.ipynb"], "no synthetic cell file is written");
+}
+
+#[tokio::test]
 async fn write_from_a_cell_commits_the_notebook_and_nothing_else() {
     let h = Harness::open("v4.5-outputs.ipynb", Options::default()).await;
     let code = h.key(1);
