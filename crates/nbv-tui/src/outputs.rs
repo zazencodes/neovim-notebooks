@@ -66,7 +66,79 @@ struct MeasuredImage {
 /// Raster cache budget. Output views retain compressed bytes, never decoded raster Arcs.
 const DECODED_BYTES: usize = 32 * 1024 * 1024;
 
-/// Decoded rasters are retained by bytes, with least-recently-used eviction.
+/// Derived stream tails, independent of image decoding and the saved notebook data.
+#[derive(Default)]
+pub struct TextCache {
+    epoch: Option<u64>,
+    width: u16,
+    streams: HashMap<usize, StreamTail>,
+    prefix: Vec<Block>,
+    prefix_rows: usize,
+    next: usize,
+    #[cfg(test)]
+    parsed_bytes: usize,
+}
+
+struct StreamTail {
+    tail: ansi::Tail,
+    checkpoint: ansi::Tail,
+    part: usize,
+    byte: usize,
+    rewrite: u64,
+}
+
+impl TextCache {
+    fn text(&self, text: impl FnOnce() -> String) -> (Vec<Line<'static>>, usize) {
+        let mut tail = ansi::Tail::new(Style::default(), self.width);
+        tail.push(&text());
+        tail.snapshot()
+    }
+
+    fn stream(
+        &mut self,
+        index: usize,
+        out: &Value,
+        revisions: Option<&HashMap<usize, u64>>,
+        base: Style,
+    ) -> (Vec<Line<'static>>, usize) {
+        let revision = |part| revisions.and_then(|r| r.get(&part)).copied().unwrap_or(0);
+        let cached = self.streams.entry(index).or_insert_with(|| {
+            let tail = ansi::Tail::new(base, self.width);
+            StreamTail { checkpoint: tail.clone(), tail, part: 0, byte: 0, rewrite: revision(0) }
+        });
+        if cached.rewrite != revision(cached.part) {
+            cached.tail = cached.checkpoint.clone();
+            cached.byte = 0;
+            cached.rewrite = revision(cached.part);
+        }
+        let text = out.get("text");
+        let count = text.and_then(Value::as_array).map_or(1, Vec::len);
+        while cached.part < count {
+            let value = match text {
+                Some(Value::Array(parts)) => parts[cached.part].as_str().unwrap_or(""),
+                Some(Value::String(s)) => s,
+                _ => "",
+            };
+            #[cfg(test)]
+            {
+                self.parsed_bytes += value.len() - cached.byte;
+            }
+            cached.tail.push(&value[cached.byte..]);
+            cached.byte = value.len();
+            // The final unterminated part can still grow or be rewritten by CR.
+            if cached.part + 1 == count && !value.ends_with('\n') {
+                break;
+            }
+            cached.part += 1;
+            cached.rewrite = revision(cached.part);
+            cached.byte = 0;
+            cached.checkpoint = cached.tail.clone();
+        }
+        cached.tail.snapshot()
+    }
+}
+
+/// Decoded rasters retained by bytes, with least-recently-used eviction.
 #[derive(Default)]
 pub struct Images {
     decoded: HashMap<u64, (Arc<DynamicImage>, u64)>,
@@ -179,34 +251,55 @@ fn image_cells(dimensions: (u32, u32), font: FontSize, max_cols: u16) -> (u16, u
 
 /// Builds the view of a cell's outputs for a given width.
 pub fn build(cell: &Cell, width: u16, font: FontSize, images: &mut Images) -> OutputView {
-    let mut blocks = vec![];
-    for out in cell.outputs() {
+    build_cached(cell, width, font, images, &mut TextCache::default())
+}
+
+/// Reuses stream decoder state across output appends. Arbitrary output mutations and
+/// width changes invalidate it; no cache data is written into the notebook.
+pub fn build_cached(cell: &Cell, width: u16, font: FontSize, images: &mut Images, cache: &mut TextCache) -> OutputView {
+    if cache.epoch != Some(cell.runtime.output_epoch) || cache.width != width {
+        cache.streams.clear();
+        cache.prefix.clear();
+        cache.prefix_rows = 0;
+        cache.next = 0;
+        cache.epoch = Some(cell.runtime.output_epoch);
+        cache.width = width;
+    }
+    let mut blocks = cache.prefix.clone();
+    let mut omitted = cache.prefix_rows - text_rows(&blocks);
+    for (index, out) in cell.outputs().iter().enumerate().skip(cache.next) {
         let kind = out.get("output_type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "stream" => {
                 let err = out.get("name").and_then(Value::as_str) == Some("stderr");
                 let base = if err { Style::default().fg(Color::LightRed) } else { Style::default() };
-                blocks.push(Block::Text(text_block(&multiline(out.get("text")), base)));
+                let rewrite = cell.runtime.stream_rewrites.get(index);
+                let (rows, total) = cache.stream(index, out, rewrite, base);
+                omitted += total - rows.len();
+                blocks.push(Block::Text(rows));
             }
             "error" => {
-                let tb: Vec<String> = out
-                    .get("traceback")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect();
-                let text = if tb.is_empty() {
-                    format!(
-                        "{}: {}",
-                        out.get("ename").and_then(Value::as_str).unwrap_or("Error"),
-                        out.get("evalue").and_then(Value::as_str).unwrap_or("")
-                    )
-                } else {
-                    tb.join("\n")
-                };
-                blocks.push(Block::Text(text_block(&text, Style::default())));
+                let (rows, total) = cache.text(|| {
+                    let tb: Vec<String> = out
+                        .get("traceback")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect();
+                    if tb.is_empty() {
+                        format!(
+                            "{}: {}",
+                            out.get("ename").and_then(Value::as_str).unwrap_or("Error"),
+                            out.get("evalue").and_then(Value::as_str).unwrap_or("")
+                        )
+                    } else {
+                        tb.join("\n")
+                    }
+                });
+                omitted += total - rows.len();
+                blocks.push(Block::Text(rows));
             }
             "execute_result" | "display_data" => {
                 let data = out.get("data").unwrap_or(&Value::Null);
@@ -225,20 +318,27 @@ pub fn build(cell: &Cell, width: u16, font: FontSize, images: &mut Images) -> Ou
                         )])),
                     }
                 } else if let Some(t) = data.get("text/plain") {
-                    blocks.push(Block::Text(text_block(&multiline(Some(t)), Style::default())));
+                    let (rows, total) = cache.text(|| multiline(Some(t)));
+                    omitted += total - rows.len();
+                    blocks.push(Block::Text(rows));
                 } else if let Some(mime) = data.as_object().and_then(|m| m.keys().next()) {
                     blocks.push(Block::Text(vec![Line::styled(format!("[{mime} output]"), dim())]));
                 }
             }
             other => blocks.push(Block::Text(vec![Line::styled(format!("[unsupported output: {other}]"), dim())])),
         }
-    }
-    for b in &mut blocks {
-        if let Block::Text(lines) = b {
+        if let Some(Block::Text(lines)) = blocks.last_mut() {
             *lines = wrap(std::mem::take(lines), width);
         }
+        omitted += trim_text(&mut blocks, MAX_TEXT_ROWS);
+        if kind != "stream" || index + 1 < cell.outputs().len() {
+            cache.prefix_rows = text_rows(&blocks) + omitted;
+            cache.prefix = blocks.clone();
+            cache.next = index + 1;
+            cache.streams.remove(&index);
+        }
     }
-    cap_text(&mut blocks);
+    cap_text(&mut blocks, omitted);
     // Why the last run could not happen: after the outputs, never elided.
     if let Some(e) = &cell.runtime.error {
         blocks.push(Block::Text(wrap(text_block(e, Style::default().fg(Color::LightRed)), width)));
@@ -247,15 +347,37 @@ pub fn build(cell: &Cell, width: u16, font: FontSize, images: &mut Images) -> Ou
     OutputView { blocks, height, width }
 }
 
+fn text_rows(blocks: &[Block]) -> usize {
+    blocks.iter().filter(|b| matches!(b, Block::Text(_))).map(Block::height).sum()
+}
+
+/// Discards only derived rows. The complete output remains in the cell's JSON.
+fn trim_text(blocks: &mut Vec<Block>, keep: usize) -> usize {
+    let mut drop = text_rows(blocks).saturating_sub(keep);
+    let removed = drop;
+    for block in blocks.iter_mut() {
+        if let Block::Text(lines) = block {
+            let n = drop.min(lines.len());
+            lines.drain(..n);
+            drop -= n;
+        }
+        if drop == 0 {
+            break;
+        }
+    }
+    blocks.retain(|b| !matches!(b, Block::Text(lines) if lines.is_empty()));
+    removed
+}
+
 /// Keeps the last `MAX_TEXT_ROWS` text (display) rows of a cell, eliding the head: for long-running
 /// output the latest lines matter most.
-fn cap_text(blocks: &mut [Block]) {
+fn cap_text(blocks: &mut [Block], omitted: usize) {
     let total: usize = blocks.iter().filter(|b| matches!(b, Block::Text(_))).map(Block::height).sum();
-    if total <= MAX_TEXT_ROWS {
+    if total + omitted <= MAX_TEXT_ROWS {
         return;
     }
     let mut drop = total - MAX_TEXT_ROWS + 1;
-    let hidden = drop;
+    let hidden = drop + omitted;
     let mut marked = false;
     for b in blocks.iter_mut() {
         if let Block::Text(lines) = b {
@@ -281,6 +403,160 @@ mod tests {
     fn cell(outputs: Value) -> Cell {
         let raw = json!({"cell_type": "code", "execution_count": 1, "metadata": {}, "outputs": outputs, "source": ""});
         Cell::from_raw(raw.as_object().unwrap().clone())
+    }
+
+    fn rendered(view: &OutputView) -> Vec<Line<'static>> {
+        view.blocks
+            .iter()
+            .flat_map(|b| match b {
+                Block::Text(lines) => lines.clone(),
+                _ => vec![],
+            })
+            .collect()
+    }
+
+    fn streaming() -> (nbv_core::Notebook, nbv_core::exec::Executor, nbv_core::CellKey, jupyter_protocol::JupyterMessage)
+    {
+        let raw = br#"{"cells":[{"cell_type":"code","execution_count":null,"id":"a","metadata":{},"outputs":[],"source":""}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
+        let mut nb = nbv_core::Notebook::from_bytes(std::path::Path::new("t.ipynb"), raw, Default::default()).unwrap();
+        let key = nbv_core::CellKey::new("a");
+        let mut exec = nbv_core::exec::Executor::default();
+        let req = exec.request(&mut nb, &key).unwrap();
+        (nb, exec, key, req)
+    }
+
+    #[test]
+    fn cached_stream_matches_complete_render_at_every_utf8_chunk_boundary() {
+        use jupyter_protocol::{JupyterMessage, StreamContent};
+        let text = "prefix\n\x1b[38;2;1;2;3m世界🙂é\tcolored\x1b[0m\nlast";
+        for boundary in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+            let (mut nb, mut exec, key, req) = streaming();
+            let (mut cache, mut images) = (TextCache::default(), Images::default());
+            for part in [&text[..boundary], &text[boundary..]] {
+                exec.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout(part), Some(&req)));
+                let cell = nb.cell(&key).unwrap();
+                let actual = build_cached(cell, 7, FontSize::new(10, 20), &mut images, &mut cache);
+                let expected = build(cell, 7, FontSize::new(10, 20), &mut images);
+                assert_eq!(rendered(&actual), rendered(&expected), "boundary {boundary}");
+            }
+        }
+    }
+
+    #[test]
+    fn cached_progress_rewinds_wrapped_rows_and_resizes_without_losing_history() {
+        use jupyter_protocol::{JupyterMessage, StreamContent};
+        let (mut nb, mut exec, key, req) = streaming();
+        let (mut cache, mut images) = (TextCache::default(), Images::default());
+        for part in ["old\n", &"x".repeat(1000), "\r", "界\x1b[31", "mred\nnext", "\r\n", "tail"] {
+            exec.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout(part), Some(&req)));
+            let cell = nb.cell(&key).unwrap();
+            let actual = build_cached(cell, 8, FontSize::new(10, 20), &mut images, &mut cache);
+            assert_eq!(rendered(&actual), rendered(&build(cell, 8, FontSize::new(10, 20), &mut images)));
+        }
+        for width in [3, 80, 1] {
+            let cell = nb.cell(&key).unwrap();
+            let actual = build_cached(cell, width, FontSize::new(10, 20), &mut images, &mut cache);
+            assert_eq!(rendered(&actual), rendered(&build(cell, width, FontSize::new(10, 20), &mut images)));
+        }
+        assert_eq!(multiline(nb.cell(&key).unwrap().outputs()[0].get("text")), "old\n界\x1b[31mred\nnext\r\ntail");
+    }
+
+    #[test]
+    fn cached_tail_is_bounded_for_unterminated_lines_and_keeps_ansi_style() {
+        use jupyter_protocol::{JupyterMessage, StreamContent};
+        let (mut nb, mut exec, key, req) = streaming();
+        let (mut cache, mut images) = (TextCache::default(), Images::default());
+        for i in 0..2000 {
+            let part = if i == 0 { "\x1b[32m界" } else { "界" };
+            exec.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout(part), Some(&req)));
+            let view = build_cached(nb.cell(&key).unwrap(), 10, FontSize::new(10, 20), &mut images, &mut cache);
+            assert!(view.height <= MAX_TEXT_ROWS);
+            assert_eq!(rendered(&view).last().unwrap().spans[0].style.fg, Some(Color::Green));
+        }
+        let cell = nb.cell(&key).unwrap();
+        assert_eq!(multiline(cell.outputs()[0].get("text")).chars().filter(|c| *c == '界').count(), 2000);
+        assert_eq!(cache.streams[&0].tail.snapshot().1, 400);
+        assert_eq!(cache.streams[&0].tail.snapshot().0.len(), MAX_TEXT_ROWS);
+    }
+
+    #[test]
+    fn rewrites_on_new_lines_do_not_reparse_an_earlier_unterminated_history() {
+        use jupyter_protocol::{JupyterMessage, StreamContent};
+        let (mut nb, mut exec, key, req) = streaming();
+        let (mut cache, mut images) = (TextCache::default(), Images::default());
+        exec.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout(&"x".repeat(100_000)), Some(&req)));
+        build_cached(nb.cell(&key).unwrap(), 80, FontSize::new(10, 20), &mut images, &mut cache);
+        let parsed = cache.parsed_bytes;
+        // This CR affects only new text, after the previously rendered long line.
+        exec.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout("\nabc\rdef"), Some(&req)));
+        let view = build_cached(nb.cell(&key).unwrap(), 80, FontSize::new(10, 20), &mut images, &mut cache);
+        assert_eq!(cache.parsed_bytes - parsed, "\ndef".len());
+        assert_eq!(rendered(&view).last().unwrap().to_string(), "def");
+    }
+
+    #[test]
+    fn many_stderr_boundaries_keep_only_the_rendered_prefix_tail() {
+        use jupyter_protocol::{JupyterMessage, StreamContent};
+        let (mut nb, mut exec, key, req) = streaming();
+        let (mut cache, mut images) = (TextCache::default(), Images::default());
+        for i in 0..1000 {
+            let msg = if i % 2 == 0 {
+                StreamContent::stdout(&format!("out {i}"))
+            } else {
+                StreamContent::stderr(&format!("err {i}"))
+            };
+            exec.handle(&mut nb, &JupyterMessage::new(msg, Some(&req)));
+            let view = build_cached(nb.cell(&key).unwrap(), 80, FontSize::new(10, 20), &mut images, &mut cache);
+            assert_eq!(view.height, (i + 1).min(MAX_TEXT_ROWS));
+            assert!(cache.prefix.len() <= MAX_TEXT_ROWS);
+            assert!(cache.streams.len() <= 1);
+            if i % 137 == 0 {
+                assert_eq!(
+                    rendered(&view),
+                    rendered(&build(nb.cell(&key).unwrap(), 80, FontSize::new(10, 20), &mut images))
+                );
+            }
+        }
+        let view = build_cached(nb.cell(&key).unwrap(), 80, FontSize::new(10, 20), &mut images, &mut cache);
+        let rows = rendered(&view);
+        assert_eq!(rows[0].to_string(), "⋯ 961 earlier rows");
+        assert_eq!(rows.last().unwrap().to_string(), "err 999");
+        assert_eq!(nb.cell(&key).unwrap().outputs().len(), 1000);
+    }
+
+    #[test]
+    fn cached_clear_wait_stderr_and_display_update_invalidate_correctly() {
+        use jupyter_protocol::{
+            ClearOutput, DisplayData, JupyterMessage, Media, MediaType, StreamContent, Transient, UpdateDisplayData,
+        };
+        let (mut nb, mut exec, key, req) = streaming();
+        let media = |s: &str| Media::new(vec![MediaType::Plain(s.into())]);
+        let mut display = DisplayData::new(media("before"));
+        display.transient = Some(Transient { display_id: Some("d".into()) });
+        let messages = vec![
+            JupyterMessage::new(StreamContent::stdout("\x1b[32mout\n"), Some(&req)),
+            JupyterMessage::new(StreamContent::stderr("err\n"), Some(&req)),
+            JupyterMessage::new(display, Some(&req)),
+            JupyterMessage::new(UpdateDisplayData::new(media("after"), "d"), Some(&req)),
+            JupyterMessage::new(ClearOutput { wait: true }, Some(&req)),
+            JupyterMessage::new(StreamContent::stdout("fresh\n"), Some(&req)),
+            JupyterMessage::new(ClearOutput { wait: false }, Some(&req)),
+            JupyterMessage::new(StreamContent::stderr("error"), Some(&req)),
+        ];
+        let (mut cache, mut images) = (TextCache::default(), Images::default());
+        for msg in messages {
+            exec.handle(&mut nb, &msg);
+            let cell = nb.cell(&key).unwrap();
+            let actual = build_cached(cell, 80, FontSize::new(10, 20), &mut images, &mut cache);
+            assert_eq!(rendered(&actual), rendered(&build(cell, 80, FontSize::new(10, 20), &mut images)));
+        }
+        assert_eq!(
+            rendered(&build_cached(nb.cell(&key).unwrap(), 80, FontSize::new(10, 20), &mut images, &mut cache))[0]
+                .spans[0]
+                .style
+                .fg,
+            Some(Color::LightRed)
+        );
     }
 
     #[test]

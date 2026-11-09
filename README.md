@@ -246,6 +246,36 @@ ipykernel ruff`). CI runs everything on Linux and macOS.
 `tests/corpus/` holds deliberately ugly notebooks. Every one must survive open → save without
 losing information.
 
+### Stream scaling benchmark
+
+Run the same release workload against a pristine baseline snapshot and this checkout:
+
+```sh
+CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=2 scripts/bench-stream.sh 68a896b
+```
+
+Use your isolated build-cache path for `CARGO_TARGET_DIR` when working alongside other
+checkouts. The script leaves the checkout alone, removes its temporary baseline snapshot,
+and uses the supplied build directory for both builds. It measures kernel-message handling
+alone and handling plus rebuilding the inline view after every 62-byte ANSI/UTF-8 stream
+chunk, at width 80. Each run verifies that every output line remains in the document.
+Compilation and notebook setup are outside the timed region.
+
+Measured on an Apple Silicon Mac on 2026-11-09 (milliseconds, one run, concurrent development
+workloads; compare scaling rather than treating the timings as fixed thresholds):
+
+| Chunks | Baseline append | Incremental append | Baseline append + view | Incremental append + view |
+|---:|---:|---:|---:|---:|
+| 1,000 | 62.883 | 0.256 | 240.303 | 10.072 |
+| 4,000 | 1,017.980 | 0.981 | 3,910.209 | 41.007 |
+| 16,000 | 17,506.601 | 4.053 | 65,015.608 | 165.891 |
+
+The 16× input increase takes about 16.5× as long with incremental rendering, compared with
+270.6× for the baseline. At 16,000 chunks, handling plus rendering is about 392× faster.
+Width changes, reloads and explicit display replacements rebuild derived text from the full
+saved output. Appends reuse the bounded rendered tail, including across stdout/stderr
+boundaries and within a long unterminated line.
+
 ## License
 
 [MIT](LICENSE)

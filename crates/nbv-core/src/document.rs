@@ -39,6 +39,11 @@ pub struct Runtime {
     /// Why the most recent run could not happen (no kernel, kernel died). Shown under the
     /// cell; cleared by the next run.
     pub error: Option<String>,
+    /// Invalidates derived output caches after arbitrary output edits.
+    pub output_epoch: u64,
+    /// Per-output, per-line carriage-return revisions. Only overwritten logical lines
+    /// get an entry; renderers can rewind exactly their unfinished line.
+    pub stream_rewrites: Vec<std::collections::HashMap<usize, u64>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +106,8 @@ impl Cell {
         if kind == self.kind() {
             return;
         }
+        self.runtime.output_epoch = self.runtime.output_epoch.wrapping_add(1);
+        self.runtime.stream_rewrites.clear();
         for field in disallowed(kind) {
             match self.raw.shift_remove(*field) {
                 // Defaults are recreated on the way back; stashing them would be noise.
@@ -149,6 +156,12 @@ impl Cell {
     }
 
     pub fn outputs_mut(&mut self) -> &mut Vec<Value> {
+        self.runtime.output_epoch = self.runtime.output_epoch.wrapping_add(1);
+        self.runtime.stream_rewrites.clear();
+        self.output_storage()
+    }
+
+    pub(crate) fn output_storage(&mut self) -> &mut Vec<Value> {
         let entry = self.raw.entry("outputs").or_insert(Value::Array(vec![]));
         if !entry.is_array() {
             *entry = Value::Array(vec![]);

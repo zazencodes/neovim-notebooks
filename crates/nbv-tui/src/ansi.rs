@@ -72,6 +72,159 @@ fn apply_sgr(style: &mut Style, params: &[u16]) {
     }
 }
 
+/// Incremental ANSI decoder and wrapped tail. Its retained text is bounded by the
+/// visible row budget, even for a single logical line with millions of characters.
+#[derive(Clone)]
+pub struct Tail {
+    base: Style,
+    style: Style,
+    escape: String,
+    osc: bool,
+    osc_esc: bool,
+    cr: bool,
+    rows: std::collections::VecDeque<Line<'static>>,
+    current: Line<'static>,
+    col: usize,
+    logical_col: usize,
+    total: usize,
+    width: usize,
+    ended: bool,
+    line_rows: std::collections::VecDeque<Line<'static>>,
+    line_total: usize,
+    line_style: Style,
+}
+
+impl Tail {
+    pub fn new(base: Style, width: u16) -> Self {
+        Self {
+            base,
+            style: Style::default(),
+            escape: String::new(),
+            osc: false,
+            osc_esc: false,
+            cr: false,
+            rows: Default::default(),
+            current: Line::default(),
+            col: 0,
+            logical_col: 0,
+            total: 0,
+            width: width.max(1) as usize,
+            ended: false,
+            line_rows: Default::default(),
+            line_total: 0,
+            line_style: Style::default(),
+        }
+    }
+
+    fn finish_row(&mut self) {
+        self.rows.push_back(std::mem::take(&mut self.current));
+        self.total += 1;
+        if self.rows.len() > crate::outputs::MAX_TEXT_ROWS {
+            self.rows.pop_front();
+        }
+        self.col = 0;
+    }
+
+    fn character(&mut self, c: char) {
+        use unicode_width::UnicodeWidthChar;
+        let w = c.width().unwrap_or(0);
+        if self.col + w > self.width && self.col > 0 {
+            self.finish_row();
+        }
+        let style = self.base.patch(self.style);
+        if let Some(last) = self.current.spans.last_mut().filter(|s| s.style == style) {
+            last.content.to_mut().push(c);
+        } else {
+            self.current.spans.push(Span::styled(c.to_string(), style));
+        }
+        self.col += w;
+        self.logical_col += w;
+    }
+
+    pub fn push(&mut self, text: &str) {
+        for c in text.chars() {
+            self.ended = false;
+            if self.cr && c != '\r' && c != '\n' {
+                self.rows = self.line_rows.clone();
+                self.total = self.line_total;
+                self.style = self.line_style;
+                self.current = Line::default();
+                self.col = 0;
+                self.logical_col = 0;
+                self.cr = false;
+            }
+            if self.osc {
+                if c == '\x07' || (self.osc_esc && c == '\\') {
+                    self.osc = false;
+                }
+                self.osc_esc = c == '\x1b';
+                continue;
+            }
+            if !self.escape.is_empty() {
+                self.escape.push(c);
+                if self.escape.len() == 2 {
+                    match c {
+                        '[' => continue,
+                        ']' => {
+                            self.escape.clear();
+                            self.osc = true;
+                            continue;
+                        }
+                        _ => {
+                            self.escape.clear();
+                            continue;
+                        }
+                    }
+                }
+                if ('@'..='~').contains(&c) {
+                    if c == 'm' {
+                        let seq = &self.escape[2..self.escape.len() - 1];
+                        let params: Vec<u16> = seq.split(';').map(|p| p.parse().unwrap_or(0)).collect();
+                        apply_sgr(&mut self.style, if seq.is_empty() { &[] } else { &params });
+                    }
+                    self.escape.clear();
+                }
+                continue;
+            }
+            match c {
+                '\x1b' => self.escape.push(c),
+                '\r' => self.cr = true,
+                '\n' => {
+                    self.finish_row();
+                    self.logical_col = 0;
+                    self.line_rows = self.rows.clone();
+                    self.line_total = self.total;
+                    self.line_style = self.style;
+                    self.cr = false;
+                    self.ended = true;
+                }
+                c => {
+                    if c == '\t' {
+                        for _ in 0..(8 - self.logical_col % 8) {
+                            self.character(' ');
+                        }
+                    } else if !c.is_control() {
+                        self.character(c);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> (Vec<Line<'static>>, usize) {
+        let mut rows: Vec<_> = self.rows.iter().cloned().collect();
+        let extra = usize::from(!self.ended);
+        if extra != 0 {
+            rows.push(self.current.clone());
+        }
+        let total = self.total + extra;
+        if rows.len() > crate::outputs::MAX_TEXT_ROWS {
+            rows.drain(..rows.len() - crate::outputs::MAX_TEXT_ROWS);
+        }
+        (rows, total)
+    }
+}
+
 /// Parses text with ANSI escapes into lines. Carriage returns overwrite from the line start
 /// and tabs expand to 8 columns; other control sequences are dropped.
 pub fn lines(text: &str, base: Style) -> Vec<Line<'static>> {

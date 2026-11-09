@@ -327,7 +327,7 @@ impl Executor {
             self.clear_now(nb, key);
         }
         let Some(cell) = nb.cell_mut(key) else { return };
-        let outputs = cell.outputs_mut();
+        let outputs = cell.output_storage();
         outputs.push(output);
         if let Some(id) = display_id {
             self.displays.entry(id).or_default().push((key.clone(), outputs.len() - 1));
@@ -340,31 +340,67 @@ impl Executor {
             self.clear_now(nb, key);
         }
         let Some(cell) = nb.cell_mut(key) else { return };
-        let outputs = cell.outputs_mut();
-        if let Some(Value::Object(last)) = outputs.last_mut()
+        let last_index = cell.outputs().len().saturating_sub(1);
+        if cell.outputs().last().is_some_and(|last| last["output_type"] == "stream" && last["name"] == name)
+            && cell.runtime.stream_rewrites.len() <= last_index
+        {
+            // Normalize a loaded multiline representation once, including arbitrary
+            // list-element boundaries. A renderer may already have seen that form.
+            let old = crate::document::multiline(cell.outputs().last().and_then(|o| o.get("text")));
+            let mut lines = vec![];
+            append_stream(&mut lines, &old);
+            cell.outputs_mut()[last_index]["text"] = Value::Array(lines);
+            cell.runtime.stream_rewrites.resize_with(last_index + 1, HashMap::new);
+        }
+        let outputs = cell.output_storage();
+        let index = outputs.len().saturating_sub(1);
+        let mut rewritten = Vec::new();
+        let merged = if let Some(Value::Object(last)) = outputs.last_mut()
             && last.get("output_type").and_then(Value::as_str) == Some("stream")
             && last.get("name").and_then(Value::as_str) == Some(name)
         {
-            let merged = collapse_cr(&(crate::document::multiline(last.get("text")) + text));
-            last.insert("text".into(), lines_json(&merged));
-            return;
+            let lines = last.get_mut("text").and_then(Value::as_array_mut).expect("normalized stream line array");
+            rewritten = append_stream(lines, text);
+            true
+        } else {
+            false
+        };
+        if merged {
+            cell.runtime.stream_rewrites.resize_with(index + 1, HashMap::new);
+            for line in rewritten {
+                let revision = cell.runtime.stream_rewrites[index].entry(line).or_default();
+                *revision = revision.wrapping_add(1);
+            }
+        } else {
+            let mut lines = vec![];
+            append_stream(&mut lines, text);
+            cell.output_storage().push(json!({ "name": name, "output_type": "stream", "text": lines }));
+            let count = cell.outputs().len();
+            cell.runtime.stream_rewrites.resize_with(count, HashMap::new);
         }
-        outputs.push(json!({ "name": name, "output_type": "stream", "text": lines_json(&collapse_cr(text)) }));
     }
 }
 
-/// Applies carriage returns within each line, so progress bars do not accumulate.
-fn collapse_cr(s: &str) -> String {
-    s.split_inclusive('\n')
-        .map(|line| {
-            let (body, nl) = line.strip_suffix('\n').map_or((line, ""), |b| (b, "\n"));
-            // A trailing \r keeps its text visible until something overwrites it.
-            let trimmed = body.trim_end_matches('\r');
-            let kept = trimmed.rsplit('\r').next().unwrap_or("");
-            let tail = &body[trimmed.len()..];
-            format!("{kept}{tail}{nl}")
-        })
-        .collect()
+/// Extends only the unfinished line. Completed lines are never copied or revisited.
+/// A pending CR keeps the previous text visible until a non-CR character replaces it;
+/// CRLF keeps that text, matching Jupyter's progress-output semantics.
+fn append_stream(lines: &mut Vec<Value>, text: &str) -> Vec<usize> {
+    let mut rewritten = Vec::new();
+    for part in text.split_inclusive('\n') {
+        if lines.last().and_then(Value::as_str).is_none_or(|s| s.ends_with('\n')) {
+            lines.push(Value::String(String::new()));
+        }
+        let index = lines.len() - 1;
+        let Value::String(line) = lines.last_mut().expect("unfinished line") else { unreachable!() };
+        for run in part.split_inclusive('\r') {
+            if line.ends_with('\r') && !run.starts_with(['\r', '\n']) {
+                line.clear();
+                rewritten.push(index);
+            }
+            line.push_str(run);
+        }
+    }
+    rewritten
 }
 
 /// nbformat's multiline list form.
@@ -573,9 +609,64 @@ mod tests {
     }
 
     #[test]
+    fn incremental_cr_matches_reference_for_all_short_chunks() {
+        fn reference(s: &str) -> String {
+            s.split_inclusive('\n')
+                .map(|line| {
+                    let (body, nl) = line.strip_suffix('\n').map_or((line, ""), |b| (b, "\n"));
+                    let trimmed = body.trim_end_matches('\r');
+                    format!("{}{}{nl}", trimmed.rsplit('\r').next().unwrap_or(""), &body[trimmed.len()..])
+                })
+                .collect()
+        }
+        let alphabet = ['a', '界', '\r', '\n'];
+        for number in 0..4096usize {
+            let mut n = number;
+            let mut text = String::new();
+            for _ in 0..6 {
+                text.push(alphabet[n % 4]);
+                n /= 4;
+            }
+            for boundary in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+                let mut lines = vec![];
+                let mut expected = String::new();
+                for chunk in [&text[..boundary], &text[boundary..]] {
+                    append_stream(&mut lines, chunk);
+                    expected = reference(&(expected + chunk));
+                    assert_eq!(
+                        crate::document::multiline(Some(&Value::Array(lines.clone()))),
+                        expected,
+                        "{text:?}, split {boundary}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extending_loaded_fragmented_stream_normalizes_once() {
+        let (mut nb, mut ex, req, key) = setup();
+        nb.cell_mut(&key)
+            .unwrap()
+            .outputs_mut()
+            .push(json!({"output_type":"stream", "name":"stdout", "text":["old", "\r", "new\n", "界"]}));
+        ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout("語\n"), Some(&req)));
+        assert_eq!(nb.cell(&key).unwrap().outputs()[0]["text"], json!(["new\n", "界語\n"]));
+        let epoch = nb.cell(&key).unwrap().runtime.output_epoch;
+        ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout("tail"), Some(&req)));
+        assert_eq!(nb.cell(&key).unwrap().runtime.output_epoch, epoch);
+        assert_eq!(nb.cell(&key).unwrap().outputs()[0]["text"], json!(["new\n", "界語\n", "tail"]));
+    }
+
+    #[test]
     fn collapse_cr_keeps_pending_text() {
-        assert_eq!(collapse_cr("a\rb\rc\n"), "c\n");
-        assert_eq!(collapse_cr("abc\r"), "abc\r");
-        assert_eq!(collapse_cr("x\ny\rz"), "x\nz");
+        fn collapsed(s: &str) -> String {
+            let mut lines = vec![];
+            append_stream(&mut lines, s);
+            crate::document::multiline(Some(&Value::Array(lines)))
+        }
+        assert_eq!(collapsed("a\rb\rc\n"), "c\n");
+        assert_eq!(collapsed("abc\r"), "abc\r");
+        assert_eq!(collapsed("x\ny\rz"), "x\nz");
     }
 }

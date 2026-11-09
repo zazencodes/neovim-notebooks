@@ -30,6 +30,8 @@ before 1.0, a breaking change bumps the minor version.
 - Failed kernel starts clean up their connection files and processes. Kernel and embedded
   Neovim errors keep a byte-bounded stderr tail, and unexpected Neovim exits report their
   status and RPC error. Local lifecycle logs are bounded and exclude notebook contents.
+- Long-running text output stays responsive as it grows, while the notebook keeps the full
+  output and the inline view shows its latest rows.
 
 - Inside tmux, switching panes, windows or apps no longer blanks nbv and sends every visible
   image to the terminal again (several megabytes each time, kept in the terminal's memory).

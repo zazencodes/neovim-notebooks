@@ -123,6 +123,7 @@ struct App {
     collapsed_outputs: HashSet<CellKey>,
     artifacts: crate::inspect::Artifacts,
     cached_layout: Option<(u16, Arc<Layout>)>,
+    text_tails: HashMap<CellKey, outputs::TextCache>,
     protocols: HashMap<(u64, u16, u16), SlicedProtocol>,
     picker: Picker,
     tmux: Option<Tmux>,
@@ -261,6 +262,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         collapsed_outputs: HashSet::new(),
         artifacts: crate::inspect::Artifacts::new()?,
         cached_layout: None,
+        text_tails: HashMap::new(),
         protocols: HashMap::new(),
         picker,
         tmux,
@@ -515,6 +517,7 @@ impl App {
                     self.views.clear();
                     self.source_rows.clear();
                     self.invalidate_layout();
+                    self.text_tails.clear();
                     self.dirty = false;
                     self.last_sent = None;
                     self.relayout = true;
@@ -590,6 +593,7 @@ impl App {
             Event::Resize(w, h) => {
                 self.editor.calls.request("nvim_ui_try_resize", vec![(w as u64).into(), (h as u64).into()]);
                 self.views.clear();
+                self.text_tails.clear();
                 self.protocols.clear();
                 self.invalidate_layout();
             }
@@ -1251,7 +1255,8 @@ impl App {
         let font = self.picker.font_size();
         if self.views.get(key).is_none_or(|v| v.width != width) {
             let cell = self.nb.cell(key)?;
-            let mut view = outputs::build(cell, width, font, &mut self.images);
+            let cache = self.text_tails.entry(key.clone()).or_default();
+            let mut view = outputs::build_cached(cell, width, font, &mut self.images, cache);
             if self.collapsed_outputs.contains(key) {
                 view.collapse();
             }
@@ -1770,6 +1775,7 @@ mod tests {
             memory: KernelMemory::at(h.notebook.with_extension("kernels.json")).unwrap(),
             views: HashMap::new(),
             images: Images::default(),
+            text_tails: HashMap::new(),
             source_rows: HashMap::new(),
             collapsed_outputs: HashSet::new(),
             artifacts: crate::inspect::Artifacts::new().unwrap(),
