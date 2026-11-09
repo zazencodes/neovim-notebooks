@@ -17,6 +17,11 @@ before 1.0, a breaking change bumps the minor version.
 
 - Large notebooks keep rendering work within the visible cells and rows, and sustained kernel
   or Neovim output yields between batches so input and drawing keep progressing.
+- Kernel transport and send failures now fail queued and running cells with a restart action.
+  Messages and input replies from an earlier kernel session are ignored after restart.
+- Failed kernel starts clean up their connection files and processes. Kernel and embedded
+  Neovim errors keep a byte-bounded stderr tail, and unexpected Neovim exits report their
+  status and RPC error. Local lifecycle logs are bounded and exclude notebook contents.
 
 - Inside tmux, switching panes, windows or apps no longer blanks nbv and sends every visible
   image to the terminal again (several megabytes each time, kept in the terminal's memory).

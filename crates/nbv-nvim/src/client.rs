@@ -1,8 +1,14 @@
 //! The `NvimClient` boundary (§5.3). `nvim-rs` types stay inside this module; a breaking
 //! upstream release is a repair here and nowhere else.
 
+use nbv_core::diagnostics;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::{Handler, Neovim};
@@ -44,7 +50,9 @@ pub enum NvimEvent {
         args: Vec<Value>,
         reply: oneshot::Sender<Value>,
     },
-    Exited,
+    Exited {
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +134,7 @@ pub trait NvimClient: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct EmbeddedNvim {
     nvim: Neovim<Compat<ChildStdin>>,
+    quitting: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -195,20 +204,77 @@ impl EmbeddedNvim {
         if opts.clean {
             cmd.arg("--clean");
         }
-        cmd.args(&opts.args).envs(opts.env.iter().map(|(k, v)| (k, v))).stderr(Stdio::null()).kill_on_drop(true);
-        let (nvim, io, mut child) = nvim_rs::create::tokio::new_child_cmd(&mut cmd, Forwarder { tx: tx.clone() })
+        cmd.args(&opts.args).envs(opts.env.iter().map(|(k, v)| (k, v))).stderr(Stdio::piped()).kill_on_drop(true);
+        let (nvim, mut io, mut child) = nvim_rs::create::tokio::new_child_cmd(&mut cmd, Forwarder { tx: tx.clone() })
             .await
             .map_err(|e| NvimError::Spawn(opts.program.display().to_string(), e))?;
+        let quitting = Arc::new(AtomicBool::new(false));
+        let expected = quitting.clone();
+        let tail = diagnostics::stderr_tail();
+        let stderr = child.stderr.take().expect("piped stderr");
+        let capture = tail.clone();
+        let mut stderr_task = tokio::spawn(async move { diagnostics::read_stderr(stderr, capture).await });
         tokio::spawn(async move {
-            let _ = io.await;
-            let _ = child.wait().await;
-            let _ = tx.send(NvimEvent::Exited);
+            let mut exit_status = None;
+            let rpc_result = tokio::select! {
+                result = &mut io => Some(result),
+                status = child.wait() => {
+                    exit_status = Some(status);
+                    match tokio::time::timeout(Duration::from_millis(500), &mut io).await {
+                        Ok(result) => Some(result),
+                        Err(_) => { io.abort(); None }
+                    }
+                }
+            };
+            let (rpc_closed, rpc) = match rpc_result {
+                Some(Ok(Ok(()))) => (true, None),
+                Some(Ok(Err(e))) => (e.is_channel_closed(), Some(rpc_loop_error(&e))),
+                Some(Err(e)) => (false, Some(e.to_string())),
+                None => (false, Some("RPC did not close after process exit".into())),
+            };
+            // An RPC failure with a still-live child must not hang the application.
+            let status = match exit_status {
+                Some(status) => status,
+                None => match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
+                    Ok(status) => status,
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        child.wait().await
+                    }
+                },
+            };
+            let stderr_result = tokio::time::timeout(Duration::from_millis(500), &mut stderr_task).await;
+            if stderr_result.is_err() {
+                stderr_task.abort();
+            }
+            let clean = status.as_ref().is_ok_and(|s| s.success());
+            let status = diagnostics::exit_status(&status);
+            let error = if (clean && rpc_closed) || expected.load(Ordering::SeqCst) {
+                None
+            } else {
+                Some(format!(
+                    "embedded Neovim exited unexpectedly ({status}); RPC: {}; stderr: {}{}. Try nvb --clean to check your configuration. Lifecycle log: {}",
+                    rpc.as_deref().unwrap_or("closed"),
+                    diagnostics::tail_text(&tail),
+                    if stderr_result.is_err() { " [stderr did not close]" } else { "" },
+                    diagnostics::log_path().map(|p| p.display().to_string()).unwrap_or_else(|e| e.to_string())
+                ))
+            };
+            let event = if error.is_some() { "unexpected exit" } else { "quit" };
+            let _ = diagnostics::record("neovim", &format!("{event} {status}"), 0);
+            let _ = tx.send(NvimEvent::Exited { error });
         });
-        Ok((EmbeddedNvim { nvim }, rx))
+        Ok((EmbeddedNvim { nvim, quitting }, rx))
     }
 }
 
 impl NvimClient for EmbeddedNvim {
+    async fn quit(&self) -> Result<(), NvimError> {
+        self.quitting.store(true, Ordering::SeqCst);
+        let _ = self.request("nvim_command", vec!["qall!".into()]).await;
+        Ok(())
+    }
+
     async fn request(&self, method: &str, args: Vec<Value>) -> Result<Value, NvimError> {
         match self.nvim.call(method, args).await {
             Ok(Ok(v)) => Ok(v),
@@ -218,10 +284,71 @@ impl NvimClient for EmbeddedNvim {
     }
 }
 
+/// Loop errors may contain complete response values. Keep the failure category and
+/// request identity without copying buffer contents or user input into diagnostics.
+fn rpc_loop_error(error: &nvim_rs::error::LoopError) -> String {
+    use nvim_rs::error::LoopError;
+    match error {
+        LoopError::DecodeError(error, _) => format!("RPC decode failed: {error}"),
+        LoopError::MsgidNotFound(id) => format!("RPC response has unknown request id {id}"),
+        LoopError::InternalSendResponseError(id, _) => format!("cannot deliver RPC response for request {id}"),
+    }
+}
+
 /// Neovim errors arrive as `[type, message]`.
 fn describe(v: &Value) -> String {
     match v.as_array().and_then(|a| a.get(1)).and_then(Value::as_str) {
         Some(msg) => msg.to_string(),
         None => v.to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    async fn fake_process(script: &str) -> NvimEvent {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("fake-nvim");
+        std::fs::write(&program, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (_client, mut rx) =
+            EmbeddedNvim::spawn(SpawnOptions { program, clean: false, args: vec![], env: vec![] }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn preserves_stderr_status_and_rpc_failure() {
+        let event = fake_process("echo process-fault >&2; printf '\\301'; exit 23").await;
+        let NvimEvent::Exited { error: Some(error) } = event else { panic!("{event:?}") };
+        assert!(error.contains("process-fault"), "{error}");
+        assert!(error.contains("RPC:"), "{error}");
+        assert!(error.contains("23"), "{error}");
+        assert!(error.contains("--clean"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn rpc_failure_kills_and_reaps_a_child_that_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let event = fake_process(&format!("echo $$ > '{}'; printf '\\301'; exec sleep 60", pid_file.display())).await;
+        assert!(matches!(event, NvimEvent::Exited { error: Some(_) }));
+        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().trim().parse().unwrap();
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!alive.success(), "RPC failure must reap its child");
+    }
+
+    #[tokio::test]
+    async fn malformed_rpc_is_reported_even_with_zero_exit_status() {
+        assert!(matches!(fake_process("printf '\\301'; exit 0").await, NvimEvent::Exited { error: Some(_) }));
+    }
+
+    #[tokio::test]
+    async fn normal_quit_is_expected() {
+        assert!(matches!(fake_process("exit 0").await, NvimEvent::Exited { error: None }));
     }
 }

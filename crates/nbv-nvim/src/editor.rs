@@ -138,7 +138,7 @@ pub enum EditorEvent {
         action: String,
         args: Value,
     },
-    Exited,
+    Exited(Option<String>),
 }
 
 /// Where a cell's editor window goes, in screen cells. `skip` is the cell's display rows above
@@ -408,7 +408,7 @@ impl Editor {
                 self.notification(nb, action, payload)
             }
             NvimEvent::Notify { .. } => vec![],
-            NvimEvent::Exited => vec![EditorEvent::Exited],
+            NvimEvent::Exited { error } => vec![EditorEvent::Exited(error)],
         }
     }
 

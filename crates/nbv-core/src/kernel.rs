@@ -1,18 +1,18 @@
 //! Kernel transport and lifecycle over `jupyter-zmq-client` (§13). Wire details belong to
 //! the library; this module launches, connects, forwards messages, interrupts and stops.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use crate::diagnostics::{self, StderrTail};
 use jupyter_protocol::{
     ConnectionInfo, InputReply, InterruptRequest, JupyterMessage, JupyterMessageContent, KernelInfoRequest,
     ReplyStatus, ShutdownRequest, Transport,
 };
 use jupyter_zmq_client as zmq;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -34,12 +34,55 @@ pub struct KernelCommand {
 /// What a running kernel reports to the application loop.
 #[derive(Debug)]
 pub enum KernelMessage {
-    Message(Box<JupyterMessage>),
+    Message {
+        generation: u64,
+        message: Box<JupyterMessage>,
+    },
+    TransportFailed {
+        generation: u64,
+        channel: &'static str,
+        reason: String,
+    },
     /// The kernel process exited. Carries the tail of its stderr.
     Died {
         generation: u64,
         stderr: String,
     },
+}
+
+impl KernelMessage {
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.generation() == generation
+    }
+
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Message { generation, .. }
+            | Self::Died { generation, .. }
+            | Self::TransportFailed { generation, .. } => *generation,
+        }
+    }
+}
+
+fn transport_failed(
+    tx: &UnboundedSender<KernelMessage>,
+    generation: u64,
+    channel: &'static str,
+    error: impl std::fmt::Display,
+) {
+    let _ = diagnostics::record("kernel", &format!("{channel} read failed"), generation);
+    let _ = tx.send(KernelMessage::TransportFailed { generation, channel, reason: error.to_string() });
+}
+
+/// Startup tasks must also be aborted when startup fails or its future is cancelled.
+#[derive(Default)]
+struct Tasks(Vec<JoinHandle<()>>);
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -216,15 +259,16 @@ pub struct Kernel {
     stdin: zmq::DealerSendConnection,
     control: zmq::ClientControlConnection,
     interrupt_via_message: bool,
-    connection_file: PathBuf,
-    tasks: Vec<JoinHandle<()>>,
+    _connection_file: tempfile::TempPath,
+    tasks: Tasks,
+    watcher: Option<JoinHandle<()>>,
 }
 
 static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl Kernel {
-    /// Launches a kernel and waits until its iopub channel is live. `generation` tags death
-    /// notices so a restarted session can ignore the previous process's.
+    /// Launches a kernel and waits until its iopub channel is live. Every event carries
+    /// `generation`, so a restarted session can ignore all previous process events.
     pub async fn start(
         cmd: &KernelCommand,
         cwd: &Path,
@@ -252,7 +296,12 @@ impl Kernel {
         let runtime = zmq::runtime_dir();
         std::fs::create_dir_all(&runtime).map_err(KernelError::Spawn)?;
         let session = format!("nbv-{:016x}", rand::random::<u64>());
-        let connection_file = runtime.join(format!("kernel-{session}.json"));
+        let connection_file = tempfile::Builder::new()
+            .prefix("kernel-nbv-")
+            .suffix(".json")
+            .tempfile_in(&runtime)
+            .map_err(KernelError::Spawn)?
+            .into_temp_path();
         std::fs::write(&connection_file, serde_json::to_vec(&info).expect("serialisable"))
             .map_err(KernelError::Spawn)?;
 
@@ -273,23 +322,16 @@ impl Kernel {
             .spawn()
             .map_err(KernelError::Spawn)?;
 
-        // Keep the tail of stderr for the death notice.
-        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::<String>::new()));
-        let mut tasks = vec![];
-        if let Some(stderr) = child.stderr.take() {
-            let tail = stderr_tail.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let mut t = tail.lock().expect("not poisoned");
-                    t.push_back(line);
-                    if t.len() > 20 {
-                        t.pop_front();
-                    }
-                }
-            }));
-        }
-        let tail_text = || stderr_tail.lock().expect("not poisoned").iter().cloned().collect::<Vec<_>>().join("\n");
+        let stderr_tail = diagnostics::stderr_tail();
+        let mut tasks = Tasks::default();
+        let stderr = child.stderr.take().expect("piped stderr");
+        let tail = stderr_tail.clone();
+        let (stderr_finished, mut stderr_done) = tokio::sync::oneshot::channel();
+        tasks.0.push(tokio::spawn(async move {
+            let _ = diagnostics::read_stderr(stderr, tail).await;
+            let _ = stderr_finished.send(());
+        }));
+        let tail_text = || diagnostics::tail_text(&stderr_tail);
 
         let connect = async {
             let identity = zmq::peer_identity_for_session(&session).map_err(conn_err)?;
@@ -304,48 +346,68 @@ impl Kernel {
             // Probe until iopub delivers something: subscriptions are live once it does.
             loop {
                 shell_tx.send(JupyterMessage::new(KernelInfoRequest {}, None)).await.map_err(conn_err)?;
-                if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(300), iopub.read()).await {
-                    break;
+                match tokio::time::timeout(Duration::from_millis(300), iopub.read()).await {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(e)) => return Err(conn_err(e)),
+                    Err(_) => {}
                 }
             }
             // Drain the probes' replies before handing shell to the forwarder.
-            while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(50), shell_rx.read()).await {}
+            loop {
+                match tokio::time::timeout(Duration::from_millis(50), shell_rx.read()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => return Err(conn_err(error)),
+                    Err(_) => break,
+                }
+            }
             Ok::<_, KernelError>((iopub, shell_tx, shell_rx, stdin, control))
         };
         let limit = Duration::from_secs(60);
-        let (mut iopub, shell_tx, mut shell_rx, stdin, control) = tokio::select! {
+        let connected = tokio::select! {
             r = tokio::time::timeout(limit, connect) => match r {
-                Ok(r) => r?,
-                Err(_) => return Err(KernelError::Timeout(limit, format!("\n{}", tail_text()))),
+                Ok(r) => r,
+                Err(_) => Err(KernelError::Timeout(limit, format!("\n{}", tail_text()))),
             },
-            _ = child.wait() => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                return Err(KernelError::Connection(format!("kernel exited during startup\n{}", tail_text())));
+            status = child.wait() => {
+                let _ = tokio::time::timeout(Duration::from_millis(500), &mut stderr_done).await;
+                Err(KernelError::Connection(format!("kernel exited during startup ({})\n{}", diagnostics::exit_status(&status), tail_text())))
+            }
+        };
+        let (mut iopub, shell_tx, mut shell_rx, stdin, control) = match connected {
+            Ok(connected) => connected,
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = diagnostics::record("kernel", "startup failed; child reaped", generation);
+                return Err(error);
             }
         };
         let (stdin_tx, mut stdin_rx) = stdin.split();
 
-        let fwd = |tx: UnboundedSender<KernelMessage>| {
-            move |m: JupyterMessage| tx.send(KernelMessage::Message(Box::new(m))).is_ok()
-        };
-        let send = fwd(tx.clone());
-        tasks.push(tokio::spawn(async move {
-            while let Ok(m) = iopub.read().await
-                && send(m)
-            {}
-        }));
-        let send = fwd(tx.clone());
-        tasks.push(tokio::spawn(async move {
-            while let Ok(m) = shell_rx.read().await
-                && send(m)
-            {}
-        }));
-        let send = fwd(tx.clone());
-        tasks.push(tokio::spawn(async move {
-            while let Ok(m) = stdin_rx.read().await
-                && send(m)
-            {}
-        }));
+        macro_rules! forward {
+            ($reader:ident, $channel:literal) => {{
+                let tx = tx.clone();
+                tasks.0.push(tokio::spawn(async move {
+                    loop {
+                        match $reader.read().await {
+                            Ok(message) => {
+                                if tx.send(KernelMessage::Message { generation, message: Box::new(message) }).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                transport_failed(&tx, generation, $channel, e);
+                                break;
+                            }
+                        }
+                    }
+                }));
+            }};
+        }
+        forward!(iopub, "iopub");
+        forward!(shell_rx, "shell");
+        forward!(stdin_rx, "stdin");
+        let _ = diagnostics::record("kernel", "connected", generation);
 
         let mut kernel = Kernel {
             pid: child.id(),
@@ -356,10 +418,11 @@ impl Kernel {
             stdin: stdin_tx,
             control,
             interrupt_via_message: cmd.interrupt_via_message,
-            connection_file,
+            _connection_file: connection_file,
             tasks,
+            watcher: None,
         };
-        kernel.watch_exit(child, tx, stderr_tail);
+        kernel.watch_exit(child, tx, stderr_tail, stderr_done);
         Ok(kernel)
     }
 
@@ -368,22 +431,28 @@ impl Kernel {
         &mut self,
         mut child: Child,
         tx: UnboundedSender<KernelMessage>,
-        tail: std::sync::Arc<std::sync::Mutex<VecDeque<String>>>,
+        tail: StderrTail,
+        stderr_done: tokio::sync::oneshot::Receiver<()>,
     ) {
         let generation = self.generation;
         let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
         self.exited = exited_rx;
         self.kill = Some(kill_tx);
-        self.tasks.push(tokio::spawn(async move {
-            tokio::select! {
-                _ = child.wait() => {}
-                _ = kill_rx => { let _ = child.kill().await; }
-            }
+        self.watcher = Some(tokio::spawn(async move {
+            let status = tokio::select! {
+                status = child.wait() => status,
+                _ = kill_rx => { let _ = child.kill().await; child.wait().await }
+            };
             let _ = exited_tx.send(true);
-            // Let the stderr reader catch up with the final lines.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let stderr = tail.lock().expect("not poisoned").iter().cloned().collect::<Vec<_>>().join("\n");
+            // Wait for the final bytes, with a deadline in case a descendant inherited stderr.
+            let _ = tokio::time::timeout(Duration::from_millis(500), stderr_done).await;
+            let stderr = format!("{}\n{}", diagnostics::exit_status(&status), diagnostics::tail_text(&tail));
+            let _ = diagnostics::record(
+                "kernel",
+                &format!("process exited {}", diagnostics::exit_status(&status)),
+                generation,
+            );
             let _ = tx.send(KernelMessage::Died { generation, stderr });
         }));
     }
@@ -393,7 +462,10 @@ impl Kernel {
     }
 
     pub async fn send_shell(&mut self, msg: JupyterMessage) -> Result<(), KernelError> {
-        self.shell.send(msg).await.map_err(conn_err)
+        self.shell.send(msg).await.map_err(|error| {
+            let _ = diagnostics::record("kernel", "shell send failed", self.generation);
+            conn_err(error)
+        })
     }
 
     /// Answers an `input_request`.
@@ -434,10 +506,14 @@ impl Drop for Kernel {
             // SAFETY: killing our own child process, which has not been reaped yet.
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
-        for t in &self.tasks {
-            t.abort();
+        // The child watcher must reap the process. Dropping the kill sender wakes it;
+        // reader tasks are aborted independently.
+        if let Some(watcher) = self.watcher.take() {
+            drop(watcher);
         }
-        let _ = std::fs::remove_file(&self.connection_file);
+        for task in &self.tasks.0 {
+            task.abort();
+        }
     }
 }
 
@@ -449,6 +525,62 @@ pub fn is_input_request(msg: &JupyterMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_channel_failure_and_message_carries_its_session() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for channel in ["iopub", "shell", "stdin"] {
+            transport_failed(&tx, 7, channel, std::io::Error::other("injected read failure"));
+            let msg = rx.try_recv().unwrap();
+            assert!(msg.is_current(7));
+            assert!(!msg.is_current(8));
+            assert!(
+                matches!(msg, KernelMessage::TransportFailed { channel: c, reason, .. } if c == channel && reason.contains("injected"))
+            );
+        }
+        for message in [
+            JupyterMessage::new(jupyter_protocol::Status::busy(), None),
+            JupyterMessage::new(jupyter_protocol::InputRequest { prompt: "who?".into(), password: true }, None),
+        ] {
+            let event = KernelMessage::Message { generation: 7, message: Box::new(message) };
+            assert!(!event.is_current(8), "queued status and password prompts must be ignored after restart");
+        }
+        assert!(!KernelMessage::Died { generation: 7, stderr: String::new() }.is_current(8));
+        drop(rx);
+        transport_failed(&tx, 7, "shell", "receiver closed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_start_removes_connection_file_and_reaps_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = dir.path().join("connection");
+        let pid = dir.path().join("pid");
+        let cmd = KernelCommand {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"echo "$1" > "$2"; echo $$ > "$3"; echo startup-fault >&2; exit 19"#.into(),
+                "test".into(),
+                "{connection_file}".into(),
+                connection.display().to_string(),
+                pid.display().to_string(),
+            ],
+            env: HashMap::new(),
+            interrupt_via_message: false,
+            display_name: "fault".into(),
+            language: "python".into(),
+            spec: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let error = Kernel::start(&cmd, dir.path(), 11, tx).await.err().expect("must fail");
+        assert!(error.to_string().contains("startup-fault"), "{error}");
+        let file = std::fs::read_to_string(connection).unwrap();
+        assert!(!Path::new(file.trim()).exists());
+        let pid: i32 = std::fs::read_to_string(pid).unwrap().trim().parse().unwrap();
+        // SAFETY: signal zero only checks the test child's existence.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "failed startup child was not reaped");
+    }
 
     fn venv(dir: &Path) {
         std::fs::create_dir_all(dir.join("bin")).unwrap();

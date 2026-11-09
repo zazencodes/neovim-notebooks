@@ -691,10 +691,10 @@ function M.offer_install(prompt, generation)
 end
 
 --- Asks the user for a line on behalf of the kernel (`input()`), without blocking RPC.
-function M.input(prompt, password)
+function M.input(prompt, password, generation, request_id)
   vim.schedule(function()
     local ok, value = pcall(password and vim.fn.inputsecret or vim.fn.input, { prompt = prompt, cancelreturn = '' })
-    vim.rpcnotify(M.chan, 'nbv', 'input', { value = ok and value or '' })
+    vim.rpcnotify(M.chan, 'nbv', 'input', { value = ok and value or '', generation = generation, request_id = request_id })
   end)
 end
 

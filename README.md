@@ -173,7 +173,20 @@ them. For ruff, in its configuration:
 ```
 
 **Troubleshooting.** `nvb --clean` starts Neovim without your configuration. If a problem goes
-away with `--clean`, its source is in your config or plugins.
+away with `--clean`, its source is in your config or plugins. Kernel channel and send failures
+fail queued and running cells; press `00` to restart or choose a kernel in the header.
+Unexpected embedded Neovim exits report its exit status, RPC failure and the last 16 KiB of
+stderr after restoring the terminal. Kernel startup and death errors include the same bounded
+stderr tail, even when a process prints a single huge line.
+
+Lifecycle diagnostics are local in `$XDG_STATE_HOME/nbv/diagnostics.log` (default
+`~/.local/state/nbv/diagnostics.log`). The log rotates to `diagnostics.log.1`; each file is at
+most 64 KiB and created readable only by your user. An empty `diagnostics.lock` coordinates
+rotation across open notebooks. It records lifecycle events and kernel
+generation numbers. Notebook source, outputs, input answers, environment variables, connection
+keys and raw process stderr are excluded from the log. When reporting a failure, include the
+terminal error and these logs; review the terminal error first, since a kernel or plugin can
+include private information in its stderr. These files can be removed at any time.
 
 ## Images
 

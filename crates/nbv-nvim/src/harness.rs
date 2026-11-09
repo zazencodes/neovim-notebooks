@@ -123,7 +123,7 @@ impl Harness {
                         for e in editor.handle(nb, ev) {
                             match e {
                                 EditorEvent::Ready => st.ready = true,
-                                EditorEvent::Exited => st.exited = true,
+                                EditorEvent::Exited(_) => st.exited = true,
                                 EditorEvent::Flush => st.flushes += 1,
                                 EditorEvent::Command { action, args } => st.commands.push((action, args)),
                                 EditorEvent::Focus { seq, focus } => st.focus = Some((seq, focus)),

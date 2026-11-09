@@ -72,7 +72,7 @@ impl Session {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         while !done(&self.nb) {
             let msg = tokio::time::timeout_at(deadline, self.rx.recv()).await.expect("timed out").unwrap();
-            let KernelMessage::Message(m) = msg else { panic!("kernel died: {msg:?}") };
+            let KernelMessage::Message { message: m, .. } = msg else { panic!("kernel died: {msg:?}") };
             for e in self.ex.handle(&mut self.nb, &m) {
                 if let ExecEvent::InputRequested { .. } = e {
                     assert!(is_input_request(&m));
@@ -154,9 +154,10 @@ async fn death_is_reported() {
                 assert_eq!(generation, 1);
                 break;
             }
-            KernelMessage::Message(m) => {
+            KernelMessage::Message { message: m, .. } => {
                 s.ex.handle(&mut s.nb, &m);
             }
+            KernelMessage::TransportFailed { .. } => {}
         }
     }
 }

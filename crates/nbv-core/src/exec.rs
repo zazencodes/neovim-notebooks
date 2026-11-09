@@ -553,6 +553,26 @@ mod tests {
     }
 
     #[test]
+    fn transport_send_failure_fails_queued_and_running_without_losing_outputs() {
+        let (mut nb, mut ex, req, running) = setup();
+        ex.handle(&mut nb, &JupyterMessage::new(Status::busy(), Some(&req)));
+        ex.handle(&mut nb, &JupyterMessage::new(StreamContent::stdout("preserved\n"), Some(&req)));
+        let queued = nb.new_cell(crate::CellKind::Code, "queued");
+        nb.edit(vec![crate::Change::Show { key: queued.clone(), index: 1 }]);
+        ex.request(&mut nb, &queued).unwrap();
+        assert_eq!(nb.cell(&queued).unwrap().runtime.exec, ExecState::Queued);
+        assert_eq!(nb.cell(&running).unwrap().runtime.exec, ExecState::Running);
+        ex.fail_all(&mut nb, "shell send failed");
+        for key in [&running, &queued] {
+            let runtime = &nb.cell(key).unwrap().runtime;
+            assert_eq!(runtime.exec, ExecState::Error);
+            assert_eq!(runtime.error.as_deref(), Some("shell send failed"));
+        }
+        assert_eq!(ex.in_flight().count(), 0);
+        assert_eq!(nb.cell(&running).unwrap().outputs()[0]["text"], json!(["preserved\n"]));
+    }
+
+    #[test]
     fn collapse_cr_keeps_pending_text() {
         assert_eq!(collapse_cr("a\rb\rc\n"), "c\n");
         assert_eq!(collapse_cr("abc\r"), "abc\r");

@@ -127,6 +127,7 @@ struct App {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     cursor_shape: Option<(CursorShape, u8)>,
     quit: bool,
+    exit_error: Option<String>,
 
     mode: Mode,
     /// Sequence number of the latest focus change nbv asked for (§10.2).
@@ -263,6 +264,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         terminal,
         cursor_shape: None,
         quit: false,
+        exit_error: None,
         mode: Mode::Nav,
         focus_seq: 0,
         focus_cursor: FocusCursor::Shown,
@@ -327,6 +329,9 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         let _ = tokio::time::timeout(Duration::from_secs(3), k.shutdown()).await;
     }
     let _ = tokio::time::timeout(Duration::from_millis(500), app.client.quit()).await;
+    if let Some(error) = app.exit_error {
+        return Err(NvimError::Rpc(error).into());
+    }
     Ok(())
 }
 
@@ -428,6 +433,7 @@ impl App {
     /// later runs until the kernel is restarted or another is picked.
     fn kernel_failed(&mut self, reason: String) {
         self.kernel = None;
+        self.input_request = None;
         self.pending.clear();
         for ev in self.exec.fail_all(&mut self.nb, &reason) {
             self.on_exec_event(ev);
@@ -436,7 +442,7 @@ impl App {
     }
 
     async fn on_kernel_ready(&mut self, generation: u64, result: Result<Kernel, KernelError>) {
-        if generation != self.generation {
+        if generation != self.generation || self.kernel_error.is_some() {
             if let Ok(k) = result {
                 tokio::spawn(k.shutdown());
             }
@@ -444,9 +450,10 @@ impl App {
         }
         match result {
             Ok(mut k) => {
-                for msg in self.pending.drain(..) {
+                for msg in std::mem::take(&mut self.pending) {
                     if let Err(e) = k.send_shell(msg).await {
-                        self.message = Some(e.to_string());
+                        self.kernel_failed(format!("kernel send failed (00 restarts it): {e}"));
+                        return;
                     }
                 }
                 self.kernel = Some(k);
@@ -541,7 +548,10 @@ impl App {
                     self.draw = true;
                 }
                 EditorEvent::Command { action, args } => self.on_command(&action, &args).await,
-                EditorEvent::Exited => self.quit = true,
+                EditorEvent::Exited(error) => {
+                    self.exit_error = error;
+                    self.quit = true;
+                }
             }
         }
     }
@@ -619,8 +629,11 @@ impl App {
     }
 
     async fn on_kernel(&mut self, msg: KernelMessage) {
+        if !msg.is_current(self.generation) || self.kernel_error.is_some() {
+            return;
+        }
         match msg {
-            KernelMessage::Message(m) => {
+            KernelMessage::Message { message: m, .. } => {
                 if kernel::is_input_request(&m) {
                     self.input_request = Some((*m).clone());
                 }
@@ -634,6 +647,9 @@ impl App {
                 self.kernel_failed(format!("the kernel died (00 restarts it){tail}"));
             }
             KernelMessage::Died { .. } => {}
+            KernelMessage::TransportFailed { channel, reason, .. } => {
+                self.kernel_failed(format!("kernel {channel} channel failed (00 restarts it): {reason}"));
+            }
         }
     }
 
@@ -647,7 +663,15 @@ impl App {
             }
             ExecEvent::Status(_) => self.draw = true,
             ExecEvent::InputRequested { prompt, password, .. } => {
-                self.editor.calls.lua("require('nbv').input(...)", vec![prompt.into(), password.into()]);
+                self.editor.calls.lua(
+                    "require('nbv').input(...)",
+                    vec![
+                        prompt.into(),
+                        password.into(),
+                        self.generation.into(),
+                        self.input_request.as_ref().map(|m| m.header.msg_id.clone()).unwrap_or_default().into(),
+                    ],
+                );
             }
         }
     }
@@ -714,7 +738,7 @@ impl App {
             match self.kernel.as_mut() {
                 Some(k) => {
                     if let Err(e) = k.send_shell(msg).await {
-                        self.message = Some(e.to_string());
+                        self.kernel_failed(format!("kernel send failed (00 restarts it): {e}"));
                     }
                 }
                 None => self.pending.push(msg),
@@ -737,6 +761,7 @@ impl App {
             self.on_exec_event(ev);
         }
         self.pending.clear();
+        self.input_request = None;
         self.start_kernel();
     }
 
@@ -1179,11 +1204,18 @@ impl App {
             }
             "disk_deferred" => self.disk_notified = None,
             "input" => {
+                let generation = field(args, "generation").and_then(Value::as_u64);
+                let request_id = field(args, "request_id").and_then(Value::as_str);
+                if generation != Some(self.generation)
+                    || request_id != self.input_request.as_ref().map(|m| m.header.msg_id.as_str())
+                {
+                    return;
+                }
                 let value = field(args, "value").and_then(Value::as_str).unwrap_or("").to_string();
                 if let (Some(req), Some(k)) = (self.input_request.take(), self.kernel.as_mut())
                     && let Err(e) = k.reply_input(&req, value).await
                 {
-                    self.message = Some(e.to_string());
+                    self.kernel_failed(format!("kernel input reply failed (00 restarts it): {e}"));
                 }
             }
             _ => {}
@@ -1630,6 +1662,7 @@ mod tests {
             terminal,
             cursor_shape: None,
             quit: false,
+            exit_error: None,
             mode: Mode::Nav,
             focus_seq: 0,
             focus_cursor: FocusCursor::Shown,
