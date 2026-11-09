@@ -6,7 +6,7 @@ Run the release scenarios from the worktree, with an isolated Cargo target direc
 CARGO_TARGET_DIR="$PWD/.agents/builds/render" CARGO_BUILD_JOBS=2 cargo test -p nbv-tui --release --lib scenario -- --ignored --nocapture --test-threads=1
 ```
 
-The cached-navigation scenario uses the isolated Neovim harness; `.tools/nvim-macos-arm64`
+The cached-navigation and giant-status scenarios use the isolated Neovim harness; `.tools/nvim-macos-arm64`
 (or `NBV_NVIM`) must be available. The other component scenarios need no terminal or kernel.
 The real terminal-input flood regression lives in `crates/nbv-cli/tests/tmux.rs` and uses the
 normal tmux/Neovim/ipykernel test prerequisites.
@@ -18,9 +18,11 @@ A November 9, 2026 release run on the development Mac measured:
 | 2,000 viewport queries across 100,000 giant cells | Full block scan: 101.85 ms | Binary-search visible range: 110.92 µs |
 | 200 navigation turns across 20,000 cells | Rebuild current geometry: 296.32 ms | Cached pan/scroll/select/align: 18.25 µs |
 | Layout measurements for 200 800×800 PNGs | Full raster decode: 87.78 ms | Header-only measurement: 5.09 ms |
+| 200 status redraws of an unchanged 8 MiB executed cell (follow-up run) | Core source comparison: 146.75 ms | Cached full status: 44.67 µs |
 
 These are component measurements from one run, with construction excluded where noted in
-the tests. The navigation reference rebuilds the current geometry; it does not recreate an
+the tests. The giant-status regression also performs 2,000 status reads and verifies zero
+instrumented core staleness comparisons. The navigation reference rebuilds the current geometry; it does not recreate an
 older application binary. Other workers were active on the machine. These timings do not
 measure end-to-end frame latency or terminal memory.
 
@@ -71,3 +73,10 @@ retires every view and derived image resource for reload/resize/structural reset
 `DynamicImage`. `Images::decode`, `touch` and `retain` own raster lifetime. The private
 `image_cache::Protocols` module owns encoded data, LRU stamps and Kitty IDs. Shown/in-flight
 layouts are `Arc<Layout>` so pure navigation shares geometry without copying every cell.
+
+App staleness is initialized from loaded baselines without comparing source. Source changes,
+execution requests and structural edits refresh the affected cache through `Cell::is_stale`;
+reload reinitializes it. Redraws and output-only events read the cached bool. Commit-time
+mirror repairs emit the existing `SourceChanged` event only when text actually changes;
+successful repairs carry `Written` too, so App preserves the saved modified state. Repeated
+unchanged saves cause no extra staleness comparisons.

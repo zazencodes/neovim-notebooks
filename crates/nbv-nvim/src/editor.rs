@@ -576,21 +576,25 @@ impl Editor {
     /// mirror that differs is repaired before committing.
     fn commit(&mut self, nb: &mut Notebook, args: &[Value]) -> (Value, Vec<EditorEvent>) {
         let force = args.first().and_then(Value::as_bool).unwrap_or(false);
+        let mut events = vec![];
         for pair in args.get(1).and_then(Value::as_array).into_iter().flatten() {
             let pair = pair.as_array().map(Vec::as_slice).unwrap_or(&[]);
             let (Some(buf), Some(lines)) = (pair.first().and_then(Value::as_i64), pair.get(1)) else { continue };
             if let Some(b) = self.buffers.get_mut(&buf) {
                 b.lines = strings(lines);
-                nb.set_source(&b.key, &b.lines.join("\n"));
+                if nb.set_source(&b.key, &b.lines.join("\n")) {
+                    events.push(EditorEvent::SourceChanged(b.key.clone()));
+                }
             }
         }
         match nb.commit(CommitOptions { force }) {
             Ok(()) => {
                 let name = nb.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let message = format!("\"{name}\" {}C written", nb.order().len());
-                (map(vec![("message", message.into())]), vec![EditorEvent::Written])
+                events.push(EditorEvent::Written);
+                (map(vec![("message", message.into())]), events)
             }
-            Err(e) => (map(vec![("error", e.to_string().into())]), vec![]),
+            Err(e) => (map(vec![("error", e.to_string().into())]), events),
         }
     }
 

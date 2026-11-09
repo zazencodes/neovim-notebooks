@@ -27,6 +27,8 @@ before 1.0, a breaking change bumps the minor version.
 
 - A notebook deleted by another program requires an explicit `:w!` before it can be recreated,
   preserving external-change protection.
+- Redrawing an unchanged executed cell reuses its edited-state check, keeping giant cell
+  sources out of redraw and output-only updates.
 
 - Recently viewed plots reuse their cached images when scrolling back within the cache budget.
   Replaced, cleared, and evicted Kitty images release their terminal image data explicitly.

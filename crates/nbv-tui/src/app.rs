@@ -126,6 +126,10 @@ struct App {
     source_rows: HashMap<CellKey, usize>,
     collapsed_outputs: HashSet<CellKey>,
     artifacts: crate::inspect::Artifacts,
+    /// Core staleness, refreshed only when source, kind or execution baseline changes.
+    staleness: HashMap<CellKey, bool>,
+    #[cfg(test)]
+    staleness_checks: usize,
     cached_layout: Option<(u16, Arc<Layout>)>,
     text_tails: HashMap<CellKey, outputs::TextCache>,
     protocols: Protocols,
@@ -254,8 +258,12 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
     let (kernel_tx, mut kernel_rx) = mpsc::unbounded_channel();
     let (start_tx, mut start_rx) = mpsc::unbounded_channel();
+    let staleness = App::loaded_staleness(&nb);
     let mut app = App {
         nb,
+        staleness,
+        #[cfg(test)]
+        staleness_checks: 0,
         editor,
         client,
         exec: Executor::default(),
@@ -548,7 +556,9 @@ impl App {
         } else {
             ev
         };
-        for e in self.editor.handle(&mut self.nb, ev) {
+        let events = self.editor.handle(&mut self.nb, ev);
+        let written = events.iter().any(|event| matches!(event, EditorEvent::Written));
+        for e in events {
             match e {
                 EditorEvent::Flush => {
                     if self.focus_cursor == FocusCursor::AwaitFlush {
@@ -568,8 +578,12 @@ impl App {
                 }
                 EditorEvent::SourceChanged(key) => {
                     self.source_rows.remove(&key);
-                    // So `:x` in the home window writes it, as for any changed buffer.
-                    self.mark_dirty();
+                    self.refresh_staleness(&key);
+                    // Commit-time mirror repairs may already have been persisted. Avoid
+                    // queuing a modified flag after the companion has finished that write.
+                    if !written {
+                        self.mark_dirty();
+                    }
                     // A cell's line count may have changed, and its staleness.
                     self.invalidate_layout();
                     self.draw = true;
@@ -579,6 +593,7 @@ impl App {
                     // A cell whose window closed reports the focus change.
                     self.clear_views();
                     self.source_rows.clear();
+                    self.staleness = Self::loaded_staleness(&self.nb);
                     self.invalidate_layout();
                     self.text_tails.clear();
                     self.dirty = false;
@@ -837,6 +852,7 @@ impl App {
                 continue;
             }
             let Some(msg) = self.exec.request(&mut self.nb, &key) else { continue };
+            self.refresh_staleness(&key);
             self.invalidate_view(&key);
             self.invalidate_layout();
             match self.kernel.as_mut() {
@@ -899,6 +915,9 @@ impl App {
 
     /// Brings the buffers, the selection and the screen up to date after a structural change.
     fn structure_changed(&mut self, focus: Option<usize>) {
+        for key in self.nb.order().to_vec() {
+            self.refresh_staleness(&key);
+        }
         self.source_rows.clear();
         self.clear_views();
         self.invalidate_layout();
@@ -1267,6 +1286,7 @@ impl App {
                     Some("Recover unsaved snapshot") => {
                         if let Some(nb) = self.pending_recovery.take() {
                             self.nb = nb;
+                            self.staleness = Self::loaded_staleness(&self.nb);
                             self.clear_views();
                             self.source_rows.clear();
                             self.last_sent = None;
@@ -1576,11 +1596,27 @@ impl App {
         rgb(self.theme.get(name).and_then(|c| c.0))
     }
 
+    /// Loading establishes each baseline from that cell's source; no comparison is needed.
+    fn loaded_staleness(nb: &Notebook) -> HashMap<CellKey, bool> {
+        nb.order().iter().cloned().map(|key| (key, false)).collect()
+    }
+
+    fn refresh_staleness(&mut self, key: &CellKey) {
+        if let Some(cell) = self.nb.cell(key) {
+            #[cfg(test)]
+            {
+                self.staleness_checks += 1;
+            }
+            self.staleness.insert(key.clone(), cell.is_stale());
+        }
+    }
+
     /// A code cell's execution count for the gutter, and its status for the box's top border.
     fn status(&self, key: &CellKey) -> (String, Option<(String, Option<Color>)>) {
         let Some(cell) = self.nb.cell(key) else { return (String::new(), None) };
         let count = cell.execution_count().map_or(" ".to_string(), |n| n.to_string());
-        let stale = cell.is_stale() && cell.execution_count().is_some();
+        let stale = *self.staleness.get(key).expect("cell staleness initialized before drawing")
+            && cell.execution_count().is_some();
         let edited = if stale { " · edited" } else { "" };
         let ok_color = if stale { self.color("stale") } else { self.color("ok") };
         match cell.runtime.exec {
@@ -1931,8 +1967,12 @@ mod tests {
             ratatui::TerminalOptions { viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)) },
         )
         .unwrap();
+        let nb = Notebook::open(&h.notebook).unwrap();
+        let staleness = App::loaded_staleness(&nb);
         let app = App {
-            nb: Notebook::open(&h.notebook).unwrap(),
+            nb,
+            staleness,
+            staleness_checks: 0,
             editor: Editor::new(h.client.clone(), errors),
             client: h.client.clone(),
             exec: Executor::default(),
@@ -2036,6 +2076,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":cells}))
                 .unwrap();
         app.nb = Notebook::from_bytes(app.nb.path(), &bytes, Default::default()).unwrap();
+        app.staleness = App::loaded_staleness(&app.nb);
         let g = app.geometry.unwrap();
         let original = app.layout(&g);
         let start = Instant::now();
@@ -2053,6 +2094,167 @@ mod tests {
         }
         eprintln!(
             "20000 cells, 200 navigation turns: geometry rebuild={rebuild:?}, cached pan/scroll/select/align={:?}",
+            start.elapsed()
+        );
+    }
+
+    async fn source_event(app: &mut App, buf: i64, source: &str) {
+        app.on_nvim(NvimEvent::BufLines {
+            buf,
+            tick: None,
+            first: 0,
+            last: -1,
+            lines: source.split('\n').map(String::from).collect(),
+        })
+        .await;
+    }
+
+    fn assert_staleness(app: &App, key: &CellKey, expected: bool) {
+        assert_eq!(app.staleness[key], expected);
+        assert_eq!(app.staleness[key], app.nb.cell(key).unwrap().is_stale());
+    }
+
+    #[tokio::test]
+    async fn staleness_tracks_source_run_edit_during_run_undo_and_reload() {
+        let (h, mut app) = fixture_app().await;
+        h.layout_all(None).await;
+        std::mem::swap(&mut app.editor, &mut h.state.lock().unwrap().editor);
+        let key = app.code_cells()[0].clone();
+        let buf = app.editor.buffer(&key).unwrap();
+        app.nb.cell_mut(&key).unwrap().raw.insert("execution_count".into(), serde_json::json!(7));
+        assert_staleness(&app, &key, false);
+        assert_eq!(app.staleness_checks, 0, "loaded baselines need no source scan");
+
+        source_event(&mut app, buf, "requested = 1").await;
+        assert_staleness(&app, &key, true);
+        app.run_cells(vec![key.clone()]).await;
+        assert_staleness(&app, &key, false);
+        app.nb.runtime_mut(&key).unwrap().exec = ExecState::Running;
+        source_event(&mut app, buf, "edited_during_run = 2").await;
+        assert_staleness(&app, &key, true);
+        let checks = app.staleness_checks;
+        app.on_exec_event(ExecEvent::Cell(key.clone()));
+        for _ in 0..100 {
+            assert!(app.status(&key).1.unwrap().0.contains("edited"));
+        }
+        assert_eq!(app.staleness_checks, checks, "output/status updates must not compare source");
+
+        // Text undo arrives through the same buffer event as any other source change.
+        source_event(&mut app, buf, "requested = 1").await;
+        assert_staleness(&app, &key, false);
+        let next = app.nb.order()[app.nb.index_of(&key).unwrap() + 1].clone();
+        let at = app.nb.edit(vec![Change::Merge { key: key.clone(), next }]);
+        app.structure_changed(at);
+        assert_staleness(&app, &key, true);
+        let at = app.nb.undo();
+        app.structure_changed(at);
+        assert_staleness(&app, &key, false);
+        source_event(&mut app, buf, "edited_again = 3").await;
+        assert_staleness(&app, &key, true);
+        let checks = app.staleness_checks;
+        app.kernel_error = Some("offline".into());
+        app.run_cells(vec![key.clone()]).await;
+        assert_staleness(&app, &key, true);
+        assert_eq!(app.staleness_checks, checks, "failed runs leave the execution baseline unchanged");
+        let at = app.nb.edit(vec![Change::Kind { key: key.clone(), kind: CellKind::Markdown }]);
+        app.structure_changed(at);
+        assert_staleness(&app, &key, false);
+        let at = app.nb.undo();
+        app.structure_changed(at);
+        assert_staleness(&app, &key, true);
+        let at = app.nb.redo();
+        app.structure_changed(at);
+        assert_staleness(&app, &key, false);
+        let at = app.nb.undo();
+        app.structure_changed(at);
+        assert_staleness(&app, &key, true);
+
+        // Reload resets baselines from disk, with no source comparisons in App.
+        let checks = app.staleness_checks;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        app.on_nvim(NvimEvent::Request { name: "nbv_reload".into(), args: vec![], reply }).await;
+        response.await.unwrap();
+        assert_staleness(&app, &key, false);
+        assert_eq!(app.staleness_checks, checks);
+    }
+
+    #[tokio::test]
+    async fn authoritative_commit_text_repairs_staleness_without_a_line_event() {
+        let (h, mut app) = fixture_app().await;
+        h.layout_all(None).await;
+        std::mem::swap(&mut app.editor, &mut h.state.lock().unwrap().editor);
+        let key = app.code_cells()[0].clone();
+        let buf = app.editor.buffer(&key).unwrap();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        app.on_nvim(NvimEvent::Request {
+            name: "nbv_commit".into(),
+            args: vec![
+                false.into(),
+                Value::Array(vec![Value::Array(vec![buf.into(), Value::Array(vec!["commit_repair = 1".into()])])]),
+            ],
+            reply,
+        })
+        .await;
+        response.await.unwrap();
+        assert_staleness(&app, &key, true);
+        assert_eq!(app.staleness_checks, 1);
+        assert!(!app.dirty, "persisted mirror repairs must not re-mark the home buffer modified");
+        let (reply, response) = tokio::sync::oneshot::channel();
+        app.on_nvim(NvimEvent::Request {
+            name: "nbv_commit".into(),
+            args: vec![
+                false.into(),
+                Value::Array(vec![Value::Array(vec![buf.into(), Value::Array(vec!["commit_repair = 1".into()])])]),
+            ],
+            reply,
+        })
+        .await;
+        response.await.unwrap();
+        assert_eq!(app.staleness_checks, 1, "an unchanged save must not refresh staleness");
+    }
+
+    #[tokio::test]
+    async fn repeated_giant_cell_status_redraws_never_reconstruct_source() {
+        let (_h, mut app) = fixture_app().await;
+        let key = app.code_cells()[0].clone();
+        let source = "x".repeat(8 * 1024 * 1024);
+        app.nb.set_source(&key, &source);
+        app.nb.runtime_mut(&key).unwrap().baseline = source;
+        app.nb.runtime_mut(&key).unwrap().exec = ExecState::Ok;
+        app.nb.cell_mut(&key).unwrap().raw.insert("execution_count".into(), serde_json::json!(1));
+        app.refresh_staleness(&key);
+        let checks = app.staleness_checks;
+        for _ in 0..2_000 {
+            assert!(!app.status(&key).1.unwrap().0.contains("edited"));
+        }
+        assert_eq!(app.staleness_checks, checks, "2000 status redraws must perform zero core source comparisons");
+    }
+
+    #[tokio::test]
+    #[ignore = "release performance scenario: cargo test -p nbv-tui --release giant_status_scenario -- --ignored --nocapture"]
+    async fn giant_status_scenario() {
+        use std::{hint::black_box, time::Instant};
+        let (_h, mut app) = fixture_app().await;
+        let key = app.code_cells()[0].clone();
+        let source = "x".repeat(8 * 1024 * 1024);
+        app.nb.set_source(&key, &source);
+        app.nb.runtime_mut(&key).unwrap().baseline = source;
+        app.nb.runtime_mut(&key).unwrap().exec = ExecState::Ok;
+        app.nb.cell_mut(&key).unwrap().raw.insert("execution_count".into(), serde_json::json!(1));
+        app.refresh_staleness(&key);
+        let start = Instant::now();
+        for _ in 0..200 {
+            assert!(!black_box(app.nb.cell(&key).unwrap()).is_stale());
+        }
+        let reference = start.elapsed();
+        let checks = app.staleness_checks;
+        let start = Instant::now();
+        for _ in 0..200 {
+            black_box(app.status(black_box(&key)));
+        }
+        assert_eq!(app.staleness_checks, checks);
+        eprintln!(
+            "200 status redraws of unchanged 8 MiB executed source: source comparison={reference:?}, cached full status={:?}; core staleness checks during redraw=0",
             start.elapsed()
         );
     }
