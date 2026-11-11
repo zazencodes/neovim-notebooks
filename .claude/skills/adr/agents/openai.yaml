@@ -1,0 +1,4 @@
+interface:
+  display_name: "ADR"
+  short_description: "Read and record a project's standing decisions"
+  default_prompt: "Use $adr to record the decision we just made."

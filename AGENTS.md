@@ -15,6 +15,10 @@ Neovim Notebooks (`nvb`): a Rust/Ratatui TUI that edits Jupyter notebooks with a
 - `crates/nbv-nvim/lua/nbv/init.lua`: Lua companion loaded into the embedded Neovim.
 - `.agents/docs/specs/`: design specs, local and git-ignored. Code comments cite their sections (`§7.6`): the v1 architecture spec, as amended by the cell-editors spec.
 
+## Decisions
+
+Standing decisions live in `docs/adr/`, indexed below. Use the `adr` skill to read the relevant ones before changing an area and to write one whenever a decision is made. Specs in `.agents/docs/specs/` describe work in progress; ADRs record decisions that have shipped.
+
 ## Validation
 
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`.

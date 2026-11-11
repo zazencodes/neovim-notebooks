@@ -2,5 +2,6 @@
 /.tools
 /.venv
 .DS_Store
-/.agents
+/.agents/*
+!/.agents/skills/
 /.worktrees
