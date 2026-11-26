@@ -190,6 +190,17 @@ falls back quietly: a notebook nbv cannot read correctly (an unknown cell type, 
 metadata) is refused at startup with the reason, and an image that cannot be decoded says so
 where it would be.
 
+**Diagnostics in cells.** Without the opt-in below, each language server sees one cell at a
+time, so names imported or defined in another cell, and top-level `await`, show as errors. To
+turn diagnostics off in nbv only, while keeping completion, hover and go-to-definition, add
+this to your Neovim config:
+
+```lua
+if vim.g.nbv then
+  vim.diagnostic.enable(false)
+end
+```
+
 **Language servers.** Python notebooks can share one language-server document across code
 cells, while keeping separate editable cell buffers. Configure a server in your Neovim as
 usual, then opt in after its configuration is available:
