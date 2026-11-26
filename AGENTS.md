@@ -19,6 +19,8 @@ Neovim Notebooks (`nvb`): a Rust/Ratatui TUI that edits Jupyter notebooks with a
 
 Standing decisions live in `docs/adr/`, indexed below. Use the `adr` skill to read the relevant ones before changing an area and to write one whenever a decision is made. Specs in `.agents/docs/specs/` describe work in progress; ADRs record decisions that have shipped.
 
+- nbv takes the mouse for wheel scrolling; mouse selection uses the terminal's modifier: `docs/adr/2026-11-26-nbv-takes-the-mouse-for-the-wheel.md`
+
 ## Validation
 
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`.

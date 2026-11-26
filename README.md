@@ -120,6 +120,13 @@ the next cell with a match, and `n` `N` go on to the next or previous one, wrapp
 `'ignorecase'`, `'smartcase'` and `'wrapscan'` apply as in any buffer. Matches are highlighted
 in every cell, and inside a cell `n` moves between them as usual.
 
+**Copying with the mouse.** nbv takes the mouse so the wheel can scroll the notebook, which
+means a plain click or drag selects nothing. **Hold Shift while you drag** to select text with
+your terminal, then copy as usual (`Cmd+C` on macOS). Shift works in Ghostty, Kitty, WezTerm
+and Alacritty, inside tmux too; in iTerm2 hold Option instead. The selection is whatever is on
+screen, so it can take in cell borders; for an output's clean text, open it with `:NvbOutput`
+and yank it there.
+
 **Inspecting outputs.** Inline output shows the last 40 text rows. `:NvbOutput` opens a
 read-only Neovim scratch buffer containing every output from the current cell, at full length.
 Use `/`, `n`, Visual selection, `y` or `yy` as usual; `q` or `Esc` in Normal mode closes it.
